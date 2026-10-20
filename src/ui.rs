@@ -109,7 +109,10 @@ struct App {
     progress: (String, usize, usize),
     paused: bool,
     task_popup: bool,
+    task_handoff: bool,
     task_result: Option<(String, String)>,
+    result_scroll: u16,
+    result_max_scroll: std::cell::Cell<u16>,
     snapshots: bool,
     query: String,
     tx: Sender<Message>,
@@ -162,7 +165,10 @@ impl App {
             progress: ("空闲".into(), 0, 0),
             paused: false,
             task_popup: false,
+            task_handoff: false,
             task_result: None,
+            result_scroll: 0,
+            result_max_scroll: std::cell::Cell::new(0),
             snapshots: false,
             query: String::new(),
             tx,
@@ -267,6 +273,7 @@ impl App {
             return;
         }
         self.task = Some(kind);
+        self.task_handoff = false;
         self.task_result = None;
         self.task_popup = kind != WorkKind::Game;
         self.pause_allowed = kind == WorkKind::Download;
@@ -704,6 +711,7 @@ impl App {
                     game,
                     versions,
                 } => {
+                    self.task_handoff = true;
                     self.loader_picker = Some(LoaderPicker {
                         kind,
                         game,
@@ -763,7 +771,7 @@ impl App {
                     self.selection = 0;
                 }
                 Message::Done(result) => {
-                    let show_result = self.task_popup || result.is_err();
+                    let show_result = (self.task_popup && !self.task_handoff) || result.is_err();
                     if show_result {
                         let title = if self.control.cancelled() && result.is_err() {
                             "任务已取消"
@@ -776,6 +784,7 @@ impl App {
                             Ok(message) | Err(message) => message.clone(),
                         };
                         self.task_result = Some((title.into(), message));
+                        self.result_scroll = 0;
                     }
                     self.task = None;
                     self.task_popup = false;
@@ -811,7 +820,19 @@ impl App {
         }
     }
     fn key(&mut self, key: event::KeyEvent) -> bool {
-        if key.kind != KeyEventKind::Press {
+        let repeatable = matches!(
+            key.code,
+            KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+                | KeyCode::Home
+                | KeyCode::End
+                | KeyCode::Backspace
+        );
+        if key.kind == KeyEventKind::Release || (key.kind == KeyEventKind::Repeat && !repeatable) {
             return false;
         }
         if self.task_result.is_some()
@@ -821,6 +842,22 @@ impl App {
             && self.confirm_remove.is_none()
         {
             match key.code {
+                KeyCode::Up => self.result_scroll = self.result_scroll.saturating_sub(1),
+                KeyCode::Down => {
+                    self.result_scroll = self
+                        .result_scroll
+                        .saturating_add(1)
+                        .min(self.result_max_scroll.get())
+                }
+                KeyCode::PageUp => self.result_scroll = self.result_scroll.saturating_sub(8),
+                KeyCode::PageDown => {
+                    self.result_scroll = self
+                        .result_scroll
+                        .saturating_add(8)
+                        .min(self.result_max_scroll.get())
+                }
+                KeyCode::Home => self.result_scroll = 0,
+                KeyCode::End => self.result_scroll = self.result_max_scroll.get(),
                 KeyCode::Enter | KeyCode::Esc => self.task_result = None,
                 KeyCode::Char('l') => {
                     self.task_result = None;
@@ -928,11 +965,25 @@ impl App {
             self.task_popup = true;
             return false;
         }
+        if self.task.is_some() && key.code == KeyCode::Char('c') {
+            if self.task == Some(WorkKind::Game) {
+                self.confirm_stop = true;
+            } else {
+                self.control.cancel();
+                self.paused = false;
+                self.log("正在取消，等待当前操作结束…");
+            }
+            return false;
+        }
+        if self.task.is_some() && key.code == KeyCode::Char('p') && self.pause_allowed {
+            if !self.control.cancelled() {
+                self.paused = self.control.toggle_pause();
+            }
+            return false;
+        }
         if let Some(picker) = &mut self.world_picker {
             match key.code {
-                KeyCode::Esc | KeyCode::Char('q') if self.task.is_none() => {
-                    self.world_picker = None
-                }
+                KeyCode::Esc | KeyCode::Char('q') => self.world_picker = None,
                 KeyCode::Up | KeyCode::Char('k') => {
                     picker.selected = picker.selected.saturating_sub(1)
                 }
@@ -2027,11 +2078,21 @@ fn draw(f: &mut Frame, app: &App) {
     if let Some((title, message)) = &app.task_result {
         let dialog = dialog_rect(area, 76, 12);
         f.render_widget(Clear, dialog);
+        let block =
+            panel(title.as_str()).title_bottom(" ↑↓ / PgUp PgDn 滚动 · Enter 关闭 · L 日志 ");
+        let inner = block.inner(dialog);
+        let paragraph = Paragraph::new(message.as_str())
+            .style(Style::default().bg(BG).fg(TEXT))
+            .wrap(Wrap { trim: false });
+        let maximum = paragraph
+            .line_count(inner.width)
+            .saturating_sub(inner.height as usize)
+            .min(u16::MAX as usize) as u16;
+        app.result_max_scroll.set(maximum);
         f.render_widget(
-            Paragraph::new(message.as_str())
-                .block(panel(title.as_str()).title_bottom(" Enter / Esc 关闭 · L 查看日志 "))
-                .style(Style::default().bg(BG).fg(TEXT))
-                .wrap(Wrap { trim: false }),
+            paragraph
+                .block(block)
+                .scroll((app.result_scroll.min(maximum), 0)),
             dialog,
         );
     }
@@ -2178,6 +2239,91 @@ mod tests {
         assert_eq!(app.log_horizontal, 8);
         app.key(event::KeyEvent::new(KeyCode::Left, KeyModifiers::ALT));
         assert_eq!(app.log_horizontal, 0);
+    }
+    #[test]
+    fn loader_list_handoff_does_not_require_dismissing_a_result() {
+        let mut app = app();
+        app.task = Some(WorkKind::Other);
+        app.task_popup = true;
+        app.tx
+            .send(Message::LoaderVersions {
+                kind: crate::loader_catalog::InstallerKind::Fabric,
+                game: "1.21.1".into(),
+                versions: vec![],
+            })
+            .unwrap();
+        app.messages();
+        app.tx.send(Message::Done(Ok("列表已获取".into()))).unwrap();
+        app.messages();
+        assert!(app.loader_picker.is_some());
+        assert!(app.task_result.is_none());
+        assert!(!app.task_popup);
+        app.key(event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.loader_picker.is_none());
+    }
+    #[test]
+    fn long_result_scrolls_to_the_last_line_and_clamps() {
+        let mut app = app();
+        let message = format!("{}\nEND-OF-ERROR", "很长的中文错误信息。".repeat(150));
+        app.task_result = Some(("任务失败".into(), message));
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        assert!(app.result_max_scroll.get() > 0);
+        app.key(event::KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        let frame = terminal.draw(|f| draw(f, &app)).unwrap();
+        let text: String = frame
+            .buffer
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("END-OF-ERROR"));
+        app.key(event::KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.result_scroll, app.result_max_scroll.get());
+        app.key(event::KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(app.result_scroll, 0);
+    }
+    #[test]
+    fn repeated_navigation_works_but_confirmation_does_not_repeat() {
+        let mut app = app();
+        app.tab = 2;
+        app.key(event::KeyEvent::new_with_kind(
+            KeyCode::Down,
+            KeyModifiers::NONE,
+            KeyEventKind::Repeat,
+        ));
+        assert_eq!(app.setting, 1);
+        app.task = Some(WorkKind::Game);
+        app.confirm_stop = true;
+        app.key(event::KeyEvent::new_with_kind(
+            KeyCode::Char('y'),
+            KeyModifiers::NONE,
+            KeyEventKind::Repeat,
+        ));
+        assert!(!app.control.cancelled());
+        app.key(event::KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(app.control.cancelled());
+    }
+    #[test]
+    fn hidden_world_task_can_pause_cancel_and_close_picker() {
+        let mut app = app();
+        app.task = Some(WorkKind::Download);
+        app.pause_allowed = true;
+        app.world_picker = Some(WorldPicker {
+            instance: "1.21.1".into(),
+            worlds: vec![],
+            selected: 0,
+        });
+        app.key(event::KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        assert!(app.paused);
+        app.key(event::KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert!(app.control.cancelled());
+        assert!(!app.paused);
+        app.key(event::KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        assert!(!app.paused);
+        app.key(event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.world_picker.is_none());
+        assert!(app.task.is_some());
     }
     #[test]
     fn task_completion_is_visible_and_can_open_logs() {
