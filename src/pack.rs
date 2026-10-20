@@ -485,7 +485,12 @@ mod tests {
         fs::create_dir_all(&base).unwrap();
         fs::create_dir_all(root.join("assets/indexes")).unwrap();
         let control = crate::task::TaskControl::default();
-        fs::write(base.join("base.jar"), b"fixture-client").unwrap();
+        let mut client = zip::ZipWriter::new(fs::File::create(base.join("base.jar")).unwrap());
+        client
+            .start_file("META-INF/test", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        client.write_all(b"fixture-client").unwrap();
+        client.finish().unwrap();
         let index_path = root.join("assets/indexes/base.json");
         fs::write(&index_path, b"{\"objects\":{}}").unwrap();
         let client_hash = crate::pack_state::sha1_file(&base.join("base.jar"), &control).unwrap();
