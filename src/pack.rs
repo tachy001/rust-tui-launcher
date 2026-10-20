@@ -491,11 +491,12 @@ mod tests {
             .unwrap();
         client.write_all(b"fixture-client").unwrap();
         client.finish().unwrap();
+        let client_size = fs::metadata(base.join("base.jar")).unwrap().len();
         let index_path = root.join("assets/indexes/base.json");
         fs::write(&index_path, b"{\"objects\":{}}").unwrap();
         let client_hash = crate::pack_state::sha1_file(&base.join("base.jar"), &control).unwrap();
         let index_hash = crate::pack_state::sha1_file(&index_path, &control).unwrap();
-        fs::write(base.join("base.json"),json!({"id":"base","libraries":[],"downloads":{"client":{"url":"https://invalid.example/client.jar","sha1":client_hash,"size":14}},"assetIndex":{"id":"base","url":"https://invalid.example/index.json","sha1":index_hash,"size":14}}).to_string()).unwrap();
+        fs::write(base.join("base.json"),json!({"id":"base","libraries":[],"downloads":{"client":{"url":"https://invalid.example/client.jar","sha1":client_hash,"size":client_size}},"assetIndex":{"id":"base","url":"https://invalid.example/index.json","sha1":index_hash,"size":14}}).to_string()).unwrap();
         let source = temp.path.join("example.mrpack");
         let mut archive = zip::ZipWriter::new(fs::File::create(&source).unwrap());
         let options = zip::write::SimpleFileOptions::default();
