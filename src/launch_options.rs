@@ -7,6 +7,23 @@ pub struct ServerAddress {
     pub host: String,
     pub port: u16,
 }
+/// Expand only the original template; substituted paths and tokens are literal data.
+pub fn expand_argument(template: &str, values: &HashMap<&str, String>) -> Result<String> {
+    let mut output = String::new();
+    let mut remaining = template;
+    while let Some(start) = remaining.find("${") {
+        output.push_str(&remaining[..start]);
+        let suffix = &remaining[start + 2..];
+        let end = suffix.find('}').context("启动参数占位符缺少右花括号")?;
+        let value = values
+            .get(&suffix[..end])
+            .context("启动参数中存在未识别的占位符，请检查版本元数据或自定义参数")?;
+        output.push_str(value);
+        remaining = &suffix[end + 1..];
+    }
+    output.push_str(remaining);
+    Ok(output)
+}
 pub fn quickplay_address(input: &str) -> Result<String> {
     Ok(match server_address(input)? {
         Some(address) if address.host.contains(':') => {
@@ -117,6 +134,20 @@ pub fn game_arguments(config: &Config, meta: &Value) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn expansion_keeps_inserted_values_literal() {
+        let values = HashMap::from([
+            ("game_directory", r"C:\Games\${profile}\中文".into()),
+            ("auth_access_token", "${game_directory}".into()),
+        ]);
+        assert_eq!(
+            expand_argument("${game_directory}/${auth_access_token}", &values).unwrap(),
+            r"C:\Games\${profile}\中文/${game_directory}"
+        );
+        assert!(expand_argument("${unknown}", &values).is_err());
+        assert!(expand_argument("${unfinished", &values).is_err());
+        assert_eq!(expand_argument("plain", &values).unwrap(), "plain");
+    }
     #[test]
     fn accepts_domains_and_ipv6_but_rejects_paths_and_bad_ports() {
         assert_eq!(

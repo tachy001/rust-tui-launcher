@@ -410,12 +410,7 @@ impl Backend {
         args.extend(crate::launch_options::game_arguments(&config, meta)?);
         args.extend(shlex::split(&config.game_args).context("游戏参数引号不匹配")?);
         for arg in &mut args {
-            for (key, value) in &values {
-                *arg = arg.replace(&format!("${{{key}}}"), value);
-            }
-            if arg.contains("${") {
-                bail!("启动参数中存在未识别的占位符，请检查版本元数据或自定义参数");
-            }
+            *arg = crate::launch_options::expand_argument(arg, &values)?;
         }
         self.control.check()?;
         let log_path = game_dir.join("tui-mc-game.log");

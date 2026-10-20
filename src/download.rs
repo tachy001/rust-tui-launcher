@@ -126,6 +126,7 @@ impl Downloader {
             if offset > 0
                 && (entry.sha1.is_some() || entry.size.is_some())
                 && valid_file(partial, entry.sha1.as_deref(), entry.size)?
+                && valid_archive(partial, &entry.dest)?
             {
                 meter.update(job, offset, Some(offset), 0);
                 return commit(partial, &entry.dest);
@@ -142,13 +143,23 @@ impl Downloader {
                 .get(CONTENT_RANGE)
                 .and_then(|s| s.to_str().ok())
                 .context("断点响应缺少 Content-Range")?;
-            if !range.starts_with(&format!("bytes {}-", if resume { offset } else { 0 })) {
-                let _ = fs::remove_file(partial);
-                bail!("断点响应的起始位置错误");
+            let (end, total) = parse_content_range(range, if resume { offset } else { 0 })?;
+            if total.is_none() && entry.size.is_none() && entry.sha1.is_none() {
+                bail!("断点响应未提供总大小，且没有文件校验信息，无法确认下载完整");
             }
-            range_total = range
-                .split_once('/')
-                .and_then(|(_, total)| total.parse::<u64>().ok());
+            if entry
+                .size
+                .is_some_and(|size| total.is_some_and(|total| total != size))
+            {
+                bail!("断点响应的总大小与下载元数据不符");
+            }
+            if response
+                .content_length()
+                .is_some_and(|length| length != end - if resume { offset } else { 0 } + 1)
+            {
+                bail!("断点响应的长度与 Content-Range 不符");
+            }
+            range_total = total;
         }
         let expected_len = range_total.or_else(|| {
             response
@@ -187,12 +198,7 @@ impl Downloader {
             fs::remove_file(partial)?;
             bail!("文件大小或 SHA-1 校验失败");
         }
-        if entry
-            .dest
-            .extension()
-            .is_some_and(|ext| ext == "jar" || ext == "zip")
-            && zip::ZipArchive::new(fs::File::open(partial)?).is_err()
-        {
+        if !valid_archive(partial, &entry.dest)? {
             fs::remove_file(partial)?;
             bail!("下载结果不是有效 JAR / ZIP 文件");
         }
@@ -248,6 +254,32 @@ impl Downloader {
         self.control.check()
     }
 }
+fn valid_archive(path: &Path, destination: &Path) -> Result<bool> {
+    Ok(!is_archive(destination) || zip::ZipArchive::new(fs::File::open(path)?).is_ok())
+}
+fn is_archive(destination: &Path) -> bool {
+    destination
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("jar") || ext.eq_ignore_ascii_case("zip"))
+}
+
+fn parse_content_range(header: &str, offset: u64) -> Result<(u64, Option<u64>)> {
+    let range = header.strip_prefix("bytes ").context("断点响应单位无效")?;
+    let (bounds, total) = range.split_once('/').context("断点响应缺少总大小")?;
+    let (start, end) = bounds.split_once('-').context("断点响应范围无效")?;
+    let start = start.parse::<u64>().context("断点起始位置无效")?;
+    let end = end.parse::<u64>().context("断点结束位置无效")?;
+    let total = if total == "*" {
+        None
+    } else {
+        Some(total.parse::<u64>().context("断点总大小无效")?)
+    };
+    if start != offset || end < start || end == u64::MAX || total.is_some_and(|n| end >= n) {
+        bail!("断点响应范围与请求不符");
+    }
+    Ok((end, total))
+}
 fn commit(partial: &Path, dest: &Path) -> Result<()> {
     fs::rename(partial, dest)?;
     Ok(())
@@ -260,15 +292,11 @@ fn cached(entry: &Download) -> Result<bool> {
         return Ok(false);
     }
     if entry.sha1.is_some() || entry.size.is_some() {
-        return Ok(true);
+        return valid_archive(&entry.dest, &entry.dest);
     }
     // Maven profiles may omit hashes: a parseable archive avoids re-downloading every repair.
-    if entry
-        .dest
-        .extension()
-        .is_some_and(|ext| ext == "jar" || ext == "zip")
-    {
-        return Ok(zip::ZipArchive::new(fs::File::open(&entry.dest)?).is_ok());
+    if is_archive(&entry.dest) {
+        return valid_archive(&entry.dest, &entry.dest);
     }
     Ok(false)
 }
@@ -296,6 +324,30 @@ pub fn valid_file(path: &Path, expected: Option<&str>, size: Option<u64>) -> Res
 mod tests {
     use super::*;
     use std::net::TcpListener;
+    #[test]
+    fn validates_complete_range_instead_of_only_start_prefix() {
+        assert_eq!(parse_content_range("bytes 1-2/3", 1).unwrap(), (2, Some(3)));
+        assert_eq!(parse_content_range("bytes 1-2/*", 1).unwrap(), (2, None));
+        for invalid in [
+            "bytes 1-0/3",
+            "bytes 1-3/3",
+            "bytes 1-2/bad",
+            "bytes 10-12/13",
+            "bytes 1-18446744073709551615/*",
+            "items 1-2/3",
+        ] {
+            assert!(parse_content_range(invalid, 1).is_err(), "{invalid}");
+        }
+    }
+    #[test]
+    fn uppercase_archives_are_validated() {
+        let workspace = crate::test_support::Workspace::new();
+        let path = workspace.path.join("download.part");
+        fs::write(&path, b"not a jar").unwrap();
+        assert!(!valid_archive(&path, Path::new("mod.JAR")).unwrap());
+        assert!(!valid_archive(&path, Path::new("pack.ZIP")).unwrap());
+        assert!(valid_archive(&path, Path::new("asset")).unwrap());
+    }
     fn request_test(
         name: &str,
         partial_bytes: &[u8],
@@ -358,6 +410,15 @@ mod tests {
     #[test]
     fn resumes_range_response() {
         request_test("resume", b"a", "HTTP/1.1 206 Partial Content\r\nContent-Length: 2\r\nContent-Range: bytes 1-2/3\r\nConnection: close\r\n\r\nbc", "range: bytes=1-");
+    }
+    #[test]
+    fn complete_partial_is_committed_after_range_rejection() {
+        request_test(
+            "complete",
+            b"abc",
+            "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "range: bytes=3-",
+        );
     }
     #[test]
     fn resets_when_server_ignores_range() {

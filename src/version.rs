@@ -52,17 +52,18 @@ pub fn merge(parent: &Value, child: &Value) -> Value {
         match key.as_str() {
             "libraries" => {
                 let mut libraries = parent[key].as_array().cloned().unwrap_or_default();
-                for lib in value.as_array().into_iter().flatten() {
-                    if let Some(name) = lib["name"].as_str() {
-                        let identity = library_key(name);
-                        libraries.retain(|old| {
-                            old["name"]
-                                .as_str()
-                                .is_none_or(|n| library_key(n) != identity)
-                        });
-                    }
-                    libraries.push(lib.clone());
-                }
+                let overrides: HashSet<_> = value
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|lib| lib["name"].as_str().map(library_key))
+                    .collect();
+                libraries.retain(|old| {
+                    old["name"]
+                        .as_str()
+                        .is_none_or(|name| !overrides.contains(&library_key(name)))
+                });
+                libraries.extend(value.as_array().into_iter().flatten().cloned());
                 result[key] = json!(libraries);
             }
             "arguments" => {
@@ -83,6 +84,16 @@ pub fn merge(parent: &Value, child: &Value) -> Value {
     }
     if let Some(object) = result.as_object_mut() {
         object.remove("inheritsFrom");
+        if child
+            .pointer("/arguments/game")
+            .is_some_and(Value::is_array)
+        {
+            object.remove("minecraftArguments");
+        } else if child["minecraftArguments"].is_string() {
+            if let Some(arguments) = object.get_mut("arguments").and_then(Value::as_object_mut) {
+                arguments.remove("game");
+            }
+        }
     }
     result
 }
@@ -123,6 +134,28 @@ pub fn maven_path(name: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn inheritance_preserves_child_platform_variants_and_argument_format() {
+        let parent = json!({
+            "libraries": [{"name":"a:b:1"}],
+            "minecraftArguments":"--old",
+            "arguments":{"jvm":["-Dbase=true"]}
+        });
+        let child = json!({
+            "libraries":[
+                {"name":"a:b:2","rules":[{"action":"allow","os":{"name":"windows"}}]},
+                {"name":"a:b:2","rules":[{"action":"allow","os":{"name":"linux"}}]}
+            ],
+            "arguments":{"game":["--modern"]}
+        });
+        let merged = merge(&parent, &child);
+        assert_eq!(merged["libraries"].as_array().unwrap().len(), 2);
+        assert!(merged.get("minecraftArguments").is_none());
+        assert_eq!(merged["arguments"]["jvm"], json!(["-Dbase=true"]));
+        let legacy = merge(&merged, &json!({"minecraftArguments":"--legacy"}));
+        assert!(legacy["arguments"].get("game").is_none());
+        assert_eq!(legacy["minecraftArguments"], "--legacy");
+    }
     #[test]
     fn child_overrides_library_but_keeps_other_classifiers() {
         let merged = merge(

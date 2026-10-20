@@ -108,6 +108,8 @@ struct App {
     control: TaskControl,
     progress: (String, usize, usize),
     paused: bool,
+    task_popup: bool,
+    task_result: Option<(String, String)>,
     snapshots: bool,
     query: String,
     tx: Sender<Message>,
@@ -119,6 +121,7 @@ struct App {
     mod_list: Vec<ModEntry>,
     confirm_stop: bool,
     log_scroll: usize,
+    log_view_height: std::cell::Cell<usize>,
     log_horizontal: u16,
     accounts: Accounts,
     help: bool,
@@ -158,6 +161,8 @@ impl App {
             control: TaskControl::default(),
             progress: ("空闲".into(), 0, 0),
             paused: false,
+            task_popup: false,
+            task_result: None,
             snapshots: false,
             query: String::new(),
             tx,
@@ -169,6 +174,7 @@ impl App {
             mod_list: vec![],
             confirm_stop: false,
             log_scroll: 0,
+            log_view_height: std::cell::Cell::new(1),
             log_horizontal: 0,
             accounts: Accounts::load().unwrap_or_default(),
             help: false,
@@ -193,6 +199,12 @@ impl App {
             self.logs.push_back(line.to_owned());
             if self.logs.len() > 500 {
                 self.logs.pop_front();
+            }
+            if self.log_scroll > 0 {
+                self.log_scroll = self
+                    .log_scroll
+                    .saturating_add(1)
+                    .min(self.logs.len().saturating_sub(self.log_view_height.get()));
             }
         }
     }
@@ -255,6 +267,8 @@ impl App {
             return;
         }
         self.task = Some(kind);
+        self.task_result = None;
+        self.task_popup = kind != WorkKind::Game;
         self.pause_allowed = kind == WorkKind::Download;
         self.control = TaskControl::default();
         self.paused = false;
@@ -749,7 +763,22 @@ impl App {
                     self.selection = 0;
                 }
                 Message::Done(result) => {
+                    let show_result = self.task_popup || result.is_err();
+                    if show_result {
+                        let title = if self.control.cancelled() && result.is_err() {
+                            "任务已取消"
+                        } else if result.is_ok() {
+                            "任务已完成"
+                        } else {
+                            "任务失败"
+                        };
+                        let message = match &result {
+                            Ok(message) | Err(message) => message.clone(),
+                        };
+                        self.task_result = Some((title.into(), message));
+                    }
                     self.task = None;
+                    self.task_popup = false;
                     self.transfer = None;
                     self.paused = false;
                     self.confirm_stop = false;
@@ -783,6 +812,54 @@ impl App {
     }
     fn key(&mut self, key: event::KeyEvent) -> bool {
         if key.kind != KeyEventKind::Press {
+            return false;
+        }
+        if self.task_result.is_some()
+            && !self.help
+            && self.editor.is_none()
+            && !self.confirm_stop
+            && self.confirm_remove.is_none()
+        {
+            match key.code {
+                KeyCode::Enter | KeyCode::Esc => self.task_result = None,
+                KeyCode::Char('l') => {
+                    self.task_result = None;
+                    self.world_picker = None;
+                    self.loader_picker = None;
+                    self.tab = 6;
+                }
+                _ => {}
+            }
+            return false;
+        }
+        if self.task_popup
+            && self.task.is_some()
+            && !self.confirm_stop
+            && !self.help
+            && self.editor.is_none()
+            && self.confirm_remove.is_none()
+        {
+            match key.code {
+                KeyCode::Esc | KeyCode::F(6) => self.task_popup = false,
+                KeyCode::Char('l') => {
+                    self.task_popup = false;
+                    self.world_picker = None;
+                    self.loader_picker = None;
+                    self.tab = 6;
+                }
+                KeyCode::Char('p') if self.pause_allowed && !self.control.cancelled() => {
+                    self.paused = self.control.toggle_pause();
+                }
+                KeyCode::Char('c') if self.task == Some(WorkKind::Game) => {
+                    self.confirm_stop = true;
+                }
+                KeyCode::Char('c') => {
+                    self.control.cancel();
+                    self.paused = false;
+                }
+                KeyCode::F(1) => self.help = true,
+                _ => {}
+            }
             return false;
         }
         if let Some(id) = self.confirm_remove.clone() {
@@ -845,6 +922,10 @@ impl App {
                 KeyCode::Char(c) => self.editor.as_mut().unwrap().text.push(c),
                 _ => {}
             }
+            return false;
+        }
+        if key.code == KeyCode::F(6) && self.task.is_some() {
+            self.task_popup = true;
             return false;
         }
         if let Some(picker) = &mut self.world_picker {
@@ -949,6 +1030,7 @@ impl App {
                     }
                 }
             }
+            KeyCode::F(6) if self.task.is_some() => self.task_popup = true,
             KeyCode::F(1) => self.help = true,
             KeyCode::Char('q') | KeyCode::Esc => {
                 if self.task.is_none() {
@@ -964,10 +1046,10 @@ impl App {
                     self.log("请按 C 取消任务后退出");
                 }
             }
-            KeyCode::Right if self.tab == 6 => {
+            KeyCode::Right if self.tab == 6 && key.modifiers.contains(KeyModifiers::ALT) => {
                 self.log_horizontal = self.log_horizontal.saturating_add(8);
             }
-            KeyCode::Left if self.tab == 6 => {
+            KeyCode::Left if self.tab == 6 && key.modifiers.contains(KeyModifiers::ALT) => {
                 self.log_horizontal = self.log_horizontal.saturating_sub(8);
             }
             KeyCode::Tab | KeyCode::Right => {
@@ -992,26 +1074,38 @@ impl App {
                 }
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                if self.tab == 2 {
+                if self.tab == 6 {
+                    self.log_scroll = self.log_scroll.saturating_sub(1);
+                } else if self.tab == 2 {
                     self.setting = (self.setting + 1) % SETTINGS.len();
                 } else if self.count() > 0 {
                     self.selection = (self.selection + 1) % self.count();
                 }
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                if self.tab == 2 {
+                if self.tab == 6 {
+                    self.log_scroll = self
+                        .log_scroll
+                        .saturating_add(1)
+                        .min(self.logs.len().saturating_sub(self.log_view_height.get()));
+                } else if self.tab == 2 {
                     self.setting = (self.setting + SETTINGS.len() - 1) % SETTINGS.len();
                 } else if self.count() > 0 {
                     self.selection = (self.selection + self.count() - 1) % self.count();
                 }
             }
             KeyCode::PageUp if self.tab == 6 => {
-                self.log_scroll = (self.log_scroll + 10).min(self.logs.len().saturating_sub(1))
+                self.log_scroll = self
+                    .log_scroll
+                    .saturating_add(self.log_view_height.get())
+                    .min(self.logs.len().saturating_sub(self.log_view_height.get()))
             }
             KeyCode::PageDown if self.tab == 6 => {
-                self.log_scroll = self.log_scroll.saturating_sub(10)
+                self.log_scroll = self.log_scroll.saturating_sub(self.log_view_height.get())
             }
-            KeyCode::Home if self.tab == 6 => self.log_scroll = self.logs.len().saturating_sub(1),
+            KeyCode::Home if self.tab == 6 => {
+                self.log_scroll = self.logs.len().saturating_sub(self.log_view_height.get())
+            }
             KeyCode::End if self.tab == 6 => self.log_scroll = 0,
             KeyCode::Home | KeyCode::End | KeyCode::PageUp | KeyCode::PageDown => {
                 let last = self.count().saturating_sub(1);
@@ -1396,7 +1490,7 @@ fn page_actions(app: &App) -> &'static str {
     match app.tab {
         0 => "Enter 启动 · X 修复 · O 设置 · M Mod\nW 存档 · B Java · L 日志 · D 诊断\nF Fabric · U Quilt · H Forge · N NeoForge\nF2 名称 · T 复制 · E 导出 · Del 回收\nI 导入整合包 · / 搜索 · R 刷新",
         1 => "Enter 安装原版 · R 获取版本目录\nF Fabric · U Quilt · H Forge · N NeoForge\nS 切换快照 · / 搜索 · I 导入整合包",
-        6 => "PgUp / PgDn 翻页 · ← → 查看长行\nHome 最早记录 · End 跟随最新记录",
+        6 => "↑↓ 滚动 · PgUp / PgDn 翻页\n← → 切页 · Alt+← → 查看长行\nHome 最早记录 · End 跟随最新记录",
         2 => "Enter 编辑 · G 全局设置\nD 清除当前实例覆盖 · V 检测 Java\n编辑：Enter 保存 · Esc 取消 · Ctrl+U 清空",
         3 if app.mod_versions.is_some() => "Enter 安装所选版本\nBackspace 返回搜索结果 · L 本地 Mod",
         3 if app.mod_search.is_some() => "Enter 安装 · V 选择版本 · B 搜索\nN 下一页 · P 上一页 · L 本地 Mod",
@@ -1567,7 +1661,11 @@ fn draw(f: &mut Frame, app: &App) {
         }
         6 => {
             let height = rows[2].height.saturating_sub(2) as usize;
-            let end = app.logs.len().saturating_sub(app.log_scroll);
+            app.log_view_height.set(height.max(1));
+            let scroll = app
+                .log_scroll
+                .min(app.logs.len().saturating_sub(height.max(1)));
+            let end = app.logs.len().saturating_sub(scroll);
             let start = end.saturating_sub(height);
             let lines = app
                 .logs
@@ -1789,7 +1887,7 @@ fn draw(f: &mut Frame, app: &App) {
         Paragraph::new(vec![
             Line::styled(primary, Style::default().fg(ACCENT)),
             Line::styled(
-                "Tab 页面 · ↑↓ 选择 · F1 帮助 · Q 退出",
+                "Tab 页面 · ↑↓ 选择 · F6 任务 · F1 帮助 · Q 退出",
                 Style::default().fg(MUTED),
             ),
         ]),
@@ -1846,6 +1944,95 @@ fn draw(f: &mut Frame, app: &App) {
                 .highlight_style(Style::default().bg(ACCENT).fg(BG)),
             dialog,
             &mut state,
+        );
+    }
+    if app.task_popup && app.task.is_some() {
+        let dialog = dialog_rect(area, 76, 13);
+        f.render_widget(Clear, dialog);
+        let state = if app.control.cancelled() {
+            "正在取消 · 等待当前操作结束"
+        } else if app.paused {
+            "已暂停"
+        } else {
+            "任务进行中"
+        };
+        let block = panel(state).style(Style::default().bg(BG).fg(TEXT));
+        let inner = block.inner(dialog);
+        f.render_widget(block, dialog);
+        let sections = Layout::default()
+            .constraints([
+                Constraint::Length(2),
+                Constraint::Length(2),
+                Constraint::Length(2),
+                Constraint::Min(0),
+                Constraint::Length(2),
+            ])
+            .split(inner);
+        f.render_widget(
+            Paragraph::new(label.as_str()).wrap(Wrap { trim: false }),
+            sections[0],
+        );
+        let known = app.transfer.as_ref().map_or(*total > 0, |(transfer, _)| {
+            transfer.total.is_some_and(|total| total > 0)
+        });
+        f.render_widget(
+            Gauge::default()
+                .ratio(ratio)
+                .gauge_style(Style::default().fg(ACCENT).bg(Color::Rgb(27, 39, 50)))
+                .label(if known {
+                    format!("{:.0}%", ratio * 100.0)
+                } else {
+                    "处理中 · 等待进度".into()
+                }),
+            sections[1],
+        );
+        let detail = app.transfer.as_ref().map_or_else(
+            || {
+                if *total > 0 {
+                    format!("{done} / {total} 项")
+                } else {
+                    "准备或处理文件中".into()
+                }
+            },
+            |(transfer, updated)| {
+                if !app.paused && updated.elapsed() > Duration::from_secs(3) {
+                    "等待数据或校验中".into()
+                } else {
+                    transfer.display(app.paused)
+                }
+            },
+        );
+        f.render_widget(
+            Paragraph::new(detail).wrap(Wrap { trim: false }),
+            sections[2],
+        );
+        f.render_widget(
+            Paragraph::new(app.logs.back().map(String::as_str).unwrap_or(""))
+                .style(Style::default().fg(MUTED))
+                .wrap(Wrap { trim: false }),
+            sections[3],
+        );
+        let controls = if app.control.cancelled() {
+            "Esc 后台等待 · L 查看日志"
+        } else if app.pause_allowed {
+            "P 暂停/继续 · C 取消\nEsc 后台运行 · L 日志 · F6 任务"
+        } else {
+            "C 取消 · Esc 后台运行\nL 日志 · F6 任务"
+        };
+        f.render_widget(
+            Paragraph::new(controls).style(Style::default().fg(ACCENT)),
+            sections[4],
+        );
+    }
+    if let Some((title, message)) = &app.task_result {
+        let dialog = dialog_rect(area, 76, 12);
+        f.render_widget(Clear, dialog);
+        f.render_widget(
+            Paragraph::new(message.as_str())
+                .block(panel(title.as_str()).title_bottom(" Enter / Esc 关闭 · L 查看日志 "))
+                .style(Style::default().bg(BG).fg(TEXT))
+                .wrap(Wrap { trim: false }),
+            dialog,
         );
     }
     if let Some(editor) = &app.editor {
@@ -1986,11 +2173,117 @@ mod tests {
         assert_eq!(input_tail("abc中文xyz", 7), "中文xyz");
         assert_eq!(input_tail("中文", 1), "");
         app.tab = 6;
-        app.key(event::KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        app.key(event::KeyEvent::new(KeyCode::Right, KeyModifiers::ALT));
         assert_eq!(app.tab, 6);
         assert_eq!(app.log_horizontal, 8);
-        app.key(event::KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        app.key(event::KeyEvent::new(KeyCode::Left, KeyModifiers::ALT));
         assert_eq!(app.log_horizontal, 0);
+    }
+    #[test]
+    fn task_completion_is_visible_and_can_open_logs() {
+        let mut app = app();
+        app.task = Some(WorkKind::Download);
+        app.task_popup = true;
+        app.tx
+            .send(Message::Done(Ok("资源安装完成".into())))
+            .unwrap();
+        app.messages();
+        assert!(app.task.is_none());
+        assert!(!app.task_popup);
+        assert_eq!(app.task_result.as_ref().unwrap().0, "任务已完成");
+        app.key(event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.task_result.is_none());
+        app.task = Some(WorkKind::Download);
+        app.tx
+            .send(Message::Done(Err("文件校验失败".into())))
+            .unwrap();
+        app.messages();
+        assert_eq!(app.task_result.as_ref().unwrap().0, "任务失败");
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        app.key(event::KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        assert!(app.task_result.is_none());
+        assert_eq!(app.tab, 6);
+    }
+    #[test]
+    fn task_popup_controls_and_layout() {
+        let mut app = app();
+        app.task = Some(WorkKind::Download);
+        app.pause_allowed = true;
+        app.progress = ("下载游戏资源".into(), 3, 10);
+        app.key(event::KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE));
+        assert!(app.task_popup);
+        app.key(event::KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        assert!(app.paused);
+        for (width, height) in [(100, 30), (60, 18), (40, 12)] {
+            let mut terminal =
+                Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            terminal.draw(|f| draw(f, &app)).unwrap();
+        }
+        app.key(event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.task_popup);
+        assert!(!app.control.cancelled());
+        app.key(event::KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE));
+        app.key(event::KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert!(app.control.cancelled());
+        assert!(!app.paused);
+        app.key(event::KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        assert_eq!(app.tab, 6);
+        assert!(!app.task_popup);
+    }
+    #[test]
+    fn log_history_stays_anchored_and_pages_use_visible_height() {
+        let mut app = app();
+        app.tab = 6;
+        app.logs.clear();
+        for index in 0..30 {
+            app.log(format!("line {index}"));
+        }
+        app.log_view_height.set(8);
+        app.key(event::KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(app.log_scroll, 8);
+        let end = app.logs.len() - app.log_scroll;
+        let anchor = app.logs[end - 1].clone();
+        app.log("new line");
+        assert_eq!(app.logs[app.logs.len() - app.log_scroll - 1], anchor);
+        app.key(event::KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(app.logs.len() - app.log_scroll, 8);
+        app.key(event::KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        app.log("follow latest");
+        assert_eq!(app.log_scroll, 0);
+        for _ in 0..600 {
+            app.log("bounded");
+        }
+        app.key(event::KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        app.log("evict oldest");
+        assert_eq!(app.logs.len(), 500);
+        assert_eq!(app.log_scroll, 492);
+    }
+    #[test]
+    fn log_arrows_scroll_and_leave_page() {
+        let mut app = app();
+        app.tab = 6;
+        app.logs = vec!["first".into(), "second".into(), "third".into()].into();
+        for _ in 0..4 {
+            app.key(event::KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        }
+        assert_eq!(app.log_scroll, 2);
+        app.key(event::KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.log_scroll, 1);
+        app.key(event::KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        app.key(event::KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.log_scroll, 0);
+        app.key(event::KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(app.tab, 5);
+        app.key(event::KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.tab, 6);
+        app.key(event::KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.tab, 0);
+        app.key(event::KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(app.tab, 6);
+        app.logs.clear();
+        app.key(event::KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.log_scroll, 0);
     }
     #[test]
     fn loader_picker_scrolls_and_cancels_without_installing() {
