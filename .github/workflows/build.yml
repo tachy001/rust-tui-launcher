@@ -54,7 +54,7 @@ jobs:
           cargo build --locked --release --target x86_64-apple-darwin
           mkdir -p target/release
           lipo -create target/aarch64-apple-darwin/release/tui-launcher target/x86_64-apple-darwin/release/tui-launcher -output target/release/tui-launcher
-          lipo -verify_arch arm64 x86_64 target/release/tui-launcher
+          lipo target/release/tui-launcher -verify_arch arm64 x86_64
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'

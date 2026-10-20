@@ -40,7 +40,7 @@ def main():
         raise SystemExit(f"Build first: missing {executable}")
     if universal:
         subprocess.run(
-            ["lipo", "-verify_arch", "arm64", "x86_64", str(executable)], check=True
+            ["lipo", str(executable), "-verify_arch", "arm64", "x86_64"], check=True
         )
     dist = root / "dist"
     dist.mkdir(exist_ok=True)
