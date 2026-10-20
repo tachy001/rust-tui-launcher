@@ -1,0 +1,116 @@
+name: Cross-platform build
+
+on:
+  push:
+    tags:
+      - 'v*'
+    branches:
+      - '**'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: windows-x64
+          - os: ubuntu-24.04
+            name: linux-x64
+          - os: macos-15
+            name: macos-universal
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libdbus-1-dev
+      - name: Set up Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+      - name: Check format
+        run: cargo fmt --check
+      - name: Check code
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Local tests
+        run: cargo test --locked
+      - name: Check Unix launcher script
+        if: runner.os != 'Windows'
+        run: sh -n run.sh
+      - name: Build
+        if: runner.os != 'macOS'
+        run: cargo build --locked --release
+      - name: Build macOS universal executable
+        if: runner.os == 'macOS'
+        run: |
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          cargo build --locked --release --target aarch64-apple-darwin
+          cargo build --locked --release --target x86_64-apple-darwin
+          mkdir -p target/release
+          lipo -create target/aarch64-apple-darwin/release/tui-launcher target/x86_64-apple-darwin/release/tui-launcher -output target/release/tui-launcher
+          lipo -verify_arch arm64 x86_64 target/release/tui-launcher
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check release tag matches Cargo version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          python -c 'import os,tomllib; v=tomllib.load(open("Cargo.toml","rb"))["package"]["version"]; assert os.environ["GITHUB_REF_NAME"] == "v"+v, "Tag and Cargo version differ"'
+      - name: Prepare release executable or minimal Unix package
+        run: python scripts/package_release.py --platform ${{ matrix.name }}
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.name }}
+          path: |
+            dist/*-windows-x64.exe
+            dist/*-linux-x64.tar.gz
+            dist/*-macos-universal.tar.gz
+          if-no-files-found: error
+
+  draft-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Create or update draft prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          shopt -s nullglob
+          packages=(dist/*-windows-x64.exe dist/*-linux-x64.tar.gz dist/*-macos-universal.tar.gz)
+          test "${#packages[@]}" -eq 3
+          if gh release view "$RELEASE_TAG" --json isDraft >/dev/null 2>&1; then
+            test "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = true
+            gh release upload "$RELEASE_TAG" "${packages[@]}" --clobber
+            # Remove obsolete draft attachments only after all packages upload.
+            gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' |
+              while IFS= read -r asset; do
+                keep=false
+                for package in "${packages[@]}"; do
+                  if [[ "$asset" == "${package##*/}" ]]; then keep=true; fi
+                done
+                if [[ "$keep" == false ]]; then
+                  gh release delete-asset "$RELEASE_TAG" "$asset" --yes
+                fi
+              done
+          else
+            gh release create "$RELEASE_TAG" "${packages[@]}" --verify-tag --draft --prerelease --generate-notes
+          fi

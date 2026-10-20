@@ -1,0 +1,15 @@
+/target/
+/.tools/
+/launcher.json
+/.minecraft/
+/.tui-mc/
+*.log
+/dist/
+/.venv/
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
+.env
+.env.*
+!.env.example
