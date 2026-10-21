@@ -135,15 +135,25 @@ fn effective_destination(root: &Path, path: &str) -> Result<PathBuf> {
     Ok(dest)
 }
 impl Backend {
+    #[cfg(test)]
     pub fn repair_pack_files(&self, config: &Config, id: &str) -> Result<()> {
+        let mutation = crate::instance_service::InstanceMutation::begin(&config.root()?, id)?;
+        self.repair_pack_files_with_session(config, id, &mutation)
+    }
+    pub(crate) fn repair_pack_files_with_session(
+        &self,
+        config: &Config,
+        id: &str,
+        mutation: &crate::instance_service::InstanceMutation,
+    ) -> Result<()> {
         valid_id(id)?;
         let root = config.root()?;
+        mutation.require(&root, id)?;
         let version_dir = root.join("versions").join(id);
         let receipt_path = version_dir.join(RECEIPT);
         if !receipt_path.exists() {
             return Ok(());
         }
-        let _lock = crate::instances::InstanceLock::acquire(&version_dir)?;
         let receipt: Receipt =
             serde_json::from_slice(&fs::read(receipt_path)?).context("整合包修复记录损坏")?;
         if receipt.schema != 1 || receipt.instance != id {

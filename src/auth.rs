@@ -1,3 +1,4 @@
+use crate::account_service::CredentialStore;
 use crate::{
     accounts::{Account, AccountKind, Accounts},
     backend::Backend,
@@ -43,31 +44,15 @@ struct OAuthToken {
     #[serde(default)]
     refresh_token: String,
 }
-fn credential(account: &Account, kind: &str) -> Result<keyring::Entry> {
-    keyring::Entry::new(
-        "tui-mc",
-        &format!("{}:{}:{kind}", account.id, account.client_id),
-    )
-    .context("无法打开系统安全凭证存储")
-}
 fn save_secret(account: &Account, kind: &str, secret: &str) -> Result<()> {
-    credential(account, kind)?
-        .set_password(secret)
-        .context("安全凭证保存失败；令牌不会写入普通配置文件")
+    crate::account_service::SystemCredentials.write(account, kind, secret)
 }
 fn read_secret(account: &Account, kind: &str) -> Result<Zeroizing<String>> {
-    Ok(Zeroizing::new(
-        credential(account, kind)?
-            .get_password()
-            .context("读取账户凭证失败，请重新登录")?,
-    ))
+    crate::account_service::SystemCredentials
+        .read(account, kind)?
+        .context("读取账户凭证失败，请重新登录")
 }
-pub fn delete_secret(account: &Account, kind: &str) -> Result<()> {
-    match credential(account, kind)?.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => Err(e).context("删除系统凭证失败"),
-    }
-}
+
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -204,9 +189,14 @@ impl Backend {
                 interval = interval.saturating_add(5);
             }
         };
-        self.finish_auth(&config.microsoft_client_id, &token)
+        self.finish_auth(&config.microsoft_client_id, &token, None)
     }
-    fn finish_auth(&self, client_id: &str, oauth: &OAuthToken) -> Result<String> {
+    fn finish_auth(
+        &self,
+        client_id: &str,
+        oauth: &OAuthToken,
+        expected_account: Option<&str>,
+    ) -> Result<String> {
         self.control.check()?;
         self.log("微软授权完成，正在验证 Xbox 与 Minecraft 资格…");
         let xbox=send_json(self.client.post("https://user.auth.xboxlive.com/user/authenticate").json(&json!({"Properties":{"AuthMethod":"RPS","SiteName":"user.auth.xboxlive.com","RpsTicket":format!("d={}",oauth.access_token)},"RelyingParty":"http://auth.xboxlive.com","TokenType":"JWT"})),"Xbox 登录")?;
@@ -270,11 +260,20 @@ impl Backend {
         if oauth.refresh_token.is_empty() {
             bail!("微软未返回刷新令牌，请确认请求了 offline_access 权限");
         }
-        save_secret(&account, "refresh", &oauth.refresh_token)?;
-        save_secret(&account, "minecraft", access)?;
-        let mut accounts = Accounts::load()?;
-        accounts.upsert(account);
-        accounts.save()?;
+        if expected_account.is_some_and(|id| id != account.id) {
+            bail!("刷新后的 Minecraft 账户身份不一致，请重新登录");
+        }
+        self.control.check()?;
+        crate::account_service::AccountService::new(
+            &crate::account_service::FileAccountIndex,
+            &crate::account_service::SystemCredentials,
+        )
+        .commit_login(
+            account,
+            &oauth.refresh_token,
+            access,
+            expected_account.is_none(),
+        )?;
         Ok(format!("正版账户已登录：{name}"))
     }
     fn refresh_account(&self, account: &Account) -> Result<()> {
@@ -294,7 +293,7 @@ impl Backend {
             oauth.refresh_token = refresh.to_string();
         }
         save_secret(account, "refresh", &oauth.refresh_token)?;
-        self.finish_auth(&account.client_id, &oauth)?;
+        self.finish_auth(&account.client_id, &oauth, Some(&account.id))?;
         Ok(())
     }
     pub fn account_session(&self, config: &Config) -> Result<Session> {

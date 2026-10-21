@@ -17,6 +17,17 @@ pub struct InstanceSettings {
 mod tests {
     use super::*;
     #[test]
+    fn rejects_nul_in_both_custom_argument_fields() {
+        let mut config = Config {
+            jvm_args: "-Dvalue=\0".into(),
+            ..Config::default()
+        };
+        assert!(format!("{:#}", config.validate().unwrap_err()).contains("JVM 参数"));
+        config.jvm_args.clear();
+        config.game_args = "--value \0".into();
+        assert!(format!("{:#}", config.validate().unwrap_err()).contains("游戏参数"));
+    }
+    #[test]
     fn legacy_config_gets_new_defaults() {
         let config: Config = serde_json::from_str(
             r#"{"game_dir":".minecraft","java":"java","username":"Player","memory_mb":2048}"#,
@@ -153,10 +164,11 @@ impl Config {
         if !(320..=16384).contains(&self.width) || !(240..=16384).contains(&self.height) {
             bail!("窗口宽高超出允许范围");
         }
-        for value in [&self.jvm_args, &self.game_args] {
-            if shlex::split(value).is_none() {
-                bail!("自定义参数的引号不匹配");
-            }
+        let parser = crate::argument_service::ArgumentParser::current();
+        for (name, value) in [("JVM 参数", &self.jvm_args), ("游戏参数", &self.game_args)] {
+            parser
+                .parse(value)
+                .with_context(|| format!("{name}格式错误"))?;
         }
         Ok(())
     }

@@ -1,18 +1,21 @@
+use crate::mod_dependency_service::ModRequest as Request;
+use crate::mod_plan_service::ModArtifactSource;
+#[cfg(test)]
+use crate::storage::atomic_write;
 use crate::{
     backend::Backend,
     config::Config,
     download::{valid_file, Download},
     metadata::{safe_path, valid_id},
-    storage::atomic_write,
     version,
 };
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 const API: &str = "https://api.modrinth.com/v2";
@@ -116,7 +119,7 @@ pub fn target(config: &Config, id: &str) -> Result<Target> {
         loader: loaders.into_iter().next().unwrap().into(),
     })
 }
-fn identifier(id: &str) -> Result<()> {
+pub(crate) fn identifier(id: &str) -> Result<()> {
     if id.is_empty()
         || id.len() > 128
         || !id
@@ -127,10 +130,10 @@ fn identifier(id: &str) -> Result<()> {
     }
     Ok(())
 }
-fn compatible(version: &ModVersion, target: &Target) -> bool {
+pub(crate) fn compatible(version: &ModVersion, target: &Target) -> bool {
     version.game_versions.contains(&target.minecraft) && version.loaders.contains(&target.loader)
 }
-fn version_rank(value: &str) -> u8 {
+pub(crate) fn version_rank(value: &str) -> u8 {
     match value {
         "release" => 0,
         "beta" => 1,
@@ -150,7 +153,7 @@ fn choose(mut versions: Vec<ModVersion>, target: &Target) -> Result<ModVersion> 
         .next()
         .context("该项目没有适用于当前 Minecraft / 加载器的版本")
 }
-fn primary_file(version: &ModVersion) -> Result<&ModFile> {
+pub(crate) fn primary_file(version: &ModVersion) -> Result<&ModFile> {
     let candidates = version
         .files
         .iter()
@@ -173,105 +176,38 @@ fn primary_file(version: &ModVersion) -> Result<&ModFile> {
     }
     Ok(file)
 }
-#[derive(Clone)]
-struct Request {
-    project: Option<String>,
-    version: Option<String>,
-    expected_project: Option<String>,
+struct ModrinthCatalog<'a> {
+    backend: &'a Backend,
+    target: &'a Target,
 }
+impl crate::mod_dependency_service::ModCatalog for ModrinthCatalog<'_> {
+    fn check_task(&self) -> Result<()> {
+        self.backend.control.check()
+    }
+    fn candidates(&self, request: &Request) -> Result<Vec<ModVersion>> {
+        self.check_task()?;
+        if let Some(id) = &request.version {
+            identifier(id)?;
+            Ok(vec![serde_json::from_value(
+                self.backend.get_json(&format!("{API}/version/{id}"))?,
+            )?])
+        } else {
+            let project = request.project.as_ref().context("依赖缺少项目 ID")?;
+            self.backend.versions_for(self.target, project)
+        }
+    }
+}
+#[cfg(test)]
 fn resolve_plan(
     target: &Target,
     root: Request,
-    mut fetch: impl FnMut(&Request) -> Result<ModVersion>,
+    fetch: impl FnMut(&Request) -> Result<ModVersion>,
 ) -> Result<Vec<ModVersion>> {
-    let mut pending = VecDeque::from([root]);
-    let mut planned: BTreeMap<String, ModVersion> = BTreeMap::new();
-    while let Some(request) = pending.pop_front() {
-        if planned.len() > 256 || pending.len() > 2000 {
-            bail!("Mod 必需依赖数量过多，拒绝继续递归");
-        }
-        if let Some(known) = request
-            .version
-            .as_ref()
-            .and_then(|id| planned.values().find(|version| &version.id == id))
-        {
-            if request
-                .expected_project
-                .as_ref()
-                .is_some_and(|project| project != &known.project_id)
-            {
-                bail!("依赖版本与项目身份不匹配");
-            }
-            continue;
-        }
-        if request.version.is_none()
-            && request
-                .expected_project
-                .as_ref()
-                .is_some_and(|project| planned.contains_key(project))
-        {
-            continue;
-        }
-        let version = fetch(&request)?;
-        identifier(&version.id)?;
-        identifier(&version.project_id)?;
-        if request.version.as_ref().is_some_and(|id| id != &version.id)
-            || request
-                .expected_project
-                .as_ref()
-                .is_some_and(|id| id != &version.project_id)
-        {
-            bail!("Modrinth 依赖响应的项目或版本身份不一致");
-        }
-        if !compatible(&version, target) {
-            bail!(
-                "依赖 {} 不支持 Minecraft {} / {}",
-                version.name,
-                target.minecraft,
-                target.loader
-            );
-        }
-        if let Some(old) = planned.get(&version.project_id) {
-            if old.id != version.id {
-                bail!(
-                    "项目 {} 的必需依赖存在版本冲突：{} / {}",
-                    version.project_id,
-                    old.version_number,
-                    version.version_number
-                );
-            }
-            continue;
-        }
-        primary_file(&version)?;
-        for dep in &version.dependencies {
-            if dep.dependency_type != "required" {
-                continue;
-            }
-            if dep.project_id.is_none() && dep.version_id.is_none() {
-                bail!("必需依赖没有可解析的项目 / 版本 ID，请手动安装");
-            }
-            pending.push_back(Request {
-                project: dep.project_id.clone(),
-                version: dep.version_id.clone(),
-                expected_project: dep.project_id.clone(),
-            });
-        }
-        planned.insert(version.project_id.clone(), version);
-    }
-    for version in planned.values() {
-        for dep in &version.dependencies {
-            if dep.dependency_type == "incompatible"
-                && planned.values().any(|candidate| {
-                    dep.project_id.as_ref() == Some(&candidate.project_id)
-                        || dep.version_id.as_ref() == Some(&candidate.id)
-                })
-            {
-                bail!("待安装项目包含声明不兼容的 Mod");
-            }
-        }
-    }
-    Ok(planned.into_values().collect())
+    let fetch = std::cell::RefCell::new(fetch);
+    let source = |request: &Request| Ok(vec![(fetch.borrow_mut())(request)?]);
+    crate::mod_dependency_service::ModDependencyResolver::new(target, &source).resolve(root)
 }
+
 fn inventory(dir: &Path) -> Result<Inventory> {
     let path = dir.join(INVENTORY);
     if !path.exists() {
@@ -373,36 +309,12 @@ impl Backend {
             version: requested.map(str::to_owned),
             expected_project: root_project,
         };
-        let plan = resolve_plan(&target, request, |request| {
-            self.control.check()?;
-            if let Some(id) = &request.version {
-                identifier(id)?;
-                Ok(serde_json::from_value(
-                    self.get_json(&format!("{API}/version/{id}"))?,
-                )?)
-            } else {
-                let project = request.project.as_ref().context("依赖缺少项目 ID")?;
-                choose(self.versions_for(&target, project)?, &target)
-            }
-        })?;
         let root = config.root()?;
         let version_dir = root.join("versions").join(id);
         let _lock = crate::instances::InstanceLock::acquire(&version_dir)?;
         let game_dir = config.effective(id).instance_dir(id)?;
         let current = inventory(&game_dir)?;
-        for version in &plan {
-            for dep in &version.dependencies {
-                if dep.dependency_type == "incompatible"
-                    && current.entries.values().any(|old| {
-                        (dep.project_id.as_ref() == Some(&old.project)
-                            || dep.version_id.as_ref() == Some(&old.version))
-                            && game_dir.join("mods").join(&old.filename).is_file()
-                    })
-                {
-                    bail!("新 Mod 与已启用的项目不兼容，请先禁用冲突文件");
-                }
-            }
-        }
+        let activation = crate::mod_install_service::ModInstallState::new(&game_dir, &current);
         let token = format!(
             "{}-{}",
             std::process::id(),
@@ -412,6 +324,66 @@ impl Backend {
         );
         let staging = game_dir.join("tui-mc-mod-downloads").join(&token);
         fs::create_dir_all(&staging)?;
+        let artifacts = crate::mod_plan_service::StagedModArtifacts::new(self, &game_dir);
+        let validator = if target.loader == "fabric" {
+            let installed = crate::fabric_check::active_paths(config, id)?
+                .into_iter()
+                .map(|path| {
+                    let filename = path.file_name().unwrap_or_default().to_string_lossy();
+                    let project = current
+                        .entries
+                        .values()
+                        .find(|old| old.filename.eq_ignore_ascii_case(&filename))
+                        .map(|old| old.project.clone());
+                    crate::mod_plan_service::InstalledArtifact { path, project }
+                })
+                .collect();
+            let resolved = version::resolve(&root, id)?;
+            Some(
+                crate::mod_plan_service::FabricPlanValidator::new(
+                    &artifacts,
+                    installed,
+                    crate::fabric_check::builtins(&resolved.meta, &target.minecraft, None),
+                )
+                .with_activation(&activation),
+            )
+        } else {
+            None
+        };
+        let catalog = ModrinthCatalog {
+            backend: self,
+            target: &target,
+        };
+        let mut resolver =
+            crate::mod_dependency_service::ModDependencyResolver::new(&target, &catalog);
+        if let Some(validator) = &validator {
+            resolver = resolver.with_validator(validator);
+        }
+        let plan = resolver.resolve(request)?;
+        for version in &plan {
+            if !activation
+                .state(&version.project_id, &primary_file(version)?.filename)?
+                .enabled()
+            {
+                continue;
+            }
+            for dep in &version.dependencies {
+                if dep.dependency_type == "incompatible"
+                    && current.entries.values().any(|old| {
+                        crate::mod_dependency_service::dependency_matches_ids(
+                            dep,
+                            &old.project,
+                            &old.version,
+                        ) && !plan
+                            .iter()
+                            .any(|replacement| replacement.project_id == old.project)
+                            && game_dir.join("mods").join(&old.filename).is_file()
+                    })
+                {
+                    bail!("新 Mod 与已启用的项目不兼容，请先禁用冲突文件");
+                }
+            }
+        }
         let mut downloads = vec![];
         let mut records = vec![];
         let mut filenames = HashSet::new();
@@ -446,7 +418,9 @@ impl Backend {
                 &game_dir.join("mods"),
                 &format!("{}.disabled", file.filename),
             )?;
-            if !already_valid && valid_file(&disabled, Some(&hash), Some(file.size))? {
+            if !already_valid && target.loader == "fabric" {
+                fs::copy(artifacts.artifact(&version)?, &dest)?;
+            } else if !already_valid && valid_file(&disabled, Some(&hash), Some(file.size))? {
                 fs::copy(&disabled, &dest)?;
             } else if !already_valid {
                 downloads.push(Download {
@@ -489,6 +463,12 @@ impl Backend {
                 })
             });
             for (record, _) in &records {
+                if !activation
+                    .state(&record.project, &record.filename)?
+                    .enabled()
+                {
+                    continue;
+                }
                 let staged = safe_path(&staging, &record.filename)?;
                 paths.push(if staged.is_file() {
                     staged
@@ -501,28 +481,33 @@ impl Backend {
             crate::fabric_check::audit(&paths, &builtins)
                 .context("文件已下载但尚未替换，请选择满足包内依赖范围的版本")?;
         }
-        commit(
+        crate::mod_install_service::ModInstallTransaction::new(
             &game_dir,
             &staging,
             &token,
             &records,
             &current,
             &self.control,
-        )?;
+        )
+        .commit()?;
         self.log(format!(
             "Mod 与必需依赖安装完成，共 {} 个项目",
             records.len()
         ));
         Ok(format!("{} 个项目已安装", records.len()))
     }
-    pub fn repair_mod_inventory(&self, config: &Config, id: &str) -> Result<()> {
+    pub(crate) fn repair_mod_inventory_with_session(
+        &self,
+        config: &Config,
+        id: &str,
+        mutation: &crate::instance_service::InstanceMutation,
+    ) -> Result<()> {
+        mutation.require(&config.root()?, id)?;
         let dir = config.effective(id).instance_dir(id)?;
         let inventory = inventory(&dir)?;
         if inventory.entries.is_empty() {
             return Ok(());
         }
-        let _lock =
-            crate::instances::InstanceLock::acquire(&config.root()?.join("versions").join(id))?;
         let mods = dir.join("mods");
         let mut downloads = vec![];
         for record in inventory.entries.values() {
@@ -566,6 +551,7 @@ impl Backend {
     }
 }
 
+#[cfg(test)]
 fn commit(
     dir: &Path,
     staging: &Path,
@@ -574,118 +560,10 @@ fn commit(
     current: &Inventory,
     control: &crate::task::TaskControl,
 ) -> Result<()> {
-    let mods = dir.join("mods");
-    fs::create_dir_all(&mods)?;
-    let backup = dir.join("tui-mc-mod-backups").join(token);
-    fs::create_dir_all(&backup)?;
-    let old_index = fs::read(dir.join(INVENTORY)).ok();
-    let receipt_path = dir.join(crate::pack_state::RECEIPT);
-    let old_receipt = fs::read(&receipt_path).ok();
-    let mut moved: Vec<(PathBuf, PathBuf)> = vec![];
-    let mut created = vec![];
-    let mut next = Inventory {
-        entries: current.entries.clone(),
-    };
-    let result = (|| -> Result<()> {
-        for (record, _) in records {
-            control.check()?;
-            valid_id(&record.filename)?;
-            let dest = safe_path(&mods, &record.filename)?;
-            if let Some(old) = current.entries.get(&record.project) {
-                valid_id(&old.filename)?;
-                for name in [old.filename.clone(), format!("{}.disabled", old.filename)] {
-                    let path = safe_path(&mods, &name)?;
-                    if path.is_file() && path != dest {
-                        let saved = safe_path(&backup, &name)?;
-                        fs::rename(&path, &saved)?;
-                        moved.push((saved, path));
-                    }
-                }
-            }
-            if dest.exists() {
-                if current.entries.values().any(|old| {
-                    old.project != record.project
-                        && old.filename.eq_ignore_ascii_case(&record.filename)
-                }) {
-                    bail!("该 JAR 文件名已由另一个项目管理：{}", record.filename);
-                }
-                if valid_file(&dest, Some(&record.sha1), Some(record.size))? {
-                    next.entries.insert(record.project.clone(), record.clone());
-                    continue;
-                }
-                if current
-                    .entries
-                    .get(&record.project)
-                    .is_none_or(|old| old.filename != record.filename)
-                {
-                    bail!(
-                        "同名文件已存在且内容不同，不会覆盖手动安装的 Mod：{}",
-                        record.filename
-                    );
-                }
-                let saved = safe_path(&backup, &record.filename)?;
-                fs::rename(&dest, &saved)?;
-                moved.push((saved, dest.clone()));
-            }
-            fs::rename(safe_path(staging, &record.filename)?, &dest)?;
-            created.push(dest);
-            next.entries.insert(record.project.clone(), record.clone());
-        }
-        atomic_write(
-            &backup.join("previous-inventory.json"),
-            &serde_json::to_vec_pretty(current)?,
-        )?;
-        atomic_write(&dir.join(INVENTORY), &serde_json::to_vec_pretty(&next)?)?;
-        if let Some(bytes) = &old_receipt {
-            let mut receipt: crate::pack_state::Receipt = serde_json::from_slice(bytes)?;
-            for (record, url) in records {
-                if let Some(old) = current.entries.get(&record.project) {
-                    receipt.files.retain(|file| {
-                        !file
-                            .path
-                            .eq_ignore_ascii_case(&format!("mods/{}", old.filename))
-                    });
-                }
-                receipt.files.retain(|file| {
-                    !file
-                        .path
-                        .eq_ignore_ascii_case(&format!("mods/{}", record.filename))
-                });
-                receipt.files.push(crate::pack_state::TrackedFile {
-                    path: format!("mods/{}", record.filename),
-                    sha1: record.sha1.clone(),
-                    size: record.size,
-                    urls: vec![url.clone()],
-                    member: None,
-                });
-            }
-            atomic_write(&receipt_path, &serde_json::to_vec_pretty(&receipt)?)?;
-        }
-        Ok(())
-    })();
-    if let Err(error) = result {
-        for path in created.into_iter().rev() {
-            let _ = fs::remove_file(path);
-        }
-        for (saved, original) in moved.into_iter().rev() {
-            let _ = fs::rename(saved, original);
-        }
-        match old_index {
-            Some(bytes) => {
-                let _ = atomic_write(&dir.join(INVENTORY), &bytes);
-            }
-            None => {
-                let _ = fs::remove_file(dir.join(INVENTORY));
-            }
-        }
-        return Err(error).with_context(|| {
-            format!(
-                "Mod 安装失败，已尝试恢复原文件；备份位置：{}",
-                backup.display()
-            )
-        });
-    }
-    Ok(())
+    crate::mod_install_service::ModInstallTransaction::new(
+        dir, staging, token, records, current, control,
+    )
+    .commit()
 }
 
 #[cfg(test)]

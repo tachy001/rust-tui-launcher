@@ -304,6 +304,12 @@ fn walk(
     result: &mut Vec<(PathBuf, String)>,
 ) -> Result<()> {
     control.check()?;
+    if path
+        .file_name()
+        .is_some_and(|name| name == crate::download_lock::LOCK_DIR)
+    {
+        return Ok(());
+    }
     if depth > 64 || result.len() > 100000 {
         bail!("实例文件层级或数量过大");
     }

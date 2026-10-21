@@ -27,6 +27,57 @@ pub struct Download {
     pub size: Option<u64>,
     pub alternatives: Vec<String>,
 }
+/// A validated batch: each destination has one owner and one set of integrity constraints.
+struct DownloadPlan {
+    jobs: Vec<Download>,
+}
+impl DownloadPlan {
+    fn new(entries: Vec<Download>) -> Result<Self> {
+        let mut destinations: HashMap<PathBuf, usize> = HashMap::new();
+        let mut jobs: Vec<Download> = Vec::new();
+        for entry in entries {
+            if let Some(&index) = destinations.get(&entry.dest) {
+                let existing = &mut jobs[index];
+                let same_hash = match (&existing.sha1, &entry.sha1) {
+                    (Some(a), Some(b)) => {
+                        if !a.eq_ignore_ascii_case(b) {
+                            bail!("相同下载路径的 SHA-1 冲突：{}", entry.dest.display());
+                        }
+                        true
+                    }
+                    _ => false,
+                };
+                if matches!((existing.size, entry.size), (Some(a), Some(b)) if a != b) {
+                    bail!("相同下载路径的文件大小冲突：{}", entry.dest.display());
+                }
+                if existing.url != entry.url && !same_hash {
+                    bail!(
+                        "不同下载指向相同文件且无法确认内容一致：{}",
+                        entry.dest.display()
+                    );
+                }
+                if existing.sha1.is_none() {
+                    existing.sha1 = entry.sha1;
+                }
+                if existing.size.is_none() {
+                    existing.size = entry.size;
+                }
+                for url in std::iter::once(entry.url).chain(entry.alternatives) {
+                    if url != existing.url && !existing.alternatives.contains(&url) {
+                        existing.alternatives.push(url);
+                    }
+                }
+            } else {
+                destinations.insert(entry.dest.clone(), jobs.len());
+                jobs.push(entry);
+            }
+        }
+        Ok(Self { jobs })
+    }
+    fn jobs(&self) -> &[Download] {
+        &self.jobs
+    }
+}
 pub struct Downloader {
     pub client: Client,
     pub control: TaskControl,
@@ -59,7 +110,19 @@ impl Downloader {
         {
             bail!("下载必须使用 HTTPS");
         }
-        fs::create_dir_all(entry.dest.parent().context("下载目标缺少父目录")?)?;
+        let _lease =
+            crate::download_lock::DownloadLease::acquire(&entry.dest, &self.control, || {
+                let _ = self.tx.send(Message::Log(format!(
+                    "等待其他任务完成共享下载：{}",
+                    entry.dest.file_name().unwrap_or_default().to_string_lossy()
+                )));
+            })?;
+        // A different process may have committed the file while we waited.
+        if cached(entry)? {
+            let size = fs::metadata(&entry.dest)?.len();
+            meter.update(job, size, Some(size), 0);
+            return Ok(());
+        }
         let mut partial_name = entry.dest.as_os_str().to_os_string();
         partial_name.push(".part");
         let partial = PathBuf::from(partial_name);
@@ -129,6 +192,7 @@ impl Downloader {
                 && valid_archive(partial, &entry.dest)?
             {
                 meter.update(job, offset, Some(offset), 0);
+                self.control.check()?;
                 return commit(partial, &entry.dest);
             }
             let _ = fs::remove_file(partial);
@@ -207,17 +271,8 @@ impl Downloader {
         commit(partial, &entry.dest)
     }
     pub fn many(&self, entries: Vec<Download>, workers: usize, label: &str) -> Result<()> {
-        let mut seen = HashMap::new();
-        let mut jobs = Vec::new();
-        for entry in entries {
-            if let Some(url) = seen.insert(entry.dest.clone(), entry.url.clone()) {
-                if url != entry.url {
-                    bail!("不同下载指向相同文件：{}", entry.dest.display());
-                }
-                continue;
-            }
-            jobs.push(entry);
-        }
+        let plan = DownloadPlan::new(entries)?;
+        let jobs = plan.jobs();
         let next = AtomicUsize::new(0);
         let done = AtomicUsize::new(0);
         let failure = Mutex::new(None);
@@ -324,6 +379,81 @@ pub fn valid_file(path: &Path, expected: Option<&str>, size: Option<u64>) -> Res
 mod tests {
     use super::*;
     use std::net::TcpListener;
+    fn planned_entry(hash: Option<&str>, size: Option<u64>) -> Download {
+        Download {
+            url: "https://example.com/library.jar".into(),
+            dest: "libraries/library.jar".into(),
+            sha1: hash.map(str::to_owned),
+            size,
+            alternatives: vec![],
+        }
+    }
+    #[test]
+    fn waiting_download_reuses_the_other_writers_verified_result() {
+        let workspace = crate::test_support::Workspace::new();
+        let dest = workspace.path.join("shared.bin");
+        let held =
+            crate::download_lock::DownloadLease::acquire(&dest, &TaskControl::default(), || {})
+                .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let entry = Download {
+            url: "https://must-not-be-requested.invalid/shared".into(),
+            dest: dest.clone(),
+            sha1: Some("a9993e364706816aba3e25717850c26c9cd0d89d".into()),
+            size: Some(3),
+            alternatives: vec![],
+        };
+        let handle = thread::spawn(move || {
+            let downloader = Downloader {
+                client: Client::builder()
+                    .timeout(std::time::Duration::from_millis(100))
+                    .build()
+                    .unwrap(),
+                control: TaskControl::default(),
+                tx,
+                source: "official".into(),
+            };
+            downloader.fetch(&entry)
+        });
+        assert!(
+            matches!(rx.recv_timeout(std::time::Duration::from_secs(3)).unwrap(), Message::Log(line) if line.contains("等待其他任务"))
+        );
+        fs::write(&dest, b"abc").unwrap();
+        drop(held);
+        handle.join().unwrap().unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"abc");
+        assert!(!workspace.path.join("shared.bin.part").exists());
+    }
+    #[test]
+    fn download_plan_merges_stronger_constraints_and_identical_content_mirrors() {
+        let mut mirror = planned_entry(Some("AABB"), Some(10));
+        mirror.url = "https://mirror.example.com/library.jar".into();
+        let plan = DownloadPlan::new(vec![
+            planned_entry(None, None),
+            planned_entry(Some("aabb"), Some(10)),
+            mirror,
+        ])
+        .unwrap();
+        assert_eq!(plan.jobs().len(), 1);
+        assert_eq!(plan.jobs()[0].sha1.as_deref(), Some("aabb"));
+        assert_eq!(plan.jobs()[0].size, Some(10));
+        assert_eq!(plan.jobs()[0].alternatives.len(), 1);
+    }
+    #[test]
+    fn conflicting_downloads_fail_before_any_network_or_file_writes() {
+        for pair in [
+            vec![
+                planned_entry(Some("aaa"), None),
+                planned_entry(Some("bbb"), None),
+            ],
+            vec![planned_entry(None, Some(1)), planned_entry(None, Some(2))],
+        ] {
+            assert!(DownloadPlan::new(pair).is_err());
+        }
+        let mut other = planned_entry(None, None);
+        other.url = "https://example.com/different.jar".into();
+        assert!(DownloadPlan::new(vec![planned_entry(None, None), other]).is_err());
+    }
     #[test]
     fn validates_complete_range_instead_of_only_start_prefix() {
         assert_eq!(parse_content_range("bytes 1-2/3", 1).unwrap(), (2, Some(3)));
@@ -354,7 +484,8 @@ mod tests {
         response: &'static str,
         expected_header: &'static str,
     ) {
-        let root = std::env::temp_dir().join(format!("tui-download-{name}-{}", std::process::id()));
+        let workspace = crate::test_support::Workspace::new();
+        let root = workspace.path.join(name);
         fs::create_dir_all(&root).unwrap();
         let dest = root.join("file");
         let partial = root.join("file.part");
@@ -405,7 +536,6 @@ mod tests {
         assert_eq!(fs::read(&dest).unwrap(), b"abc");
         assert!(!partial.exists());
         fs::remove_file(dest).unwrap();
-        fs::remove_dir(root).unwrap();
     }
     #[test]
     fn resumes_range_response() {

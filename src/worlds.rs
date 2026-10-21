@@ -66,6 +66,9 @@ fn scan(
         control.check()?;
         let entry = entry?;
         let path = entry.path();
+        if entry.file_name() == crate::download_lock::LOCK_DIR {
+            continue;
+        }
         reject_link(&path)?;
         if entry.file_type()?.is_dir() {
             scan(&path, base, depth + 1, files, bytes, control)?;

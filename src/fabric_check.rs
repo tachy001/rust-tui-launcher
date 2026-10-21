@@ -224,6 +224,16 @@ pub fn builtins(meta: &Value, minecraft: &str, java: Option<u64>) -> HashMap<Str
     result
 }
 pub fn audit(paths: &[PathBuf], builtins: &HashMap<String, String>) -> Result<()> {
+    let errors = conflicts(paths, builtins)?;
+    if !errors.is_empty() {
+        bail!("Fabric 包内依赖检查未通过：\n{}", errors.join("\n"));
+    }
+    Ok(())
+}
+pub(crate) fn conflicts(
+    paths: &[PathBuf],
+    builtins: &HashMap<String, String>,
+) -> Result<Vec<String>> {
     let mut infos = vec![];
     let mut budget = 256 * 1024 * 1024;
     for path in paths {
@@ -283,10 +293,7 @@ pub fn audit(paths: &[PathBuf], builtins: &HashMap<String, String>) -> Result<()
     }
     errors.sort();
     errors.dedup();
-    if !errors.is_empty() {
-        bail!("Fabric 包内依赖检查未通过：\n{}", errors.join("\n"));
-    }
-    Ok(())
+    Ok(errors)
 }
 pub fn active_paths(config: &crate::config::Config, id: &str) -> Result<Vec<PathBuf>> {
     let dir = crate::mods::directory(config, id)?;

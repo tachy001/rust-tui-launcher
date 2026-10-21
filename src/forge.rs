@@ -125,6 +125,7 @@ impl Backend {
             alternatives: vec![],
         })?;
         let id = installer_profile_id(&installer, game)?;
+        let mut mutation = crate::instance_service::InstanceMutation::begin(&root, &id)?;
         let launcher_profiles = root.join("launcher_profiles.json");
         if !launcher_profiles.exists() {
             atomic_write(
@@ -132,7 +133,7 @@ impl Backend {
                 br#"{"profiles":{},"selectedProfile":""}"#,
             )?;
         }
-        let resolved = version::resolve(&root, game)?;
+        let resolved = mutation.resolve(game)?;
         let required = resolved.meta["javaVersion"]["majorVersion"]
             .as_u64()
             .unwrap_or(8);
@@ -182,7 +183,7 @@ impl Backend {
         }
         version::resolve(&root, &id).context("安装器没有生成完整版本信息")?;
         let _ = self.tx.send(crate::backend::Message::Pauseable(true));
-        self.repair(config, &id)?;
+        self.repair_with_session(config, &id, &mut mutation)?;
         self.log(format!("{} 实例已就绪：{id}", kind.name()));
         Ok(id)
     }

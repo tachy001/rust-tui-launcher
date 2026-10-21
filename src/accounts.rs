@@ -1,4 +1,7 @@
-use crate::{backend::offline_uuid, config::Config, storage::atomic_write};
+use crate::{
+    account_service::{AccountService, FileAccountIndex, SystemCredentials},
+    storage::atomic_write,
+};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
@@ -8,6 +11,55 @@ use std::{fs, path::Path};
 pub enum AccountKind {
     Offline,
     Microsoft,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::Workspace;
+
+    #[test]
+    fn missing_index_is_empty_but_unreadable_or_invalid_index_is_an_error() {
+        let workspace = Workspace::new();
+        let path = workspace.path.join("accounts.json");
+        assert!(Accounts::read(&path).unwrap().entries.is_empty());
+        assert!(Accounts::read(&workspace.path).is_err());
+        fs::write(&path, b"{broken").unwrap();
+        assert!(Accounts::read(&path).is_err());
+    }
+
+    #[test]
+    fn rejects_ambiguous_identity_and_missing_active_account() {
+        let workspace = Workspace::new();
+        for (number, json) in [
+            r#"{"entries":[{"id":"","name":"Player","kind":"offline"}]}"#,
+            r#"{"entries":[{"id":"same","name":"One","kind":"offline"},{"id":"same","name":"Two","kind":"offline"}]}"#,
+            r#"{"active":"missing","entries":[]}"#,
+        ]
+        .iter()
+        .enumerate()
+        {
+            let path = workspace.path.join(format!("invalid-{number}.json"));
+            fs::write(&path, json).unwrap();
+            assert!(Accounts::read(&path).is_err());
+        }
+    }
+
+    #[test]
+    fn reads_existing_index_with_default_optional_fields() {
+        let workspace = Workspace::new();
+        let path = workspace.path.join("accounts.json");
+        fs::write(
+            &path,
+            r#"{"active":"offline:1","entries":[{"id":"offline:1","name":"Player","kind":"offline"}]}"#,
+        )
+        .unwrap();
+        let accounts = Accounts::read(&path).unwrap();
+        let active = accounts.active().unwrap();
+        assert_eq!(active.name, "Player");
+        assert!(active.client_id.is_empty());
+        assert_eq!(active.expires_at, 0);
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Account {
@@ -21,7 +73,7 @@ pub struct Account {
     #[serde(default)]
     pub xuid: String,
 }
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Accounts {
     pub active: Option<String>,
@@ -32,10 +84,28 @@ impl Accounts {
         Self::read(Path::new(".tui-mc/accounts.json"))
     }
     fn read(path: &Path) -> Result<Self> {
-        if !path.exists() {
-            return Ok(Self::default());
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default())
+            }
+            Err(error) => return Err(error).context("读取账户列表失败"),
+        };
+        let accounts: Self = serde_json::from_slice(&bytes).context("账户列表格式错误")?;
+        let mut seen = std::collections::HashSet::new();
+        for account in &accounts.entries {
+            if account.id.is_empty() || !seen.insert(&account.id) {
+                bail!("账户列表包含空 ID 或重复账户");
+            }
         }
-        serde_json::from_slice(&fs::read(path)?).context("账户列表格式错误")
+        if accounts
+            .active
+            .as_ref()
+            .is_some_and(|id| !seen.contains(id))
+        {
+            bail!("当前选择的账户不在账户列表中");
+        }
+        Ok(accounts)
     }
     pub fn save(&self) -> Result<()> {
         atomic_write(
@@ -49,22 +119,8 @@ impl Accounts {
             .and_then(|id| self.entries.iter().find(|entry| &entry.id == id))
     }
     pub fn add_offline(&mut self, name: &str) -> Result<()> {
-        let config = Config {
-            username: name.into(),
-            ..Config::default()
-        };
-        config.validate()?;
-        let uuid = offline_uuid(name);
-        let id = format!("offline:{uuid}");
-        self.upsert(Account {
-            id,
-            name: name.into(),
-            kind: AccountKind::Offline,
-            client_id: String::new(),
-            expires_at: 0,
-            xuid: String::new(),
-        });
-        self.save()
+        *self = AccountService::new(&FileAccountIndex, &SystemCredentials).add_offline(name)?;
+        Ok(())
     }
     pub fn upsert(&mut self, account: Account) {
         self.entries.retain(|entry| entry.id != account.id);
@@ -72,27 +128,11 @@ impl Accounts {
         self.entries.push(account);
     }
     pub fn select(&mut self, id: &str) -> Result<()> {
-        if !self.entries.iter().any(|entry| entry.id == id) {
-            bail!("账户不存在");
-        }
-        self.active = Some(id.into());
-        self.save()
+        *self = AccountService::new(&FileAccountIndex, &SystemCredentials).select(id)?;
+        Ok(())
     }
     pub fn remove(&mut self, id: &str) -> Result<()> {
-        let account = self
-            .entries
-            .iter()
-            .find(|entry| entry.id == id)
-            .context("账户不存在")?;
-        if account.kind == AccountKind::Microsoft {
-            for kind in ["refresh", "minecraft"] {
-                crate::auth::delete_secret(account, kind)?;
-            }
-        }
-        self.entries.retain(|entry| entry.id != id);
-        if self.active.as_deref() == Some(id) {
-            self.active = self.entries.first().map(|entry| entry.id.clone());
-        }
-        self.save()
+        *self = AccountService::new(&FileAccountIndex, &SystemCredentials).remove(id)?;
+        Ok(())
     }
 }

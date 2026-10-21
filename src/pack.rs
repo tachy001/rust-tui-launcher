@@ -105,6 +105,12 @@ pub(crate) fn file_destination(root: &Path, path: &str, id: &str) -> Result<Path
     let path = safe_path(root, path)?;
     // Game directories coexist with launch metadata: packs must not replace it.
     let relative = path.strip_prefix(root)?;
+    if relative
+        .components()
+        .any(|component| component.as_os_str() == crate::download_lock::LOCK_DIR)
+    {
+        bail!("整合包文件与下载锁目录冲突");
+    }
     let first = relative
         .components()
         .next()
@@ -513,9 +519,20 @@ mod tests {
             .unwrap();
         let dir = root.join("versions").join(&id);
         fs::rename(dir.join("mods/a.jar"), dir.join("mods/a.jar.disabled")).unwrap();
+        let mod_hash =
+            crate::pack_state::sha1_file(&dir.join("mods/a.jar.disabled"), &control).unwrap();
+        fs::write(
+            dir.join(crate::modrinth::INVENTORY),
+            json!({"entries":{"project":{
+                "project":"project", "version":"version", "version_number":"1.0",
+                "filename":"a.jar", "sha1":mod_hash, "size":b"original-mod".len()
+            }}})
+            .to_string(),
+        )
+        .unwrap();
         fs::write(dir.join("mods/a.jar.disabled"), b"bad").unwrap();
         fs::write(dir.join("config/settings.json"), b"user-config").unwrap();
-        backend.repair_pack_files(&config, &id).unwrap();
+        backend.repair(&config, &id).unwrap();
         assert_eq!(
             fs::read(dir.join("mods/a.jar.disabled")).unwrap(),
             b"original-mod"

@@ -121,13 +121,14 @@ impl Backend {
         self.install(config, &remote)?;
         self.control.check()?;
         let id = profile["id"].as_str().context("加载器配置缺少 ID")?;
+        let mut mutation = crate::instance_service::InstanceMutation::begin(&config.root()?, id)?;
         let dir = config.root()?.join("versions").join(id);
         fs::create_dir_all(&dir)?;
         crate::storage::atomic_write(
             &dir.join(format!("{id}.json")),
             &serde_json::to_vec_pretty(&profile)?,
         )?;
-        self.repair(config, id)?;
+        self.repair_with_session(config, id, &mut mutation)?;
         self.log(format!("{} 实例已就绪：{id}", loader.name()));
         Ok(id.to_owned())
     }

@@ -1,5 +1,15 @@
 # Modrinth 安装验收与依赖修正
 
+## 2026-10-21：Fabric 包内约束参与回溯
+
+已将 Fabric 包内范围接入 ModDependencyResolver 的候选验证。独立的 ModArtifactSource 提供已校验的候选文件，FabricPlanValidator 将兼容性冲突反馈给搜索；下载 / 读取 / ZIP 错误直接终止，固定版本不会被悄悄替换。候选先缓存，不直接修改已安装 Mod，最多验证 32 组组合。
+
+4 项服务检查覆盖本地 ZIP 中的 Iris / Sodium 范围回溯、固定不兼容版本失败、坏 JAR 中止、下载失败不继续回退和已禁用文件的只读复用；原有范围预检检查保持通过。
+
+额外只读检查复用工作区已有的真实 Iris 1.8.8、Sodium 0.6.13 与备份中的 Sodium 0.8.13 JAR。采用本地候选目录读取真实的 fabric.mod.json 和嵌套 JAR，解析结果选择 `0.6.13+mc1.21.1`。该检查没有访问网络、没有重新安装文件或启动游戏。平台候选 ID 在此测试中使用本地标识，不把此结果当作新的真实 Modrinth API 安装验收。
+
+仍未证明：新解析流程的完整联网安装、任意 Mod 组合、Forge / Quilt / NeoForge 包内依赖求解、该组合的实际图形运行。以下为先前真实联网安装记录。
+
 日期：2026-10-19。环境：Windows，Minecraft 1.21.1，Fabric Loader 0.19.5。
 
 真实安装入口使用已有验收实例，没有启动游戏。

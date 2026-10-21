@@ -136,17 +136,30 @@ impl Backend {
         valid_id(&remote.id)?;
         let root = config.root()?;
         let dir = root.join("versions").join(&remote.id);
+        self.control.check()?;
+        let mut mutation = crate::instance_service::InstanceMutation::begin(&root, &remote.id)?;
         self.log(format!("读取版本 {}", remote.id));
         let json_path = dir.join(format!("{}.json", remote.id));
         self.fetch(&remote.url, &json_path, Some(&remote.sha1))?;
-        self.repair(config, &remote.id)
+        self.repair_with_session(config, &remote.id, &mut mutation)
     }
     pub fn repair(&self, config: &Config, id: &str) -> Result<()> {
+        self.control.check()?;
+        let mut mutation = crate::instance_service::InstanceMutation::begin(&config.root()?, id)?;
+        self.repair_with_session(config, id, &mut mutation)
+    }
+    pub(crate) fn repair_with_session(
+        &self,
+        config: &Config,
+        id: &str,
+        mutation: &mut crate::instance_service::InstanceMutation,
+    ) -> Result<()> {
         self.control.check()?;
         let config = config.effective(id);
         config.validate()?;
         let root = config.root()?;
-        let resolved = version::resolve(&root, id)?;
+        mutation.require(&root, id)?;
+        let resolved = mutation.resolve(id)?;
         let meta = &resolved.meta;
         self.log("校验客户端与依赖库");
         self.download_entry(
@@ -208,8 +221,8 @@ impl Backend {
             let name = file["id"].as_str().context("日志配置缺少 ID")?;
             self.download_entry(file, &safe_path(&root.join("assets/log_configs"), name)?)?;
         }
-        self.repair_pack_files(&config, id)?;
-        self.repair_mod_inventory(&config, id)?;
+        self.repair_pack_files_with_session(&config, id, mutation)?;
+        self.repair_mod_inventory_with_session(&config, id, mutation)?;
         self.log("安装完成，可选择此版本启动");
         Ok(())
     }
@@ -237,29 +250,12 @@ impl Backend {
         let game_dir = config.instance_dir(id)?;
         let session = self.account_session(&config)?;
         let required = meta["javaVersion"]["majorVersion"].as_u64().unwrap_or(8);
-        let selected = crate::java::select(&config, required);
-        let runtime = if config.java == "auto"
-            && selected
-                .as_ref()
-                .map(|j| j.major != required)
-                .unwrap_or(true)
-        {
-            match self.install_java_for_version(&config, id) {
-                Ok(runtime) => runtime,
-                Err(error) => match selected {
-                    Ok(runtime) => {
-                        self.log(format!(
-                            "安装建议 Java 失败，将尝试本机 Java {}：{error:#}",
-                            runtime.major
-                        ));
-                        runtime
-                    }
-                    Err(_) => return Err(error),
-                },
-            }
-        } else {
-            selected?
-        };
+        let resolution =
+            crate::runtime_service::JavaRuntimeService::new(self).resolve(&config, id, required)?;
+        if let Some(warning) = resolution.warning() {
+            self.log(warning);
+        }
+        let runtime = resolution.into_runtime();
         self.log(format!(
             "{} · {}",
             runtime.description,
@@ -404,11 +400,16 @@ impl Backend {
                 args.push(argument.replace("${path}", &path.display().to_string()));
             }
         }
-        args.extend(shlex::split(&config.jvm_args).context("JVM 参数引号不匹配")?);
+        let parser = crate::argument_service::ArgumentParser::current();
+        args.extend(parser.parse(&config.jvm_args).context("JVM 参数格式错误")?);
         apply_platform_jvm_args(&mut args, meta, std::env::consts::OS);
         args.push(meta["mainClass"].as_str().context("缺少 mainClass")?.into());
         args.extend(crate::launch_options::game_arguments(&config, meta)?);
-        args.extend(shlex::split(&config.game_args).context("游戏参数引号不匹配")?);
+        args.extend(
+            parser
+                .parse(&config.game_args)
+                .context("游戏参数格式错误")?,
+        );
         for arg in &mut args {
             *arg = crate::launch_options::expand_argument(arg, &values)?;
         }
@@ -533,32 +534,7 @@ fn apply_platform_jvm_args(args: &mut Vec<String>, meta: &Value, os: &str) {
 }
 
 fn artifacts(lib: &Value) -> Result<Vec<(Value, bool)>> {
-    let mut result = vec![];
-    if let Some(a) = lib.pointer("/downloads/artifact") {
-        result.push((a.clone(), false));
-    } else if lib.get("downloads").is_none() {
-        let name = lib["name"].as_str().context("库缺少 Maven 坐标")?;
-        let path = version::maven_path(name)?;
-        let base = lib["url"]
-            .as_str()
-            .unwrap_or("https://libraries.minecraft.net/");
-        result.push((serde_json::json!({"path":path, "url":format!("{}/{}", base.trim_end_matches('/'), path), "sha1":lib["sha1"], "size":lib["size"]}), false));
-    }
-    if let Some(native) = lib["natives"][os_name()].as_str() {
-        let key = native.replace(
-            "${arch}",
-            if cfg!(target_pointer_width = "64") {
-                "64"
-            } else {
-                "32"
-            },
-        );
-        let entry = lib["downloads"]["classifiers"]
-            .get(&key)
-            .context("当前平台缺少 native 分类")?;
-        result.push((entry.clone(), true));
-    }
-    Ok(result)
+    crate::library_service::LibraryResolver::current().resolve(lib)
 }
 fn extract_natives(path: &Path, dir: &Path, lib: &Value) -> Result<()> {
     let mut archive = zip::ZipArchive::new(fs::File::open(path)?)?;
@@ -747,7 +723,8 @@ mod tests {
             panic!("missing catalog");
         };
         let version = versions.iter().find(|v| v.id == "1.21.1").unwrap();
-        let dir = std::env::temp_dir().join(format!("tui-mc-metadata-{}", std::process::id()));
+        let workspace = crate::test_support::Workspace::new();
+        let dir = workspace.path.join("metadata");
         let path = dir.join("version.json");
         backend
             .fetch(&version.url, &path, Some(&version.sha1))
@@ -764,6 +741,5 @@ mod tests {
             }
         }
         fs::remove_file(path).unwrap();
-        fs::remove_dir(dir).unwrap();
     }
 }
