@@ -31,7 +31,7 @@ fn reject_link(path: &Path) -> Result<()> {
     Ok(())
 }
 pub fn list(config: &Config, id: &str) -> Result<Vec<String>> {
-    let saves = config.effective(id).instance_dir(id)?.join("saves");
+    let saves = config.effective(id)?.instance_dir(id)?.join("saves");
     if !saves.exists() {
         return Ok(vec![]);
     }
@@ -127,7 +127,7 @@ impl Backend {
         valid_id(id)?;
         valid_id(world)?;
         let _lock = InstanceLock::acquire(&config.root()?.join("versions").join(id))?;
-        let saves = config.effective(id).instance_dir(id)?.join("saves");
+        let saves = config.effective(id)?.instance_dir(id)?.join("saves");
         reject_link(&saves)?;
         let source = safe_path(&saves, world)?;
         reject_link(&source)?;
@@ -216,7 +216,7 @@ impl Backend {
         valid_id(id)?;
         valid_id(name)?;
         let _lock = InstanceLock::acquire(&config.root()?.join("versions").join(id))?;
-        let saves = config.effective(id).instance_dir(id)?.join("saves");
+        let saves = config.effective(id)?.instance_dir(id)?.join("saves");
         fs::create_dir_all(&saves)?;
         reject_link(&saves)?;
         let dest = safe_path(&saves, name)?;

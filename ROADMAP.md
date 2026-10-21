@@ -2,6 +2,16 @@
 
 ## 后续开发方向：后端服务对象
 
+对照 HMCL decompressNatives 和 PCL McLaunchNatives，新增 NativeDirectory 并接入实际启动。由复用目录覆盖改为单次启动私有 run-* 目录，解决组件切换后旧 native 残留参与加载及半成品复用；解压失败对象不能再提供路径，暂停 / 取消检查覆盖逐项及分块读取。保留 Windows / Linux / macOS 文件类型与排除规则，拒绝越界和 ZIP 符号链接。5 项本地 ZIP 检查与 Clippy 通过，无网络、JVM、游戏或前端改动。会话结束后只清理已核验归属的私有目录；强制终止后的残留回收和各平台真实 native 加载仍未验收。
+
+继续对照 HMCL DefaultLauncher / LaunchManifestNormalizer 与 PCL ModLaunch。新增 LaunchClasspath 保序去重并保持客户端最后一次加入；BootstrapCompatibility 分开处理旧 BootstrapLauncher 的完整路径子串匹配与 0.1.17+ 的文件名匹配，修复继承实例忽略列表漏掉实际客户端 JAR，以及目录包含 asm 等词时误忽略库的问题。补齐 primary_jar / primary_jar_name / file_separator，占位符展开后只处理 JVM 参数；含分隔符或无法表示的路径明确报错。6 项本地检查及真实 NeoForge 21.1.264 继承配置只读检查通过，Clippy 通过；无网络、JVM、游戏、前端改动或现有实例写入。OptiFine 混装、未知限定符版本及真实加载器运行仍需完善 / 验收，源码对照细节见 docs/SOURCE-REFERENCES.md。
+
+按用户要求继续阅读本地 HMCL / PCL 源码，新增 docs/SOURCE-REFERENCES.md，记录对应符号、差异、采用范围与未实现边界。对照 HMCL JavaVersionConstraint.LAUNCH_WRAPPER 和 PCL GetJavaRequirement 后，新增 JavaRequirement：旧 LaunchWrapper 的 Java 上限参与本地选择、安装与失败回退，避免建议 Java 8 下载失败后错误回退到 Java 21 等运行时；手动路径不擅自替换，冲突元数据提前失败。8 项相关本地检查通过，未启动 Java / 游戏、未改前端。Java 更新号、其他历史 Forge / NeoForge 范围、OptiFine classpath 与真实历史实例运行仍未验收。
+
+新增 InstanceConfigResolver / InstanceConfigSource / FileInstanceConfigSource，Config::effective 改为返回可处理的错误，启动、修复、Mod、存档、复制、导出与诊断入口均传播配置读取失败。修复实例设置或版本配置损坏时静默退回全局目录的问题；只有文件不存在才继承默认值，读错 / 格式错误 / 非布尔隔离标记明确失败。保持全局 → 实例随附设置 → launcher.json 实例覆盖的优先级，以及整合包强制隔离规则；false 与空字符串可明确覆盖。全局保存前校验实例覆盖项，界面仅补配置错误展示与接口接入。13 项相关本地检查通过，含真实临时文件配置读取、Mod 错误目录防护、CLI 临时覆盖及已有页面渲染；Clippy 通过，没有网络、JVM 或游戏启动。损坏配置需要修正原文件，未自动覆盖或迁移数据。
+
+新增 ProcessMonitor / ProcessHandle / ProcessOutput / ManagedProcess，游戏与 Forge / NeoForge 安装器共用进程监控。修复实时日志读取失败导致仍运行的进程被退出清理逻辑终止，以及没有换行的末行丢失；日志故障仅警告一次，退出状态和取消仍独立处理。已退出状态优先于稍晚的取消，取消会等待直接子进程回收，启动前再次检查取消。9 项相关检查通过，包含两个真实辅助子进程的失败退出 / 末行读取与取消回收；辅助进程不运行 Java 或游戏。前端未改；子进程树清理、真实安装器和 macOS / Linux 运行验收仍未完成。
+
 新增 AccountService / AccountIndexStore / CredentialStore，现有账户与认证入口共用服务。修复保存失败后内存账户先行切换、删除凭证中途失败后索引与凭证脱节，以及刷新非当前账户抢占选择的问题。最新刷新令牌保留，后续保存失败恢复旧游戏凭证；移除失败尝试恢复两份凭证，恢复不完整明确要求重新登录。索引读取拒绝损坏、重复 / 空 ID 与悬空选择，旧版可选字段继续兼容。验证使用本地替代存储，不接触真实凭证、网络或游戏；真实微软登录、系统安全存储往返、跨进程修改与崩溃恢复仍未验收。前端未改。
 
 新增 ArgumentParser，配置校验与实际启动使用相同解析策略。修复 Windows 未加引号的盘符 / UNC 路径被 POSIX 转义剥离反斜杠的问题，支持空参数、单 / 双引号分组、双引号转义及尾部反斜杠；macOS / Linux 保持 POSIX 语义。拒绝 NUL 与不完整引号，旧版 Minecraft 元数据参数仍走原有格式解析。相关行为以纯本地样例验证，没有启动 JVM / 游戏，也未修改前端。

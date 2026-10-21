@@ -160,7 +160,7 @@ impl Backend {
             bail!("整合包修复记录版本或实例 ID 不一致");
         }
         validate_hash(&receipt.archive_sha1)?;
-        let game_dir = config.effective(id).instance_dir(id)?;
+        let game_dir = config.effective(id)?.instance_dir(id)?;
         let mut downloads = vec![];
         let mut restore = vec![];
         let mut seen = BTreeMap::new();

@@ -367,7 +367,7 @@ pub fn clone_instance(
         }
     }
     let _running = InstanceLock::acquire(&root.join("versions").join(id))?;
-    let source = config.effective(id).instance_dir(id)?;
+    let source = config.effective(id)?.instance_dir(id)?;
     let files = data_files(&source, true, control)?;
     fs::create_dir_all(&dest)?;
     atomic_write(
@@ -378,7 +378,7 @@ pub fn clone_instance(
         control.check()?;
         crate::storage::atomic_copy(&safe_path(&dest, &relative)?, &mut fs::File::open(source)?)?;
     }
-    let effective = config.effective(id);
+    let effective = config.effective(id)?;
     crate::pack_state::clone_receipt(config, id, target)?;
     let inventory = source.join(crate::modrinth::INVENTORY);
     if inventory.is_file() {

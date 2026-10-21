@@ -92,7 +92,7 @@ fn newest(dir: &Path, prefix: &str, suffix: &str, since: Option<SystemTime>) -> 
 }
 
 pub fn analyze(config: &Config, id: &str, since: Option<SystemTime>) -> Result<Diagnosis> {
-    analyze_dir(&config.effective(id).instance_dir(id)?, since)
+    analyze_dir(&config.effective(id)?.instance_dir(id)?, since)
 }
 
 pub fn analyze_dir(dir: &Path, since: Option<SystemTime>) -> Result<Diagnosis> {

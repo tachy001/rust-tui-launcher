@@ -12,7 +12,7 @@ pub struct ModEntry {
     pub size: u64,
 }
 pub fn directory(config: &Config, id: &str) -> Result<PathBuf> {
-    let dir = config.effective(id).instance_dir(id)?.join("mods");
+    let dir = config.effective(id)?.instance_dir(id)?.join("mods");
     fs::create_dir_all(&dir)?;
     Ok(dir)
 }
@@ -191,7 +191,7 @@ pub struct RemovedMod {
 
 pub fn removed(config: &Config, id: &str) -> Result<Vec<RemovedMod>> {
     let base = config
-        .effective(id)
+        .effective(id)?
         .instance_dir(id)?
         .join("tui-mc-removed-mods");
     let entries = match fs::read_dir(base) {

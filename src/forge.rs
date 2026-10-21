@@ -5,6 +5,7 @@ use crate::{
     java,
     logs::LogTail,
     metadata::valid_id,
+    process_service::{ProcessMonitor, ProcessOutcome},
     storage::atomic_write,
     version,
 };
@@ -15,8 +16,6 @@ use std::{
     io::Read,
     path::Path,
     process::{Command, Stdio},
-    thread,
-    time::Duration,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -137,7 +136,7 @@ impl Backend {
         let required = resolved.meta["javaVersion"]["majorVersion"]
             .as_u64()
             .unwrap_or(8);
-        let effective = config.effective(game);
+        let effective = config.effective(game)?;
         let runtime = match java::select(&effective, required) {
             Ok(runtime) => runtime,
             Err(error) if effective.java == "auto" => {
@@ -146,8 +145,10 @@ impl Backend {
             }
             Err(error) => return Err(error),
         };
+        self.control.check()?;
         let log_path = cache.join(format!("{artifact}-{full}.log"));
         let output = fs::File::create(&log_path)?;
+        let mut tail = LogTail::open(&log_path)?;
         let _ = self.tx.send(crate::backend::Message::Pauseable(false));
         let child = Command::new(&runtime.path)
             .args(["-Djava.awt.headless=true", "-jar"])
@@ -160,20 +161,15 @@ impl Backend {
             .spawn()
             .context("无法运行官方安装器")?;
         let mut child = GameProcess(child);
-        let mut tail = LogTail::open(&log_path)?;
-        let status = loop {
-            for line in tail.read_lines()? {
-                self.log(format!("安装器 · {line}"));
-            }
-            self.control.check()?;
-            if let Some(status) = child.try_wait()? {
-                break status;
-            }
-            thread::sleep(Duration::from_millis(100));
+        let status = match ProcessMonitor::new(&self.control).run(
+            &mut child,
+            &mut tail,
+            |line| self.log(format!("安装器 · {line}")),
+            |warning| self.log(warning),
+        )? {
+            ProcessOutcome::Exited(status) => status,
+            ProcessOutcome::Cancelled => bail!("安装器已由用户终止"),
         };
-        for line in tail.read_lines()? {
-            self.log(format!("安装器 · {line}"));
-        }
         if !status.success() {
             bail!(
                 "{} 安装器退出失败（{status}），日志：{}",

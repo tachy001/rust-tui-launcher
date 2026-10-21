@@ -1,7 +1,9 @@
+pub(crate) use crate::process_service::ManagedProcess as GameProcess;
 use crate::{
     config::Config,
     download::{Download, Downloader},
     metadata::*,
+    process_service::{ProcessMonitor, ProcessOutcome},
     task::TaskControl,
     version,
 };
@@ -17,7 +19,6 @@ use std::{
     path::Path,
     process::{Command, Stdio},
     sync::mpsc::Sender,
-    thread,
     time::Duration,
 };
 
@@ -155,7 +156,7 @@ impl Backend {
         mutation: &mut crate::instance_service::InstanceMutation,
     ) -> Result<()> {
         self.control.check()?;
-        let config = config.effective(id);
+        let config = config.effective(id)?;
         config.validate()?;
         let root = config.root()?;
         mutation.require(&root, id)?;
@@ -227,7 +228,7 @@ impl Backend {
         Ok(())
     }
     pub fn launch(&self, config: &Config, id: &str) -> Result<()> {
-        let config = config.effective(id);
+        let config = config.effective(id)?;
         config.validate()?;
         valid_id(id)?;
         let root = config.root()?;
@@ -249,9 +250,13 @@ impl Backend {
             .collect::<Result<Vec<_>>>()?;
         let game_dir = config.instance_dir(id)?;
         let session = self.account_session(&config)?;
-        let required = meta["javaVersion"]["majorVersion"].as_u64().unwrap_or(8);
-        let resolution =
-            crate::runtime_service::JavaRuntimeService::new(self).resolve(&config, id, required)?;
+        let requirement = crate::runtime_service::JavaRequirement::from_metadata(meta)?;
+        let required = requirement.recommended();
+        let resolution = crate::runtime_service::JavaRuntimeService::new(self).resolve(
+            &config,
+            id,
+            requirement,
+        )?;
         if let Some(warning) = resolution.warning() {
             self.log(warning);
         }
@@ -267,13 +272,14 @@ impl Backend {
                 runtime.major
             ));
         }
-        let natives = version_dir.join("tui-mc-natives").join(format!(
+        let native_base = version_dir.join("tui-mc-natives").join(format!(
             "{}-{}",
             std::env::consts::OS,
             std::env::consts::ARCH
         ));
-        fs::create_dir_all(&natives)?;
-        let mut cp = vec![];
+        let mut native_directory =
+            crate::native_service::NativeDirectory::create(&native_base, &self.control)?;
+        let mut cp = crate::classpath_service::LaunchClasspath::default();
         for lib in meta["libraries"].as_array().context("缺少 libraries")? {
             if !allowed(lib) {
                 continue;
@@ -292,17 +298,18 @@ impl Backend {
                     }
                 }
                 if native {
-                    extract_natives(&path, &natives, lib)?;
+                    native_directory.extract(&path, lib)?;
                 } else {
-                    cp.push(path);
+                    cp.add_library(path);
                 }
             }
         }
+        let natives = native_directory.path()?;
         let jar = root
             .join("versions")
             .join(&resolved.jar_id)
             .join(format!("{}.jar", resolved.jar_id));
-        if !jar.exists() {
+        if !jar.is_file() {
             bail!("客户端缺失，请先安装");
         }
         if let Some(hash) = meta["downloads"]["client"]["sha1"].as_str() {
@@ -310,13 +317,8 @@ impl Backend {
                 bail!("客户端校验失败，请重新安装");
             }
         }
-        cp.push(jar);
         let separator = if cfg!(windows) { ";" } else { ":" };
-        let classpath = cp
-            .iter()
-            .map(|p| p.to_string_lossy())
-            .collect::<Vec<_>>()
-            .join(separator);
+        let classpath = cp.render(&jar, separator)?;
         let uuid = session.uuid.clone();
         let asset_id = meta["assetIndex"]["id"].as_str().unwrap_or(id);
         valid_id(asset_id)?;
@@ -359,6 +361,15 @@ impl Backend {
             ("natives_directory", natives.display().to_string()),
             ("classpath", classpath.clone()),
             ("classpath_separator", separator.into()),
+            ("primary_jar", jar.display().to_string()),
+            (
+                "primary_jar_name",
+                jar.file_name()
+                    .context("客户端 JAR 缺少文件名")?
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            ("file_separator", std::path::MAIN_SEPARATOR.to_string()),
             (
                 "library_directory",
                 root.join("libraries").display().to_string(),
@@ -403,6 +414,7 @@ impl Backend {
         let parser = crate::argument_service::ArgumentParser::current();
         args.extend(parser.parse(&config.jvm_args).context("JVM 参数格式错误")?);
         apply_platform_jvm_args(&mut args, meta, std::env::consts::OS);
+        let jvm_arg_count = args.len();
         args.push(meta["mainClass"].as_str().context("缺少 mainClass")?.into());
         args.extend(crate::launch_options::game_arguments(&config, meta)?);
         args.extend(
@@ -413,6 +425,11 @@ impl Backend {
         for arg in &mut args {
             *arg = crate::launch_options::expand_argument(arg, &values)?;
         }
+        crate::classpath_service::BootstrapCompatibility::from_metadata(meta)?.rewrite(
+            &mut args[..jvm_arg_count],
+            cp.libraries(),
+            &jar,
+        )?;
         self.control.check()?;
         let log_path = game_dir.join("tui-mc-game.log");
         let builtin_versions = crate::fabric_check::builtins(
@@ -426,8 +443,10 @@ impl Backend {
                 &builtin_versions,
             )?;
         }
+        self.control.check()?;
         let launch_started = std::time::SystemTime::now();
         let output = fs::File::create(&log_path)?;
+        let mut tail = crate::logs::LogTail::open(&log_path)?;
         let mut child = Command::new(&runtime.path)
             .args(args)
             .current_dir(&game_dir)
@@ -442,30 +461,20 @@ impl Backend {
             log_path.display()
         ));
         let _ = self.tx.send(Message::Progress("游戏运行中".into(), 0, 0));
-        let mut tail = crate::logs::LogTail::open(&log_path)?;
-        let status = loop {
-            for line in tail.read_lines()? {
+        let status = match ProcessMonitor::new(&self.control).run(
+            &mut child,
+            &mut tail,
+            |line| {
                 self.log(format!(
                     "游戏 · {}",
                     redact_token(&line, &session.access_token)
                 ));
-            }
-            if self.control.cancelled() {
-                child.kill().context("终止游戏失败")?;
-                child.wait()?;
-                bail!("游戏已由用户终止");
-            }
-            if let Some(status) = child.try_wait()? {
-                break status;
-            }
-            thread::sleep(Duration::from_millis(100));
+            },
+            |warning| self.log(redact_token(&warning, &session.access_token)),
+        )? {
+            ProcessOutcome::Exited(status) => status,
+            ProcessOutcome::Cancelled => bail!("游戏已由用户终止"),
         };
-        for line in tail.read_lines()? {
-            self.log(format!(
-                "游戏 · {}",
-                redact_token(&line, &session.access_token)
-            ));
-        }
         if !status.success() {
             match crate::diagnostics::analyze_dir(&game_dir, Some(launch_started)) {
                 Ok(diagnosis) => {
@@ -485,26 +494,6 @@ fn redact_token(line: &str, token: &str) -> String {
         line.replace(token, "[令牌已隐藏]")
     } else {
         line.into()
-    }
-}
-pub(crate) struct GameProcess(pub(crate) std::process::Child);
-impl std::ops::Deref for GameProcess {
-    type Target = std::process::Child;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-impl std::ops::DerefMut for GameProcess {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-impl Drop for GameProcess {
-    fn drop(&mut self) {
-        if !matches!(self.0.try_wait(), Ok(Some(_))) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
     }
 }
 fn verify(path: &Path, expected: &str) -> Result<bool> {
@@ -535,27 +524,6 @@ fn apply_platform_jvm_args(args: &mut Vec<String>, meta: &Value, os: &str) {
 
 fn artifacts(lib: &Value) -> Result<Vec<(Value, bool)>> {
     crate::library_service::LibraryResolver::current().resolve(lib)
-}
-fn extract_natives(path: &Path, dir: &Path, lib: &Value) -> Result<()> {
-    let mut archive = zip::ZipArchive::new(fs::File::open(path)?)?;
-    for i in 0..archive.len() {
-        let mut entry = archive.by_index(i)?;
-        let name = entry.name().to_owned();
-        if entry.is_dir()
-            || name.starts_with("META-INF/")
-            || lib["extract"]["exclude"].as_array().is_some_and(|a| {
-                a.iter()
-                    .filter_map(Value::as_str)
-                    .any(|prefix| name.starts_with(prefix))
-            })
-        {
-            continue;
-        }
-        let dest = safe_path(dir, &name)?;
-        fs::create_dir_all(dest.parent().context("缺少 native 目录")?)?;
-        std::io::copy(&mut entry, &mut fs::File::create(dest)?)?;
-    }
-    Ok(())
 }
 pub fn installed(config: &Config) -> Vec<String> {
     let mut versions = vec![];

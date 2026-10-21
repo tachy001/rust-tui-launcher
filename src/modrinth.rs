@@ -260,7 +260,7 @@ impl Backend {
     }
     pub fn mod_updates(&self, config: &Config, id: &str) -> Result<Vec<ModHit>> {
         let target = target(config, id)?;
-        let dir = config.effective(id).instance_dir(id)?;
+        let dir = config.effective(id)?.instance_dir(id)?;
         let inventory = inventory(&dir)?;
         let mut result = vec![];
         for installed in inventory.entries.values() {
@@ -312,7 +312,7 @@ impl Backend {
         let root = config.root()?;
         let version_dir = root.join("versions").join(id);
         let _lock = crate::instances::InstanceLock::acquire(&version_dir)?;
-        let game_dir = config.effective(id).instance_dir(id)?;
+        let game_dir = config.effective(id)?.instance_dir(id)?;
         let current = inventory(&game_dir)?;
         let activation = crate::mod_install_service::ModInstallState::new(&game_dir, &current);
         let token = format!(
@@ -503,7 +503,7 @@ impl Backend {
         mutation: &crate::instance_service::InstanceMutation,
     ) -> Result<()> {
         mutation.require(&config.root()?, id)?;
-        let dir = config.effective(id).instance_dir(id)?;
+        let dir = config.effective(id)?.instance_dir(id)?;
         let inventory = inventory(&dir)?;
         if inventory.entries.is_empty() {
             return Ok(());

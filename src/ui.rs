@@ -723,11 +723,15 @@ impl App {
         }
     }
     fn setting_value(&self, index: usize) -> String {
-        let c = self
+        let c = match self
             .scope
             .as_ref()
             .map(|id| self.config.effective(id))
-            .unwrap_or_else(|| self.config.clone());
+            .unwrap_or_else(|| Ok(self.config.clone()))
+        {
+            Ok(config) => config,
+            Err(error) => return format!("配置读取失败：{error:#}"),
+        };
         match index {
             0 => c.username,
             1 => c.java,
@@ -760,7 +764,7 @@ impl App {
                 14 => instance.server = Some(value.trim().into()),
                 _ => bail!("此项为全局设置，按 G 切换到全局后修改"),
             }
-            candidate.effective(id).validate()?;
+            candidate.effective(id)?.validate()?;
         } else {
             match self.setting {
                 0 => candidate.username = value.into(),
@@ -1476,7 +1480,7 @@ impl App {
                     let result = self
                         .config
                         .effective(&id)
-                        .instance_dir(&id)
+                        .and_then(|config| config.instance_dir(&id))
                         .and_then(|dir| crate::logs::recent(&dir.join("tui-mc-game.log")));
                     match result {
                         Ok(lines) => {
@@ -2022,7 +2026,19 @@ fn draw(f: &mut Frame, app: &App) {
                 render_list(f, items, title, app.selection, cols[0]);
             }
             let selected = app.selected().unwrap_or_else(|| "尚未选择".into());
-            let config = app.config.effective(&selected);
+            let effective = app.config.effective(&selected);
+            let configuration = match &effective {
+                Ok(config) => format!(
+                    "{} MB · {}",
+                    config.memory_mb,
+                    if config.isolated {
+                        "独立实例目录"
+                    } else {
+                        "共享游戏目录"
+                    }
+                ),
+                Err(error) => format!("配置读取失败：{error:#}"),
+            };
             let help = if app.tab == 0 {
                 "Enter 进入实例管理\nSpace 启动游戏\n\n游戏设置、Mod、存档、组件\n均在所选实例的管理菜单中"
             } else {
@@ -2030,7 +2046,7 @@ fn draw(f: &mut Frame, app: &App) {
             };
             f.render_widget(
                 Paragraph::new(format!(
-                    "{selected}\n\n{}\n{} MB · {}\n\n{help}",
+                    "{selected}\n\n{}\n{configuration}\n\n{help}",
                     app.accounts
                         .active()
                         .map(|a| format!(
@@ -2042,13 +2058,7 @@ fn draw(f: &mut Frame, app: &App) {
                                 "离线"
                             }
                         ))
-                        .unwrap_or_else(|| format!("{} · 离线", config.username)),
-                    config.memory_mb,
-                    if config.isolated {
-                        "独立实例目录"
-                    } else {
-                        "共享游戏目录"
-                    }
+                        .unwrap_or_else(|| format!("{} · 离线", app.config.username)),
                 ))
                 .block(panel("当前选择"))
                 .wrap(Wrap { trim: false }),

@@ -624,7 +624,7 @@ mod tests {
                 .collect(),
         )
         .unwrap();
-        let effective = options.config.effective("test");
+        let effective = options.config.effective("test").unwrap();
         assert!(!effective.fullscreen);
         assert!(effective.server.is_empty());
         let options = parse(
@@ -635,8 +635,11 @@ mod tests {
                 .collect(),
         )
         .unwrap();
-        assert!(options.config.effective("test").fullscreen);
-        assert_eq!(options.config.effective("test").server, "[::1]:25566");
+        assert!(options.config.effective("test").unwrap().fullscreen);
+        assert_eq!(
+            options.config.effective("test").unwrap().server,
+            "[::1]:25566"
+        );
     }
     #[test]
     fn options_do_not_consume_command_arguments() {

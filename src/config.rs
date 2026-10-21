@@ -51,7 +51,7 @@ mod tests {
                 ..InstanceSettings::default()
             },
         );
-        let instance = config.effective("test-instance");
+        let instance = config.effective("test-instance").unwrap();
         assert_eq!(instance.memory_mb, 4096);
         assert!(!instance.isolated);
         assert_eq!(instance.jvm_args, "-Dtest=true");
@@ -73,11 +73,49 @@ mod tests {
                 ..InstanceSettings::default()
             },
         );
-        let instance = config.effective("test");
+        let instance = config.effective("test").unwrap();
         assert!(!instance.fullscreen);
         assert!(instance.server.is_empty());
         assert!(config.fullscreen);
         assert_eq!(config.server, "example.org");
+    }
+    #[test]
+    fn validates_instance_overrides_before_they_can_be_saved() {
+        for settings in [
+            InstanceSettings {
+                memory_mb: Some(0),
+                ..Default::default()
+            },
+            InstanceSettings {
+                java: Some(String::new()),
+                ..Default::default()
+            },
+            InstanceSettings {
+                jvm_args: Some("\"unfinished".into()),
+                ..Default::default()
+            },
+            InstanceSettings {
+                game_args: Some("--value \0".into()),
+                ..Default::default()
+            },
+            InstanceSettings {
+                server: Some("host:0".into()),
+                ..Default::default()
+            },
+        ] {
+            let mut config = Config::default();
+            config.instances.insert("broken".into(), settings);
+            assert!(config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("实例 broken"));
+        }
+        let mut config = Config::default();
+        config
+            .instances
+            .insert("../outside".into(), InstanceSettings::default());
+        assert!(config.validate().is_err());
     }
 }
 
@@ -127,10 +165,14 @@ impl Default for Config {
 }
 impl Config {
     pub fn load() -> Result<Self> {
-        if !std::path::Path::new("launcher.json").exists() {
-            return Ok(Self::default());
-        }
-        serde_json::from_slice(&fs::read("launcher.json")?).context("launcher.json 格式错误")
+        let bytes = match fs::read("launcher.json") {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default())
+            }
+            Err(error) => return Err(error).context("读取 launcher.json 失败"),
+        };
+        serde_json::from_slice(&bytes).context("launcher.json 格式错误")
     }
     pub fn save(&self) -> Result<()> {
         self.validate()?;
@@ -141,6 +183,20 @@ impl Config {
         Ok(())
     }
     pub fn validate(&self) -> Result<()> {
+        self.validate_values()?;
+        let mut base = self.clone();
+        base.instances.clear();
+        for (id, settings) in &self.instances {
+            crate::metadata::valid_id(id).with_context(|| format!("实例设置 ID 无效：{id}"))?;
+            let mut effective = base.clone();
+            settings.apply_to(&mut effective);
+            effective
+                .validate_values()
+                .with_context(|| format!("实例 {id} 的设置无效"))?;
+        }
+        Ok(())
+    }
+    fn validate_values(&self) -> Result<()> {
         crate::launch_options::server_address(&self.server)?;
         crate::sources::validate(&self.download_source)?;
         if self.username.is_empty()
@@ -172,59 +228,11 @@ impl Config {
         }
         Ok(())
     }
-    pub fn effective(&self, id: &str) -> Self {
-        let mut result = self.clone();
-        let persisted = if crate::metadata::valid_id(id).is_ok() {
-            fs::read(
-                self.game_dir
-                    .join("versions")
-                    .join(id)
-                    .join("tui-mc-instance.json"),
-            )
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<crate::instances::InstanceInfo>(&bytes).ok())
-            .and_then(|info| info.settings)
-        } else {
-            None
+    pub fn effective(&self, id: &str) -> Result<Self> {
+        let source = crate::instance_config_service::FileInstanceConfigSource {
+            game_dir: &self.game_dir,
         };
-        for instance in persisted.iter().chain(self.instances.get(id)) {
-            if let Some(java) = &instance.java {
-                result.java = java.clone();
-            }
-            if let Some(memory) = instance.memory_mb {
-                result.memory_mb = memory;
-            }
-            if let Some(isolated) = instance.isolated {
-                result.isolated = isolated;
-            }
-            if let Some(args) = &instance.jvm_args {
-                result.jvm_args = args.clone();
-            }
-            if let Some(args) = &instance.game_args {
-                result.game_args = args.clone();
-            }
-            if let Some(fullscreen) = instance.fullscreen {
-                result.fullscreen = fullscreen;
-            }
-            if let Some(server) = &instance.server {
-                result.server = server.clone();
-            }
-        }
-        if crate::metadata::valid_id(id).is_ok() {
-            let profile = self
-                .game_dir
-                .join("versions")
-                .join(id)
-                .join(format!("{id}.json"));
-            if let Ok(bytes) = fs::read(profile) {
-                if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                    if value["tuiMcIsolated"] == true {
-                        result.isolated = true;
-                    }
-                }
-            }
-        }
-        result
+        crate::instance_config_service::InstanceConfigResolver::new(self, &source).resolve(id)
     }
     pub fn instance_dir(&self, id: &str) -> Result<PathBuf> {
         crate::metadata::valid_id(id)?;

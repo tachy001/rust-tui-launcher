@@ -166,7 +166,7 @@ impl Backend {
         if dependencies.len() > 2 {
             bail!("实例包含多个加载器，无法生成标准 Modrinth 整合包");
         }
-        let game_dir = config.effective(id).instance_dir(id)?;
+        let game_dir = config.effective(id)?.instance_dir(id)?;
         let files = crate::instances::data_files(&game_dir, false, &self.control)?;
         let mut total_size = 0u64;
         for (source, _) in &files {

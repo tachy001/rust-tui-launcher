@@ -40,6 +40,15 @@ impl LogTail {
         }
         Ok(lines)
     }
+    /// Flush an unterminated final line only after the writer has exited.
+    pub fn finish(&mut self) -> Result<Vec<String>> {
+        let mut lines = self.read_lines()?;
+        if let Some(line) = human_line(&String::from_utf8_lossy(&self.pending)) {
+            lines.push(line);
+        }
+        self.pending.clear();
+        Ok(lines)
+    }
 }
 pub fn recent(path: &Path) -> Result<Vec<String>> {
     let mut file = File::open(path)?;
@@ -115,5 +124,15 @@ mod tests {
         drop(writer);
         drop(tail);
         fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn finish_preserves_final_line_without_newline_only_once() {
+        let workspace = crate::test_support::Workspace::new();
+        let path = workspace.path.join("final.log");
+        fs::write(&path, "ready\n最后一行").unwrap();
+        let mut tail = LogTail::open(&path).unwrap();
+        assert_eq!(tail.read_lines().unwrap(), ["ready"]);
+        assert_eq!(tail.finish().unwrap(), ["最后一行"]);
+        assert!(tail.finish().unwrap().is_empty());
     }
 }
