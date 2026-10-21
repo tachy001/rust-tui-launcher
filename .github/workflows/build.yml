@@ -75,7 +75,7 @@ jobs:
             dist/*-macos-universal.tar.gz
           if-no-files-found: error
 
-  draft-release:
+  publish-release:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-24.04
@@ -87,7 +87,7 @@ jobs:
           pattern: release-*
           path: dist
           merge-multiple: true
-      - name: Create or update draft prerelease
+      - name: Create or update latest release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -111,6 +111,7 @@ jobs:
                   gh release delete-asset "$RELEASE_TAG" "$asset" --yes
                 fi
               done
+            gh release edit "$RELEASE_TAG" --draft=false --prerelease=false --latest
           else
-            gh release create "$RELEASE_TAG" "${packages[@]}" --verify-tag --draft --prerelease --generate-notes
+            gh release create "$RELEASE_TAG" "${packages[@]}" --verify-tag --latest --generate-notes
           fi
