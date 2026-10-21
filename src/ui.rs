@@ -38,6 +38,36 @@ const ACCENT: Color = Color::Rgb(115, 224, 173);
 const MUTED: Color = Color::Rgb(139, 155, 178);
 const BG: Color = Color::Rgb(16, 22, 32);
 const TEXT: Color = Color::Rgb(220, 231, 242);
+const PRIMARY: [(usize, &str); 5] = [
+    (4, "账户"),
+    (7, "实例管理"),
+    (0, "实例列表"),
+    (1, "下载"),
+    (8, "设置"),
+];
+const INSTANCE_MENU: [&str; 13] = [
+    "启动游戏",
+    "游戏设置",
+    "Mod 管理",
+    "存档管理",
+    "加载器 / 组件",
+    "检查并修复",
+    "安装建议 Java",
+    "启动诊断",
+    "游戏日志",
+    "修改名称",
+    "复制实例",
+    "导出整合包",
+    "移入回收站",
+];
+const SETTINGS_MENU: [&str; 6] = [
+    "全局游戏与下载设置",
+    "检测本机 Java",
+    "回收站",
+    "任务日志",
+    "导入整合包",
+    "CurseForge API 密钥",
+];
 const SETTINGS: [&str; 15] = [
     "离线用户名",
     "Java 路径（auto 自动匹配）",
@@ -142,6 +172,10 @@ struct App {
     transfer: Option<(crate::download_progress::Snapshot, std::time::Instant)>,
     world_picker: Option<WorldPicker>,
     pending_world_zip: Option<std::path::PathBuf>,
+    managed_instance: Option<String>,
+    page_history: Vec<(usize, usize)>,
+    list_queries: [String; 2],
+    nav_focused: bool,
 }
 impl App {
     fn new(config: Config, tx: Sender<Message>, rx: Receiver<Message>) -> Self {
@@ -153,6 +187,7 @@ impl App {
             .unwrap_or(0);
         let mod_instance = config.last_version.clone();
         let names = crate::instances::names(&config);
+        let managed_instance = local.get(selection).cloned();
         Self {
             config,
             tab: 0,
@@ -198,6 +233,10 @@ impl App {
             transfer: None,
             world_picker: None,
             pending_world_zip: None,
+            managed_instance,
+            page_history: vec![],
+            list_queries: Default::default(),
+            nav_focused: true,
         }
     }
     fn log(&mut self, text: impl Into<String>) {
@@ -260,6 +299,9 @@ impl App {
             }
             4 => self.accounts.entries.len(),
             5 => self.trash.len(),
+            7 => INSTANCE_MENU.len(),
+            8 => SETTINGS_MENU.len(),
+            9 => 4,
             _ => 0,
         }
     }
@@ -329,6 +371,10 @@ impl App {
         }
     }
     fn action(&mut self) {
+        if matches!(self.tab, 7..=9) {
+            self.menu_action();
+            return;
+        }
         let config = self.config.clone();
         match self.tab {
             0 => {
@@ -407,6 +453,159 @@ impl App {
             _ => {}
         }
     }
+    fn primary_index(&self) -> usize {
+        match self.tab {
+            4 => 0,
+            7 | 9 | 3 => 1,
+            2 if self.scope.is_some() => 1,
+            6 if self.page_history.iter().any(|(page, _)| *page == 7) => 1,
+            0 => 2,
+            1 => 3,
+            _ => 4,
+        }
+    }
+    fn open_page(&mut self, page: usize) {
+        self.nav_focused = false;
+        if self.tab < 2 {
+            self.list_queries[self.tab] = self.query.clone();
+        }
+        self.page_history.push((self.tab, self.selection));
+        self.tab = page;
+        self.selection = 0;
+        if page == 5 {
+            self.refresh_trash();
+        }
+    }
+    fn primary_page(&mut self, index: usize) {
+        if self.tab < 2 {
+            self.list_queries[self.tab] = self.query.clone();
+        }
+        if self.tab == 0 {
+            if let Some(id) = self.selected() {
+                self.managed_instance = Some(id);
+            }
+        }
+        self.page_history.clear();
+        self.tab = PRIMARY[index].0;
+        if self.tab < 2 {
+            self.query = self.list_queries[self.tab].clone();
+        }
+        self.selection = if self.tab == 0 {
+            self.local_visible()
+                .iter()
+                .position(|id| Some(id.as_str()) == self.managed_instance.as_deref())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+    }
+    fn back_page(&mut self) {
+        if let Some((page, selection)) = self.page_history.pop() {
+            self.tab = page;
+            if page < 2 {
+                self.query = self.list_queries[page].clone();
+            }
+            self.selection = selection.min(self.count().saturating_sub(1));
+        } else if self.tab == 7 {
+            self.primary_page(2);
+        } else if !PRIMARY.iter().any(|(page, _)| *page == self.tab) {
+            self.tab = if matches!(self.tab, 3 | 9) || (self.tab == 2 && self.scope.is_some()) {
+                7
+            } else {
+                8
+            };
+            self.selection = 0;
+        }
+    }
+    fn menu_action(&mut self) {
+        let parent = (self.tab, self.selection);
+        if self.task.is_some() && !(self.tab == 8 && matches!(self.selection, 2 | 3)) {
+            self.task_popup = true;
+            return;
+        }
+        if self.tab == 8 {
+            match self.selection {
+                0 => {
+                    self.scope = None;
+                    self.open_page(2);
+                }
+                1 => {
+                    self.key(event::KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+                }
+                2 => self.open_page(5),
+                3 => self.open_page(6),
+                4 => {
+                    self.editor = Some(Editor {
+                        kind: EditKind::ImportPack,
+                        text: String::new(),
+                    })
+                }
+                5 => {
+                    self.editor = Some(Editor {
+                        kind: EditKind::CurseKey,
+                        text: String::new(),
+                    })
+                }
+                _ => {}
+            }
+            return;
+        }
+        let Some(id) = self
+            .managed_instance
+            .clone()
+            .filter(|id| self.local.contains(id))
+        else {
+            self.log("请先在实例列表选择一个已安装实例");
+            self.primary_page(2);
+            return;
+        };
+        if self.tab == 7 && self.selection == 4 {
+            self.open_page(9);
+            return;
+        }
+        let code = if self.tab == 9 {
+            [
+                KeyCode::Char('f'),
+                KeyCode::Char('u'),
+                KeyCode::Char('h'),
+                KeyCode::Char('n'),
+            ][self.selection.min(3)]
+        } else {
+            [
+                KeyCode::Enter,
+                KeyCode::Char('o'),
+                KeyCode::Char('m'),
+                KeyCode::Char('w'),
+                KeyCode::Null,
+                KeyCode::Char('x'),
+                KeyCode::Char('b'),
+                KeyCode::Char('d'),
+                KeyCode::Char('l'),
+                KeyCode::F(2),
+                KeyCode::Char('t'),
+                KeyCode::Char('e'),
+                KeyCode::Delete,
+            ][self.selection.min(12)]
+        };
+        let query = std::mem::take(&mut self.query);
+        self.tab = 0;
+        self.selection = self
+            .local
+            .iter()
+            .position(|entry| entry == &id)
+            .unwrap_or(0);
+        if code == KeyCode::Enter {
+            self.action();
+        } else {
+            self.key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        }
+        self.query = query;
+        if self.tab == 0 {
+            (self.tab, self.selection) = parent;
+        } else {
+            self.page_history.push(parent);
+        }
+    }
     fn search_online_mods(&mut self, query: String, offset: u64) {
         if let Some(id) = self.mod_instance.clone() {
             let config = self.config.clone();
@@ -422,7 +621,7 @@ impl App {
                 Ok(format!("找到 {total} 个兼容项目"))
             });
         } else {
-            self.log("请先在本地版本页按 M 选择实例");
+            self.log("请先从实例列表进入实例管理 › Mod 管理");
         }
     }
     fn install_online_mod(&mut self, project: String, version: Option<String>) {
@@ -685,7 +884,7 @@ impl App {
             EditKind::ImportMod => self
                 .mod_instance
                 .as_ref()
-                .context("请先在本地版本页按 M 选择实例")
+                .context("请先从实例列表进入实例管理 › Mod 管理")
                 .and_then(|id| {
                     mods::import(&self.config, id, Path::new(editor.text.trim_matches('"')))
                 }),
@@ -903,10 +1102,9 @@ impl App {
             match key.code {
                 KeyCode::Char('y') => {
                     let result = crate::instances::trash(&self.config, &id);
-                    self.report(
-                        result
-                            .map(|entry| format!("实例已移至回收站，可按 6 恢复：{}", entry.label)),
-                    );
+                    self.report(result.map(|entry| {
+                        format!("实例已移至回收站，可在设置 › 回收站恢复：{}", entry.label)
+                    }));
                     self.confirm_remove = None;
                     self.local = backend::installed(&self.config);
                     self.names = crate::instances::names(&self.config);
@@ -1066,6 +1264,39 @@ impl App {
             }
             return false;
         }
+        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            self.nav_focused = !self.nav_focused;
+            return false;
+        }
+        if self.nav_focused {
+            match key.code {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.primary_page((self.primary_index() + 1) % PRIMARY.len());
+                    return false;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.primary_page((self.primary_index() + PRIMARY.len() - 1) % PRIMARY.len());
+                    return false;
+                }
+                KeyCode::Home => {
+                    self.primary_page(0);
+                    return false;
+                }
+                KeyCode::End => {
+                    self.primary_page(PRIMARY.len() - 1);
+                    return false;
+                }
+                KeyCode::Enter | KeyCode::Right => {
+                    self.nav_focused = false;
+                    return false;
+                }
+                KeyCode::Esc | KeyCode::Left => return false,
+                _ => {}
+            }
+        } else if key.code == KeyCode::Left && !key.modifiers.contains(KeyModifiers::ALT) {
+            self.nav_focused = true;
+            return false;
+        }
         match key.code {
             KeyCode::Char('w') if self.tab == 0 && self.task.is_none() => {
                 if let Some(id) = self.selected() {
@@ -1083,7 +1314,15 @@ impl App {
             }
             KeyCode::F(6) if self.task.is_some() => self.task_popup = true,
             KeyCode::F(1) => self.help = true,
-            KeyCode::Char('q') | KeyCode::Esc => {
+            KeyCode::Esc => {
+                if self.page_history.is_empty() && PRIMARY.iter().any(|(page, _)| *page == self.tab)
+                {
+                    self.nav_focused = true;
+                } else {
+                    self.back_page();
+                }
+            }
+            KeyCode::Char('q') => {
                 if self.task.is_none() {
                     return true;
                 } else {
@@ -1103,26 +1342,9 @@ impl App {
             KeyCode::Left if self.tab == 6 && key.modifiers.contains(KeyModifiers::ALT) => {
                 self.log_horizontal = self.log_horizontal.saturating_sub(8);
             }
-            KeyCode::Tab | KeyCode::Right => {
-                self.tab = (self.tab + 1) % 7;
-                self.selection = 0;
-                if self.tab == 5 {
-                    self.refresh_trash();
-                }
-            }
-            KeyCode::BackTab | KeyCode::Left => {
-                self.tab = (self.tab + 6) % 7;
-                self.selection = 0;
-                if self.tab == 5 {
-                    self.refresh_trash();
-                }
-            }
-            KeyCode::Char(c @ '1'..='7') => {
-                self.tab = c as usize - '1' as usize;
-                self.selection = 0;
-                if self.tab == 5 {
-                    self.refresh_trash();
-                }
+            KeyCode::Char(c @ '1'..='5') => {
+                self.primary_page(c as usize - '1' as usize);
+                self.nav_focused = false;
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 if self.tab == 6 {
@@ -1172,6 +1394,20 @@ impl App {
                     _ => selected.saturating_add(10).min(last),
                 };
             }
+            KeyCode::Enter if self.tab == 0 => {
+                if let Some(id) = self.selected() {
+                    self.managed_instance = Some(id);
+                    self.open_page(7);
+                }
+            }
+            KeyCode::Char(' ') if self.tab == 0 => self.action(),
+            KeyCode::Char(' ') if self.tab == 7 => {
+                let selection = self.selection;
+                self.selection = 0;
+                self.menu_action();
+                self.selection = selection;
+            }
+            KeyCode::Backspace if self.tab != 3 => self.back_page(),
             KeyCode::Enter => self.action(),
             KeyCode::Char('r') => self.refresh(),
             KeyCode::Char('x') => self.repair(),
@@ -1306,10 +1542,13 @@ impl App {
             KeyCode::Backspace if self.tab == 3 => {
                 if self.mod_versions.is_some() {
                     self.mod_versions = None;
-                } else {
+                    self.selection = 0;
+                } else if self.mod_search.is_some() {
                     self.mod_search = None;
+                    self.selection = 0;
+                } else {
+                    self.back_page();
                 }
-                self.selection = 0;
             }
             KeyCode::Char('v')
                 if self.tab == 3 && self.mod_search.is_some() && self.task.is_none() =>
@@ -1475,8 +1714,10 @@ pub fn run(config: Config) -> Result<()> {
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let (tx, rx) = mpsc::channel();
     let mut app = App::new(config, tx, rx);
-    app.log("欢迎使用 Tui-Launcher。/ 搜索 · F Fabric · U Quilt · O 实例设置 · M 管理 Mod\n W 存档备份 / 导入");
-    app.log("5 账户管理 · 微软登录需先在设置中配置自己的 OAuth 客户端 ID。");
+    app.log(
+        "欢迎使用 Tui-Launcher。Enter 管理所选实例 · Space 启动 · 1–5 一级导航 · Esc 返回上一级",
+    );
+    app.log("账户 › 微软登录：请先在设置 › 全局游戏与下载设置中配置自己的 OAuth 客户端 ID。");
     loop {
         app.messages();
         terminal.draw(|f| draw(f, &app))?;
@@ -1539,15 +1780,18 @@ fn dialog_rect(area: Rect, width: u16, height: u16) -> Rect {
 
 fn page_actions(app: &App) -> &'static str {
     match app.tab {
-        0 => "Enter 启动 · X 修复 · O 设置 · M Mod\nW 存档 · B Java · L 日志 · D 诊断\nF Fabric · U Quilt · H Forge · N NeoForge\nF2 名称 · T 复制 · E 导出 · Del 回收\nI 导入整合包 · / 搜索 · R 刷新",
-        1 => "Enter 安装原版 · R 获取版本目录\nF Fabric · U Quilt · H Forge · N NeoForge\nS 切换快照 · / 搜索 · I 导入整合包",
+        0 => "Enter 管理所选实例 · Space 启动\n/ 搜索 · R 刷新\n组件、Mod、存档与修复请进入实例管理",
+        1 => "Enter 安装原版 · R 获取版本目录\nS 切换快照 · / 搜索\n安装后的加载器与 Mod 请在实例管理中配置",
+        7 => "↑↓ 选择功能 · Enter 打开\nEsc 返回实例列表 · Space 启动游戏",
+        8 => "↑↓ 选择设置分类 · Enter 打开\nEsc 返回上一级",
+        9 => "↑↓ 选择加载器 · Enter 选择具体版本\nEsc 返回实例管理",
         6 => "↑↓ 滚动 · PgUp / PgDn 翻页\n← → 切页 · Alt+← → 查看长行\nHome 最早记录 · End 跟随最新记录",
         2 => "Enter 编辑 · G 全局设置\nD 清除当前实例覆盖 · V 检测 Java\n编辑：Enter 保存 · Esc 取消 · Ctrl+U 清空",
         3 if app.mod_versions.is_some() => "Enter 安装所选版本\nBackspace 返回搜索结果 · L 本地 Mod",
         3 if app.mod_search.is_some() => "Enter 安装 · V 选择版本 · B 搜索\nN 下一页 · P 上一页 · L 本地 Mod",
-        3 => "Enter 启停 · A 导入 JAR · B 在线搜索\nU 检查更新 · Del 移出 · Z 恢复 · R 刷新\n在本地页按 M 选择要管理的实例",
+        3 => "Enter 启停 · A 导入 JAR · B 在线搜索\nU 检查更新 · Del 移出 · Z 恢复 · R 刷新\nEsc 返回实例管理",
         4 => "Enter 切换账户 · N 添加离线账户\nA 微软登录 · D 移除账户\nShift+K 配置 CurseForge 密钥\n微软登录：先在设置中填写 OAuth 应用 ID",
-        _ => "Enter 恢复实例 · R 刷新\n本地页按 Delete 将实例移入回收站",
+        _ => "Enter 恢复实例 · R 刷新\nEsc 返回设置菜单",
     }
 }
 
@@ -1592,6 +1836,7 @@ fn draw(f: &mut Frame, app: &App) {
             Constraint::Length(2),
         ])
         .split(area);
+    let mut rows = [rows[0], rows[1], rows[2], rows[3], rows[4]];
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
@@ -1610,24 +1855,88 @@ fn draw(f: &mut Frame, app: &App) {
         }),
         rows[0],
     );
-    let tabs = ["1本地", "2下载", "3设置", "4Mod", "5账户", "6回收", "7日志"];
-    f.render_widget(
-        Paragraph::new(Line::from(
-            tabs.iter()
-                .enumerate()
-                .map(|(i, t)| {
-                    Span::styled(
-                        format!("{t} "),
-                        Style::default()
-                            .fg(if app.tab == i { BG } else { MUTED })
-                            .bg(if app.tab == i { ACCENT } else { BG }),
-                    )
+    if area.width >= 80 {
+        let panes = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(22), Constraint::Min(30)])
+            .split(rows[2]);
+        rows[2] = panes[1];
+        let items: Vec<ListItem> = PRIMARY
+            .iter()
+            .enumerate()
+            .map(|(index, (_, name))| ListItem::new(format!(" {}  {name}", index + 1)))
+            .collect();
+        let mut nav_state = ListState::default().with_selected(Some(app.primary_index()));
+        f.render_stateful_widget(
+            List::new(items)
+                .block(
+                    panel(if app.nav_focused {
+                        "导航 · ↑↓ 选择"
+                    } else {
+                        "导航 · Tab 返回"
+                    })
+                    .border_style(Style::default().fg(if app.nav_focused {
+                        ACCENT
+                    } else {
+                        MUTED
+                    })),
+                )
+                .highlight_style(if app.nav_focused {
+                    highlight()
+                } else {
+                    Style::default().fg(ACCENT)
                 })
-                .collect::<Vec<_>>(),
-        )),
-        rows[1],
-    );
-    let cols = if area.width >= 100 {
+                .highlight_symbol(if app.nav_focused { "▸ " } else { "  " }),
+            panes[0],
+            &mut nav_state,
+        );
+        let section = match app.tab {
+            2 => {
+                if app.scope.is_some() {
+                    "游戏设置"
+                } else {
+                    "全局游戏与下载设置"
+                }
+            }
+            3 => "Mod 管理",
+            5 => "回收站",
+            6 => "日志",
+            9 => "加载器 / 组件",
+            _ => PRIMARY[app.primary_index()].1,
+        };
+        let context = if app.primary_index() == 1 {
+            app.managed_instance.as_deref().unwrap_or("未选择实例")
+        } else {
+            ""
+        };
+        f.render_widget(
+            Paragraph::new(format!(
+                " {}  ›  {section}  {context}",
+                PRIMARY[app.primary_index()].1
+            ))
+            .style(Style::default().fg(MUTED)),
+            rows[1],
+        );
+    } else {
+        let tabs = ["1账户", "2实例", "3列表", "4下载", "5设置"];
+        f.render_widget(
+            Paragraph::new(Line::from(
+                tabs.iter()
+                    .enumerate()
+                    .map(|(i, t)| {
+                        Span::styled(
+                            format!("{t} "),
+                            Style::default()
+                                .fg(if app.primary_index() == i { BG } else { MUTED })
+                                .bg(if app.primary_index() == i { ACCENT } else { BG }),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )),
+            rows[1],
+        );
+    }
+    let cols = if rows[2].width >= 100 {
         let split = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
@@ -1640,6 +1949,30 @@ fn draw(f: &mut Frame, app: &App) {
         [rows[2], Rect::default()]
     };
     match app.tab {
+        7..=9 => {
+            let (title, labels): (String, Vec<&str>) = match app.tab {
+                7 => (
+                    format!(
+                        "实例管理 · {}",
+                        app.managed_instance
+                            .as_ref()
+                            .map(|id| app.names.get(id).unwrap_or(id).as_str())
+                            .unwrap_or("请先选择实例")
+                    ),
+                    INSTANCE_MENU.to_vec(),
+                ),
+                8 => ("设置".into(), SETTINGS_MENU.to_vec()),
+                _ => (
+                    "实例管理 › 加载器 / 组件".into(),
+                    vec!["Fabric", "Quilt", "Forge", "NeoForge"],
+                ),
+            };
+            let items = labels
+                .into_iter()
+                .map(|label| ListItem::new(format!(" › {label}")))
+                .collect();
+            render_list(f, items, title, app.selection, rows[2]);
+        }
         0 | 1 => {
             let items = if app.tab == 0 {
                 app.local_visible()
@@ -1660,7 +1993,7 @@ fn draw(f: &mut Frame, app: &App) {
             let title = format!(
                 "{} · {}{}",
                 if app.tab == 0 {
-                    "本地游戏"
+                    "实例列表"
                 } else {
                     "官方版本"
                 },
@@ -1672,16 +2005,28 @@ fn draw(f: &mut Frame, app: &App) {
                 }
             );
             if items.is_empty() {
-                f.render_widget(Paragraph::new(if !app.query.is_empty(){"\n 没有匹配的版本。\n 按 /，Ctrl+U 清空搜索后 Enter。"}else if app.tab==0{"\n 还没有游戏版本。\n 按 2 前往下载中心，R 获取官方列表。\n 也可在设置中指定已有游戏目录。"}else{"\n R 获取 Mojang 官方版本目录。\n Enter 原版 · F Fabric · U Quilt\n S 显示快照 · / 搜索"}).block(panel(title)).wrap(Wrap{trim:false}),cols[0]);
+                let empty = if !app.query.is_empty() {
+                    "\n 没有匹配的版本。\n 按 /，Ctrl+U 清空搜索后 Enter。"
+                } else if app.tab == 0 {
+                    "\n 还没有游戏实例。\n 按 4 前往下载，R 获取官方列表。\n 已有游戏可在设置中指定游戏目录。"
+                } else {
+                    "\n R 获取 Mojang 官方版本目录。\n Enter 安装原版 · S 显示快照 · / 搜索\n 加载器和 Mod 在安装后的实例管理中配置。"
+                };
+                f.render_widget(
+                    Paragraph::new(empty)
+                        .block(panel(title))
+                        .wrap(Wrap { trim: false }),
+                    cols[0],
+                );
             } else {
                 render_list(f, items, title, app.selection, cols[0]);
             }
             let selected = app.selected().unwrap_or_else(|| "尚未选择".into());
             let config = app.config.effective(&selected);
             let help = if app.tab == 0 {
-                "Enter 启动游戏\n X 检查并修复\n O 实例设置 · M 管理 Mod\n W 存档 · F1 更多操作"
+                "Enter 进入实例管理\nSpace 启动游戏\n\n游戏设置、Mod、存档、组件\n均在所选实例的管理菜单中"
             } else {
-                "Enter 安装原版\n F Fabric · U Quilt\n H Forge · N NeoForge\n S 快照 · / 搜索\n F1 更多操作"
+                "Enter 安装原版\nS 快照 · / 搜索\n\n安装后进入实例管理\n选择组件与 Mod"
             };
             f.render_widget(
                 Paragraph::new(format!(
@@ -1938,7 +2283,11 @@ fn draw(f: &mut Frame, app: &App) {
         Paragraph::new(vec![
             Line::styled(primary, Style::default().fg(ACCENT)),
             Line::styled(
-                "Tab 页面 · ↑↓ 选择 · F6 任务 · F1 帮助 · Q 退出",
+                if app.nav_focused {
+                    "↑↓ 选择导航 · Enter / → 进入 · Tab 切换焦点"
+                } else {
+                    "↑↓ 选择内容 · ← / Tab 导航 · Esc 返回 · F6 任务"
+                },
                 Style::default().fg(MUTED),
             ),
         ]),
@@ -2168,7 +2517,7 @@ fn draw(f: &mut Frame, app: &App) {
         f.render_widget(Clear, dialog);
         f.render_widget(
             Paragraph::new(format!(
-                "{}\n\nTab / Shift+Tab 或 1–7 切换页面\n↑↓ / j k 选择 · Home / End 首尾\nPgUp / PgDn 每次移动 10 项\n任务：C 取消 · P 暂停 / 继续下载\nQ 空闲时退出",
+                "{}\n\nTab / Shift+Tab 切换导航与内容焦点\n导航 ↑↓ 选择 · Enter / → 进入内容\n内容 ← 返回导航 · 1–5 直达入口\nEnter 打开 · Esc 返回上一级\nPgUp / PgDn 翻页\n任务：F6 进度 · C 取消 · P 暂停 / 继续\nQ 空闲时退出",
                 page_actions(app)
             ))
             .block(panel("当前页面 · 操作帮助").title_bottom(" ↑↓ 滚动 · F1 / Esc 返回 "))
@@ -2189,7 +2538,7 @@ mod tests {
         for (width, height) in [(1, 1), (48, 16), (70, 20), (100, 30), (160, 45)] {
             let mut terminal =
                 Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
-            for tab in 0..7 {
+            for tab in 0..10 {
                 app.tab = tab;
                 terminal.draw(|f| draw(f, &app)).unwrap();
                 app.help = true;
@@ -2210,7 +2559,7 @@ mod tests {
                     .collect::<String>()
                     .replace(' ', "");
                 assert!(text.contains("终点.mrpack"), "{width}x{height}: {text}");
-                assert!(text.contains("7日志"));
+                assert!(text.contains("账户"));
             }
             app.editor = None;
             app.task = Some(WorkKind::Download);
@@ -2239,6 +2588,120 @@ mod tests {
         assert_eq!(app.log_horizontal, 8);
         app.key(event::KeyEvent::new(KeyCode::Left, KeyModifiers::ALT));
         assert_eq!(app.log_horizontal, 0);
+    }
+    #[test]
+    fn sidebar_focus_routes_arrows_without_moving_content_selection() {
+        let mut app = app();
+        app.selection = 1;
+        app.key(event::KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert!(app.nav_focused);
+        app.key(event::KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.tab, 7);
+        assert_eq!(
+            app.managed_instance.as_deref(),
+            Some("fabric-loader-1.20.1")
+        );
+        app.key(event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!app.nav_focused);
+        assert_eq!(app.tab, 7);
+        assert!(app.task.is_none());
+        app.key(event::KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.selection, 1);
+        app.key(event::KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(app.nav_focused);
+        app.key(event::KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(!app.nav_focused);
+        assert_eq!(app.selection, 1);
+        app.key(event::KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        app.key(event::KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(app.tab, 8);
+        app.key(event::KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert!(!app.nav_focused);
+        app.key(event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.tab, 2);
+        app.key(event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.tab, 8);
+        assert!(!app.nav_focused);
+    }
+    #[test]
+    fn instance_navigation_keeps_identity_and_returns_to_filtered_list() {
+        let mut app = app();
+        app.query = "fabric".into();
+        app.key(event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.tab, 7);
+        assert_eq!(
+            app.managed_instance.as_deref(),
+            Some("fabric-loader-1.20.1")
+        );
+        app.selection = 1;
+        app.key(event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.tab, 2);
+        assert_eq!(app.scope.as_deref(), Some("fabric-loader-1.20.1"));
+        app.key(event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!((app.tab, app.selection), (7, 1));
+        app.selection = 2;
+        app.key(event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.tab, 3);
+        assert_eq!(app.mod_instance.as_deref(), Some("fabric-loader-1.20.1"));
+        app.key(event::KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!((app.tab, app.selection), (7, 2));
+        app.selection = 9;
+        app.key(event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.editor_instance.as_deref(), Some("fabric-loader-1.20.1"));
+        app.key(event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.tab, 7);
+        app.key(event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.tab, 0);
+        assert_eq!(app.query, "fabric");
+        assert_eq!(app.selected().as_deref(), Some("fabric-loader-1.20.1"));
+        assert!(app.task.is_none());
+        app.key(event::KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
+        assert_eq!(app.tab, 1);
+        assert!(app.query.is_empty());
+        app.query = "1.21".into();
+        app.key(event::KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+        assert_eq!(app.query, "fabric");
+        app.key(event::KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
+        assert_eq!(app.query, "1.21");
+    }
+    #[test]
+    fn primary_navigation_hides_tools_and_preserves_current_instance() {
+        let mut app = app();
+        app.selection = 1;
+        app.key(event::KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+        assert_eq!(app.tab, 4);
+        app.key(event::KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+        assert_eq!(app.tab, 7);
+        assert_eq!(
+            app.managed_instance.as_deref(),
+            Some("fabric-loader-1.20.1")
+        );
+        app.selection = 4;
+        app.key(event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.tab, 9);
+        app.key(event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!((app.tab, app.selection), (7, 4));
+        app.key(event::KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE));
+        assert_eq!(app.tab, 8);
+        app.selection = 3;
+        app.key(event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.tab, 6);
+        app.key(event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!((app.tab, app.selection), (8, 3));
+        app.selection = 0;
+        app.key(event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.tab, 2);
+        assert!(app.scope.is_none());
+        assert_eq!(app.primary_index(), 4);
+    }
+    #[test]
+    fn missing_instance_management_returns_to_list_without_starting_a_task() {
+        let mut app = app();
+        app.managed_instance = Some("removed".into());
+        app.tab = 7;
+        app.key(event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.tab, 0);
+        assert!(app.task.is_none());
     }
     #[test]
     fn loader_list_handoff_does_not_require_dismissing_a_result() {
@@ -2420,13 +2883,11 @@ mod tests {
         app.key(event::KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(app.log_scroll, 0);
         app.key(event::KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
-        assert_eq!(app.tab, 5);
+        assert_eq!(app.tab, 6);
+        assert!(app.nav_focused);
         app.key(event::KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
         assert_eq!(app.tab, 6);
-        app.key(event::KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
-        assert_eq!(app.tab, 0);
-        app.key(event::KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
-        assert_eq!(app.tab, 6);
+        assert!(!app.nav_focused);
         app.logs.clear();
         app.key(event::KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(app.log_scroll, 0);
@@ -2463,6 +2924,7 @@ mod tests {
     fn app() -> App {
         let (tx, rx) = mpsc::channel();
         let mut app = App::new(Config::default(), tx, rx);
+        app.nav_focused = false;
         app.local = vec!["1.21.1".into(), "fabric-loader-1.20.1".into()];
         app
     }
@@ -2471,13 +2933,16 @@ mod tests {
         let mut app = app();
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
         for (tab, title) in [
-            "本地游戏",
+            "实例列表",
             "官方版本",
             "启动设置",
             "Mod管理",
             "账户管理",
             "实例回收站",
             "任务日志",
+            "实例管理",
+            "设置",
+            "加载器/组件",
         ]
         .iter()
         .enumerate()
