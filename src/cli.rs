@@ -258,7 +258,7 @@ pub fn run(config: Config, raw: Vec<String>) -> Result<()> {
             for runtime in &found {
                 println!(
                     "Java {} · {} · {}",
-                    runtime.major,
+                    runtime.major(),
                     runtime.path.display(),
                     runtime.description
                 );
@@ -551,7 +551,11 @@ pub fn run(config: Config, raw: Vec<String>) -> Result<()> {
                 } else {
                     backend.install_java_for_version(&config, &args[1])?
                 };
-                println!("Java {} 已安装：{}", runtime.major, runtime.path.display());
+                println!(
+                    "Java {} 已安装：{}",
+                    runtime.major(),
+                    runtime.path.display()
+                );
             }
             "fabric" | "quilt" => {
                 if !(2..=3).contains(&args.len()) {

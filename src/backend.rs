@@ -266,10 +266,10 @@ impl Backend {
             runtime.description,
             runtime.path.display()
         ));
-        if runtime.major != required {
+        if runtime.major() != required {
             self.log(format!(
                 "未使用建议的 Java {required}，当前为 Java {}；若兼容性异常请安装建议版本",
-                runtime.major
+                runtime.major()
             ));
         }
         let native_base = version_dir.join("tui-mc-natives").join(format!(
@@ -435,7 +435,7 @@ impl Backend {
         let builtin_versions = crate::fabric_check::builtins(
             meta,
             resolved.chain.first().context("版本链为空")?,
-            Some(runtime.major),
+            Some(runtime.major()),
         );
         if builtin_versions.contains_key("fabricloader") {
             crate::fabric_check::audit(
@@ -539,32 +539,20 @@ pub fn installed(config: &Config) -> Vec<String> {
     versions.reverse();
     versions
 }
-pub fn java_info(java: &str) -> Result<(u64, String)> {
+pub fn java_info(java: &str) -> Result<(crate::java_version::JavaVersion, String)> {
     let output = Command::new(java)
         .arg("-version")
         .output()
         .context("找不到 Java，请在设置中指定 java 可执行文件")?;
     let info = format!(
-        "{}{}",
+        "{}\n{}",
         String::from_utf8_lossy(&output.stderr),
         String::from_utf8_lossy(&output.stdout)
     );
     if !output.status.success() {
         bail!("Java 检测失败：{info}");
     }
-    let re = regex::Regex::new(r#"(?:version\s+\"|openjdk\s+)(\d+)(?:\.(\d+))?"#)?;
-    let captures = re.captures(&info).context("无法识别 Java 版本")?;
-    let first: u64 = captures[1].parse()?;
-    let major = if first == 1 {
-        captures
-            .get(2)
-            .context("Java 版本不完整")?
-            .as_str()
-            .parse()?
-    } else {
-        first
-    };
-    Ok((major, info.lines().next().unwrap_or("Java").to_owned()))
+    crate::java_version::JavaVersion::from_output(&info)
 }
 pub fn offline_uuid(name: &str) -> String {
     let mut bytes: [u8; 16] = Md5::digest(format!("OfflinePlayer:{name}").as_bytes()).into();

@@ -40,9 +40,6 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Local tests
         run: cargo test --locked
-      - name: Check Unix launcher script
-        if: runner.os != 'Windows'
-        run: sh -n run.sh
       - name: Build
         if: runner.os != 'macOS'
         run: cargo build --locked --release

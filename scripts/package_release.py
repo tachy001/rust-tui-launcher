@@ -53,9 +53,7 @@ def main():
             stage = Path(temp) / stem
             stage.mkdir()
             shutil.copy2(executable, stage / binary)
-            shutil.copy2(root / "run.sh", stage / "run.sh")
             (stage / binary).chmod(0o755)
-            (stage / "run.sh").chmod(0o755)
             with tarfile.open(output, "w:gz") as archive:
                 archive.add(stage, arcname=stem)
     with output.open("rb") as archive_file:

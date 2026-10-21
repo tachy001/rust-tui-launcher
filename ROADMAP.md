@@ -1,6 +1,14 @@
 # 基本功能还原与验收
 
+按用户要求移除脚本启动入口；三端直接运行可执行程序。同步清理 CI 的启动脚本检查、打包依赖和使用说明，Unix 包内只保留可执行文件，Windows 继续提供独立 EXE。以临时文件验证 Windows / Unix 打包内容，没有重新构建或发布 Release。
+
 ## 后续开发方向：后端服务对象
+
+继续对照 PCL GetJavaRequirement，将 Fabric Loader 0.17.0 之前版本的 Java 25 不兼容规则接入 JavaRequirement。实际 KnotClient 主类和当前平台启用的 Loader 库决定上限，重命名不影响判断；较新或未知限定符版本不盲目限制。手动选择、安装和下载失败回退均遵守上限，元数据上下限冲突提前失败；旧 LaunchWrapper 同时修复对平台规则的忽略，双重失败保留完整上下文。11 项服务检查与 Clippy 通过，无前端、网络、JVM / 游戏改动。旧 Fabric 真实运行及其他加载器更新号范围仍待验收 / 完善。
+
+对照 HMCL CompatibilityRule / OSRestriction / Architecture 和 PCL McJsonRuleCheck，新增 PlatformRuleEvaluator / OsVersionSource，现有库与参数规则入口共用。修复架构规则按普通字符串比较导致正则 / 别名失配，以及每条版本规则重复运行系统查询的问题；系统版本按需查询并缓存，查询失败不再以空字符串匹配任意版本。保留版本前缀匹配、空列表允许及功能默认值语义，补充平台别名、规则 action 和格式处理。11 项相关本地检查及 Clippy 通过，前端未改，测试不执行系统版本探测、JVM 或游戏。Java 跨架构依赖选择及真实系统探测 / 三端运行仍未验收；具体源码差异记录于 docs/SOURCE-REFERENCES.md。
+
+继续对照 HMCL JavaManager.chooseJava 与 PCL GetJavaRequirement / SelectOrDownloadJava，新增 JavaVersion 并接入探测、发现、手动选择和下载后验证。保留 Java 8 更新号与现代完整版本、预览和构建号；JavaRuntime 不再重复保存独立主版本。同主版本优先正式版和较新更新，避免由扫描顺序选中较旧运行时；版本头识别跳过环境警告。14 项相关本地检查与 Clippy 通过，无网络、JVM / 游戏启动；前端仅调整主版本读取接口。具体加载器更新号边界、厂商差异、架构及真实平台验收仍未完成。
 
 对照 HMCL decompressNatives 和 PCL McLaunchNatives，新增 NativeDirectory 并接入实际启动。由复用目录覆盖改为单次启动私有 run-* 目录，解决组件切换后旧 native 残留参与加载及半成品复用；解压失败对象不能再提供路径，暂停 / 取消检查覆盖逐项及分块读取。保留 Windows / Linux / macOS 文件类型与排除规则，拒绝越界和 ZIP 符号链接。5 项本地 ZIP 检查与 Clippy 通过，无网络、JVM、游戏或前端改动。会话结束后只清理已核验归属的私有目录；强制终止后的残留回收和各平台真实 native 加载仍未验收。
 
@@ -86,7 +94,7 @@ Fabric 包内范围已接入候选回溯：新增 ModPlanValidator / FabricPlanV
 | 账户 | 多离线账户、设备代码登录、Xbox / Minecraft 授权、到期刷新、系统凭证存储 | 协议分支与索引无令牌测试；没有应用 ID / 测试账户，真实登录和安全存储往返未验证 |
 | Mod / 整合包 | JAR 导入启停、Modrinth 索引与环境过滤、校验、隔离、覆盖文件、失败继续 | Mod 启停与路径保护测试；完整整合包网络导入尚未验证；不支持 CurseForge 格式 |
 | 游戏日志 / 进程 | 实时输出、XML 控制台格式清理、历史日志、取消确认、子进程回收 | UTF-8 分段读取测试；原版与 Fabric 实际初始化图形 / 声音 / GUI 纹理，Ctrl+C 后进程退出 |
-| 保存 / 发布 | 原子配置和文件替换、CLI、现有可执行文件优先启动脚本 | Windows 文件替换测试；最终本地检查与发布构建结果见后续记录 |
+| 保存 / 发布 | 原子配置和文件替换、CLI、直接运行可执行文件 | Windows 文件替换测试；最终本地检查与发布构建结果见后续记录 |
 
 真实启动暴露的 Windows `\\?\` 路径造成 Java 21 主类查找失败问题已修复，并加入普通磁盘与 UNC / 中文路径回归测试。
 

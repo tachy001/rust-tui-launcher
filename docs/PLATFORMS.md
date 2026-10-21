@@ -5,14 +5,12 @@
 在可写目录解压与机器架构一致的构建包，用终端运行：
 
 ```sh
-sh run.sh
+./tui-launcher
 ```
 
-脚本优先运行随包提供的 `tui-launcher`，源码目录下则优先运行
-`target/release/tui-launcher`；找不到程序才使用 Cargo 构建。
-脚本将工作目录固定为自身目录，配置 `launcher.json` 和默认 `.minecraft`
-保存在这里。传入的相对路径也以这里为基准；导入其他目录的文件建议使用绝对路径。
-可直接运行 `./tui-launcher`，但这时配置位置由当前工作目录决定。
+配置 `launcher.json`、默认 `.minecraft` 和传入的相对路径均以当前工作目录为基准。
+希望数据保存在程序旁时，先进入解压后的程序目录；导入其他目录的文件可使用绝对路径。
+构建包保留执行权限；手动复制导致权限丢失时可执行 `chmod +x tui-launcher`。
 终端需支持 UTF-8，界面至少 48 × 16。
 
 ## 从源码构建
@@ -24,7 +22,7 @@ Debian / Ubuntu 的构建依赖为：
 ```sh
 sudo apt-get install build-essential pkg-config libdbus-1-dev
 cargo build --locked --release
-sh run.sh
+./target/release/tui-launcher
 ```
 
 Fedora 对应 `gcc`、`pkgconf-pkg-config`、`dbus-devel`；

@@ -47,7 +47,7 @@ python scripts/package_release.py --platform windows-x64
 `项目名-v版本-平台.exe`（Windows）或 `.tar.gz`（Unix）。
 每个包都有同名 `.sha256` 校验文件，仅用于本地校验，
 不作为 Release 附件上传。
-Windows 直接提供独立 EXE；Unix 包内仅包含可执行文件和 `run.sh`；
+Windows 直接提供独立 EXE；Unix 包内仅包含可执行文件，解压后运行 `./tui-launcher`；
 不会打包配置、账号、游戏资源或工具链。压缩包使用独立顶层目录。
 
 ## 发布草稿

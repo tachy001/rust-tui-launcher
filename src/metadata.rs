@@ -71,78 +71,7 @@ pub fn allowed_with_features(
     item: &Value,
     features: &std::collections::HashMap<&str, bool>,
 ) -> bool {
-    let Some(rules) = item.get("rules").and_then(Value::as_array) else {
-        return true;
-    };
-    if rules.is_empty() {
-        return true;
-    }
-    let mut allow = false;
-    for rule in rules {
-        if let Some(os) = rule.get("os") {
-            if os
-                .get("name")
-                .and_then(Value::as_str)
-                .is_some_and(|n| n != os_name())
-            {
-                continue;
-            }
-            if let Some(arch) = os.get("arch").and_then(Value::as_str) {
-                let current = match std::env::consts::ARCH {
-                    "x86_64" => "amd64",
-                    "x86" => "x86",
-                    a => a,
-                };
-                if arch != current {
-                    continue;
-                }
-            }
-            // Version-specific native rules require the host's actual OS version.
-            if let Some(pattern) = os.get("version").and_then(Value::as_str) {
-                let version = host_version();
-                if !regex::Regex::new(pattern).is_ok_and(|r| r.is_match(&version)) {
-                    continue;
-                }
-            }
-        }
-        if rule
-            .get("features")
-            .and_then(Value::as_object)
-            .is_some_and(|required| {
-                required.iter().any(|(name, expected)| {
-                    expected.as_bool()
-                        != Some(features.get(name.as_str()).copied().unwrap_or(false))
-                })
-            })
-        {
-            continue;
-        }
-        allow = rule["action"] == "allow";
-    }
-    allow
-}
-fn host_version() -> String {
-    let output = if cfg!(windows) {
-        std::process::Command::new("cmd")
-            .args(["/C", "ver"])
-            .output()
-    } else if cfg!(target_os = "macos") {
-        std::process::Command::new("sw_vers")
-            .arg("-productVersion")
-            .output()
-    } else {
-        std::process::Command::new("uname").arg("-r").output()
-    };
-    output
-        .map(|o| {
-            let text = String::from_utf8_lossy(&o.stdout).into_owned();
-            regex::Regex::new(r"\d+\.\d+(?:\.\d+)*")
-                .unwrap()
-                .find(&text)
-                .map(|m| m.as_str().to_owned())
-                .unwrap_or(text)
-        })
-        .unwrap_or_default()
+    crate::platform_rule_service::PlatformRuleEvaluator::current().allowed(item, features)
 }
 pub fn arguments(value: &Value) -> Vec<String> {
     arguments_with_features(value, &std::collections::HashMap::new())

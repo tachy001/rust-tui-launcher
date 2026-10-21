@@ -1515,7 +1515,7 @@ impl App {
                         let runtime = b.install_java_for_version(&config, &id)?;
                         Ok(format!(
                             "Java {} 已就绪：{}",
-                            runtime.major,
+                            runtime.major(),
                             runtime.path.display()
                         ))
                     });
@@ -1661,7 +1661,7 @@ impl App {
                     for runtime in &found {
                         b.log(format!(
                             "Java {} · {}",
-                            runtime.major,
+                            runtime.major(),
                             runtime.path.display()
                         ));
                     }

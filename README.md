@@ -21,17 +21,18 @@ Rust 编写的 Minecraft Java 版终端启动器，使用 Ratatui + Crossterm。
 
 ## 启动
 
-macOS / Linux 已提供 `sh run.sh` 入口及分平台构建配置，支持源码构建；
-Java 探测、macOS 图形启动参数和本地库目录已作兼容处理。
+Windows 直接运行下载的 EXE；macOS / Linux 解压后在终端进入程序所在目录，运行 `./tui-launcher`。
+Java 探测、macOS 图形启动参数和本地库目录已作兼容处理，支持分平台源码构建。
 安装依赖、ARM64 限制与验证范围见 [跨平台说明](docs/PLATFORMS.md)。
 
-已构建的 Windows 程序：`target/release/tui-launcher.exe`。也可在 PowerShell 中运行：
+从源码构建后的 Windows 程序可在项目目录直接运行：
 
 ```powershell
-.\run.ps1
+.\target\release\tui-launcher.exe
 ```
 
-脚本优先运行已有发布版，不反复编译。修改源码后自行执行 `cargo build --release`；没有发布版时脚本才尝试构建。
+修改源码后执行 `cargo build --release`；macOS / Linux 构建后运行 `./target/release/tui-launcher`。
+配置和相对路径以当前工作目录为基准；希望数据与程序放在一起时，先进入程序所在目录。
 
 从源码启动需要稳定版 Rust、平台 C 链接器；Linux 的安全凭证后端还需要 D-Bus 开发库：
 
@@ -58,7 +59,6 @@ docs/                使用、平台、发布和验收文档
 .github/workflows/   Windows / macOS / Linux 构建及 Release 草稿流程
 Cargo.toml           项目信息与依赖
 Cargo.lock           固定依赖版本，需提交 Git
-run.ps1 / run.sh     Windows / Unix 启动入口
 ```
 
 `target/`、`.tools/`、`.tui-mc/`、游戏目录和本机配置不进入仓库或发布包。

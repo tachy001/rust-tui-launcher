@@ -13,7 +13,17 @@
 
 8 项本地运行时策略检查通过，覆盖既有取消 / 回退策略和新增上下限处理，没有启动 Java 或游戏。真实历史 Forge 实例尚未验收。
 
-尚未统一的规则：两份快照对于部分历史 Forge 的 Java 上限、补丁级别和建议 / 强制程度不同。本项目当前只保留主版本信息，不能声称已实现 Java 8u320 / 8u321 等更新号边界。后续须先扩充运行时版本模型，再按具体加载器版本逐项核对；不能把所有旧 Forge 简化成同一个最高版本。
+尚未统一的规则：两份快照对于部分历史 Forge 的 Java 上限、补丁级别和建议 / 强制程度不同。已新增完整版本模型，但 JavaRequirement 尚未实现 Java 8u320 / 8u321 等加载器更新号边界；仍需按具体加载器版本逐项核对，不能把所有旧 Forge 简化成同一个最高版本。
+
+进一步阅读 [HMCL JavaManager.java](https://github.com/HMCL-dev/HMCL/blob/main/HMCL/src/main/java/org/jackhuang/hmcl/java/JavaManager.java) 的 `chooseJava`：优先接近游戏建议的主版本，同一主版本比较完整版本。对照 PCL `GetJavaRequirement` / `SelectOrDownloadJava` 可见完整版本还参与范围判断，单纯保留主版本不足以实现这些兼容规则。
+
+本项目新增 `JavaVersion`，解析 Java 8 的 `1.8.0_321-b07` / `8u451` 与新版点分、`+build`、LTS 和预览格式；规范化数字部分以便比较，同时保留原版本文本。JavaRuntime 组合该对象，主版本由对象派生，避免主版本和完整版本分别保存后不一致。同主版本优先正式版，再按数字更新号和构建号选择较新候选；手动路径选择策略不变。探测输出按实际 Java / OpenJDK 版本头识别，跳过 JAVA_TOOL_OPTIONS 等警告，而非把输出第一行当作版本说明。
+
+14 项相关本地检查通过，包括原有运行时策略检查，没有执行 JVM。此模型不把不同厂商的更新号强行映射为同一种补丁级别；完整加载器版本范围、架构检测和真实厂商输出适配仍需继续核验。
+
+继续采用 PCL `GetJavaRequirement` 的已知 Fabric 规则：Loader 0.17.0 之前的 Mixin / ASM 不兼容 Java 25。本项目将该上限接入现有 `JavaRequirement`，根据 KnotClient 启动主类与当前平台启用的 `net.fabricmc:fabric-loader` 纯数字版本判断，而非实例 ID。旧版限制最高 Java 24；0.17.0+ 不套用此规则，未知限定符版本不猜测。元数据最低版本超过上限时报冲突，避免无效下载；手动 Java、安装结果及失败回退均不能绕过已知上限。
+
+同时修正旧 LaunchWrapper 识别对平台规则的忽略：已禁用或不属于当前平台的库不施加兼容上限。本地选择和安装都失败时保留两份错误上下文，避免仅显示下载失败而丢失不兼容原因。11 项相关服务检查通过，无网络、JVM 或游戏执行；本项尚无旧 Fabric + Java 25 的真实游戏运行证据，其他 Forge 更新号规则保持未完成。
 
 本次读取文件的 SHA-256：
 
@@ -55,6 +65,22 @@
 新增 `NativeDirectory`，每次启动在平台 native 目录下创建独立的 `run-*` 子目录；提取完成后才传给后续启动参数。目录由当前启动会话持有，游戏进程先退出 / 回收，再释放目录。解压失败后该对象不可再提供可用路径；失败、取消及正常结束均尝试清理自己创建的目录，不操作其他运行会话或旧缓存。
 
 规则保留所有平台的文件类型，不采用 PCL 仅提取 Windows DLL 的分支；继续处理 META-INF 与 metadata exclude，统一 ZIP 路径分隔符，拒绝越界路径及符号链接。逐文件和每 64 KiB 读取检查取消 / 暂停。5 项真实本地 ZIP 检查通过，覆盖 DLL / SO / dylib、排除规则、部分解压失败、并行目录隔离、取消、坏 ZIP 和符号链接条目；未运行 Java / 游戏。OS 强制终止、目录清理失败和各平台实际 DLL / SO 加载仍需验收，清理为尽力执行，不宣称崩溃后自动回收全部旧目录。
+
+## 平台兼容规则
+
+阅读 [HMCL CompatibilityRule.java](https://github.com/HMCL-dev/HMCL/blob/main/HMCLCore/src/main/java/org/jackhuang/hmcl/game/CompatibilityRule.java)、[OSRestriction.java](https://github.com/HMCL-dev/HMCL/blob/main/HMCLCore/src/main/java/org/jackhuang/hmcl/game/OSRestriction.java)、`Architecture.java`，以及 PCL `ModMinecraft.McJsonRuleCheck`。对照后保留按顺序应用最后一条匹配规则的行为，并新增 `PlatformRuleEvaluator` / `OsVersionSource`，通过注入 OS、架构和版本提供者本地检查不同平台。
+
+修复原先把 `os.arch` 当作普通字符串比较的问题：支持完整正则匹配及 x86_64 / amd64 / x64、aarch64 / arm64 等别名；x86 不会误匹配 x86_64。支持常用平台名称别名及明确的 OS-架构组合。系统版本由生产提供者按需查询并缓存一次，失败也缓存为不可用；不可用版本不能用空字符串匹配 `.*`。
+
+采用范围与差异：
+
+- 空规则沿用 HMCL 和现有实现的默认允许行为；不采用 PCL 空列表默认禁止的差异。
+- 架构正则按完整值匹配。版本正则保留现有 / PCL 的前缀与搜索匹配，避免将 `^10\.` 这类规则改成完整匹配后失效；不直接套用 HMCL 对版本的 `.matches()`。
+- 不采用 PCL Windows 专用的非 Windows / ARM 排除逻辑。未知名称只有显式 `unknown` 视为无名称限制，其他不识别名称不猜测；附带架构 / 版本条件仍需满足。
+- 未识别 action 不改变上一匹配结果；规则容器格式无效时不默认放行。空的可选 OS / features 按未设置处理，功能缺省 false 保持本项目原语义。
+- Rust regex 不支持的 Java 正则扩展不会猜测执行，该条件不匹配；架构仍以启动器进程为准，尚未实现跨架构 Java 的完整 native 重选。
+
+11 项相关本地检查通过，涵盖三端平台条件、架构正则 / 别名、版本不可用、规则顺序、功能标签及现有参数生成；测试使用替代版本提供者，不运行系统探测命令、Java 或游戏。实际系统版本探测及三端游戏运行验收仍单独保留。
 
 ## 后续对照方式
 

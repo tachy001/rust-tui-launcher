@@ -1,13 +1,38 @@
 use crate::{backend::Backend, config::Config, java::JavaRuntime};
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
 /// A recommended major version can also have mandatory loader compatibility limits.
 pub struct JavaRequirement {
     recommended: u64,
-    maximum: Option<u64>,
+    maximum: Option<JavaCeiling>,
+}
+struct JavaCeiling {
+    major: u64,
+    component: &'static str,
 }
 impl JavaRequirement {
+    fn library_version(library: &Value, group: &str, artifact: &str) -> Option<Vec<u64>> {
+        if !crate::metadata::allowed(library) {
+            return None;
+        }
+        let name = library["name"].as_str()?;
+        let parts: Vec<_> = name.split(':').collect();
+        if parts.len() != 3
+            || parts[0] != group
+            || parts[1] != artifact
+            || !parts[2]
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || byte == b'.')
+        {
+            return None;
+        }
+        parts[2]
+            .split('.')
+            .map(str::parse::<u64>)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .ok()
+    }
     pub fn from_metadata(meta: &Value) -> Result<Self> {
         let recommended = match meta.pointer("/javaVersion/majorVersion") {
             None => 8,
@@ -21,20 +46,8 @@ impl JavaRequirement {
         let legacy_wrapper = meta["mainClass"] == "net.minecraft.launchwrapper.Launch"
             && meta["libraries"].as_array().is_some_and(|libraries| {
                 libraries.iter().any(|library| {
-                    let Some(name) = library["name"].as_str() else {
-                        return false;
-                    };
-                    let parts: Vec<_> = name.split(':').collect();
-                    if parts.len() != 3
-                        || parts[0] != "net.minecraft"
-                        || parts[1] != "launchwrapper"
-                    {
-                        return false;
-                    }
-                    let Ok(version) = parts[2]
-                        .split('.')
-                        .map(str::parse::<u64>)
-                        .collect::<std::result::Result<Vec<_>, _>>()
+                    let Some(version) =
+                        Self::library_version(library, "net.minecraft", "launchwrapper")
                     else {
                         return false;
                     };
@@ -43,30 +56,67 @@ impl JavaRequirement {
                     })
                 })
             });
-        if legacy_wrapper && recommended > 8 {
-            bail!("版本 Java 要求冲突：元数据要求 Java {recommended}，旧 LaunchWrapper 需要 Java 8 或更早版本");
+        // PCL GetJavaRequirement: Fabric Loader before 0.17.0 ships Mixin/ASM
+        // that cannot handle Java 25. An inert library must not limit vanilla.
+        let old_fabric = matches!(
+            meta["mainClass"].as_str(),
+            Some(
+                "net.fabricmc.loader.impl.launch.knot.KnotClient"
+                    | "net.fabricmc.loader.launch.knot.KnotClient"
+            )
+        ) && meta["libraries"].as_array().is_some_and(|libraries| {
+            libraries.iter().any(|library| {
+                Self::library_version(library, "net.fabricmc", "fabric-loader").is_some_and(
+                    |version| {
+                        version.first() == Some(&0) && version.get(1).copied().unwrap_or(0) < 17
+                    },
+                )
+            })
+        });
+        let maximum = if legacy_wrapper {
+            Some(JavaCeiling {
+                major: 8,
+                component: "旧 LaunchWrapper",
+            })
+        } else if old_fabric {
+            Some(JavaCeiling {
+                major: 24,
+                component: "Fabric Loader 0.17.0 之前的版本",
+            })
+        } else {
+            None
+        };
+        if let Some(maximum) = &maximum {
+            if recommended > maximum.major {
+                bail!("版本 Java 要求冲突：元数据要求 Java {recommended}，{} 最高支持 Java {}；请升级加载器或修正实例配置", maximum.component, maximum.major);
+            }
         }
         Ok(Self {
             recommended,
-            maximum: legacy_wrapper.then_some(8),
+            maximum,
         })
     }
     pub fn recommended(&self) -> u64 {
         self.recommended
     }
     fn check(&self, runtime: JavaRuntime) -> Result<JavaRuntime> {
-        if runtime.major < self.recommended {
+        if runtime.major() < self.recommended {
             bail!(
                 "需要 Java {}，当前 Java {}",
                 self.recommended,
-                runtime.major
+                runtime.major()
             );
         }
-        if self.maximum.is_some_and(|maximum| runtime.major > maximum) {
-            bail!(
-                "旧 LaunchWrapper 不兼容 Java {}，请为此实例使用 Java 8",
-                runtime.major
-            );
+        if let Some(maximum) = &self.maximum {
+            if runtime.major() > maximum.major {
+                bail!(
+                    "{} 不兼容 Java {}，最高支持 Java {}；建议为此实例使用 Java {}",
+                    maximum.component,
+                    runtime.major(),
+                    maximum.major,
+                    self.recommended
+                );
+            }
         }
         Ok(runtime)
     }
@@ -137,7 +187,7 @@ impl<'a> JavaRuntimeService<'a> {
         if config.java != "auto"
             || selected
                 .as_ref()
-                .is_ok_and(|runtime| runtime.major == required)
+                .is_ok_and(|runtime| runtime.major() == required)
         {
             return Ok(RuntimeResolution {
                 runtime: selected?,
@@ -148,10 +198,10 @@ impl<'a> JavaRuntimeService<'a> {
             .source
             .install(config, instance, required)
             .and_then(|runtime| {
-                if runtime.major != required {
+                if runtime.major() != required {
                     bail!(
                         "下载后的 Java 版本不符：预期 {required}，实际 {}",
-                        runtime.major
+                        runtime.major()
                     );
                 }
                 requirement.check(runtime)
@@ -166,14 +216,14 @@ impl<'a> JavaRuntimeService<'a> {
                 Ok(runtime) => {
                     let warning = format!(
                         "安装建议 Java 失败，将尝试本机 Java {}：{error:#}",
-                        runtime.major
+                        runtime.major()
                     );
                     Ok(RuntimeResolution {
                         runtime,
                         warning: Some(warning),
                     })
                 }
-                Err(_) => Err(error),
+                Err(local_error) => Err(error).with_context(|| format!("本机没有满足要求的 Java（{local_error:#}），且安装建议 Java {required} 失败")),
             },
         }
     }
@@ -191,7 +241,7 @@ mod tests {
     fn runtime(major: u64) -> JavaRuntime {
         JavaRuntime {
             path: format!("java{major}").into(),
-            major,
+            version: crate::java_version::JavaVersion::parse(&major.to_string()).unwrap(),
             description: String::new(),
         }
     }
@@ -257,7 +307,7 @@ mod tests {
                 .resolve(&Config::default(), "game", JavaRequirement::minimum(21))
                 .unwrap()
                 .into_runtime()
-                .major,
+                .major(),
             21
         );
         let explicit = Config {
@@ -282,7 +332,7 @@ mod tests {
                 .resolve(&Config::default(), "game", JavaRequirement::minimum(21))
                 .unwrap()
                 .into_runtime()
-                .major,
+                .major(),
             21
         );
         let failing = Source {
@@ -293,7 +343,7 @@ mod tests {
             .resolve(&Config::default(), "game", JavaRequirement::minimum(21))
             .unwrap();
         assert!(resolution.warning().unwrap().contains("下载失败"));
-        assert_eq!(resolution.into_runtime().major, 25);
+        assert_eq!(resolution.into_runtime().major(), 25);
     }
     #[test]
     fn cannot_fallback_to_too_old_java_or_accept_wrong_installed_version() {
@@ -307,7 +357,7 @@ mod tests {
                 .resolve(&Config::default(), "game", JavaRequirement::minimum(21))
                 .err()
                 .unwrap();
-            assert!(error.to_string().contains("预期 21"));
+            assert!(format!("{error:#}").contains("预期 21"));
             assert_eq!(source.calls.get(), 1);
         }
     }
@@ -367,7 +417,7 @@ mod tests {
                 )
                 .unwrap()
                 .into_runtime();
-            assert_eq!(runtime.major, 8);
+            assert_eq!(runtime.major(), 8);
             assert_eq!(source.calls.get(), usize::from(local != Some(8)));
         }
     }
@@ -401,5 +451,96 @@ mod tests {
                 .recommended(),
             8
         );
+    }
+    fn fabric(version: &str) -> Value {
+        serde_json::json!({"mainClass":"net.fabricmc.loader.impl.launch.knot.KnotClient", "javaVersion":{"majorVersion":21}, "libraries":[{"name":format!("net.fabricmc:fabric-loader:{version}")}]})
+    }
+    #[test]
+    fn old_fabric_rejects_java_25_in_explicit_and_failed_download_fallback_modes() {
+        let source = Source {
+            local: Some(25),
+            installed: None,
+            calls: Cell::new(0),
+        };
+        let service = JavaRuntimeService::new(&source);
+        let error = service
+            .resolve(
+                &Config::default(),
+                "renamed-fabric",
+                JavaRequirement::from_metadata(&fabric("0.16.14")).unwrap(),
+            )
+            .err()
+            .unwrap();
+        let message = format!("{error:#}");
+        assert!(message.contains("Fabric Loader 0.17.0 之前的版本 不兼容 Java 25"));
+        assert!(message.contains("下载失败"));
+        assert_eq!(source.calls.get(), 1);
+        let explicit = Config {
+            java: "custom-java".into(),
+            ..Default::default()
+        };
+        assert!(service
+            .resolve(
+                &explicit,
+                "renamed-fabric",
+                JavaRequirement::from_metadata(&fabric("0.16.14")).unwrap()
+            )
+            .is_err());
+        assert_eq!(source.calls.get(), 1);
+    }
+    #[test]
+    fn old_fabric_allows_compatible_fallback_and_recommended_installation() {
+        for installed in [None, Some(21)] {
+            let source = Source {
+                local: Some(24),
+                installed,
+                calls: Cell::new(0),
+            };
+            let resolution = JavaRuntimeService::new(&source)
+                .resolve(
+                    &Config::default(),
+                    "fabric",
+                    JavaRequirement::from_metadata(&fabric("0.16.14")).unwrap(),
+                )
+                .unwrap();
+            assert_eq!(resolution.warning().is_some(), installed.is_none());
+            assert_eq!(resolution.into_runtime().major(), installed.unwrap_or(24));
+        }
+    }
+    #[test]
+    fn fabric_limits_follow_active_library_and_launcher_not_the_instance_label() {
+        for (version, restricted) in [
+            ("0.16.14", true),
+            ("0.17.0", false),
+            ("0.18.0", false),
+            ("1.0.0", false),
+            ("0.17.0-beta", false),
+        ] {
+            assert_eq!(
+                JavaRequirement::from_metadata(&fabric(version))
+                    .unwrap()
+                    .check(runtime(25))
+                    .is_err(),
+                restricted
+            );
+        }
+        let mut inactive = fabric("0.16.14");
+        inactive["libraries"][0]["rules"] = serde_json::json!([{"action":"disallow"}]);
+        assert!(JavaRequirement::from_metadata(&inactive)
+            .unwrap()
+            .check(runtime(25))
+            .is_ok());
+        inactive["libraries"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("rules");
+        inactive["mainClass"] = "net.minecraft.client.main.Main".into();
+        assert!(JavaRequirement::from_metadata(&inactive)
+            .unwrap()
+            .check(runtime(25))
+            .is_ok());
+        let mut conflict = fabric("0.16.14");
+        conflict["javaVersion"]["majorVersion"] = 25.into();
+        assert!(JavaRequirement::from_metadata(&conflict).is_err());
     }
 }

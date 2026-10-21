@@ -2,6 +2,7 @@ use crate::{
     backend::{java_info, Backend},
     config::Config,
     download::Download,
+    java_version::JavaVersion,
     metadata::{safe_path, valid_id},
 };
 use anyhow::{bail, Context, Result};
@@ -14,8 +15,13 @@ use std::{
 #[derive(Clone, Debug)]
 pub struct JavaRuntime {
     pub path: PathBuf,
-    pub major: u64,
+    pub version: JavaVersion,
     pub description: String,
+}
+impl JavaRuntime {
+    pub fn major(&self) -> u64 {
+        self.version.major()
+    }
 }
 pub fn discover(config: &Config) -> Vec<JavaRuntime> {
     let mut paths = vec![PathBuf::from("java")];
@@ -86,15 +92,15 @@ pub fn discover(config: &Config) -> Vec<JavaRuntime> {
         if !seen.insert(key) {
             continue;
         }
-        if let Ok((major, description)) = java_info(&canonical.to_string_lossy()) {
+        if let Ok((version, description)) = java_info(&canonical.to_string_lossy()) {
             found.push(JavaRuntime {
                 path: canonical,
-                major,
+                version,
                 description,
             });
         }
     }
-    found.sort_by_key(|runtime| runtime.major);
+    found.sort_by_key(JavaRuntime::major);
     found
 }
 fn scan(
@@ -139,7 +145,8 @@ fn executable() -> &'static str {
 }
 pub fn select(config: &Config, required: u64) -> Result<JavaRuntime> {
     if config.java != "auto" {
-        let (major, description) = java_info(&config.java)?;
+        let (version, description) = java_info(&config.java)?;
+        let major = version.major();
         if major < required {
             bail!("需要 Java {required}，当前 Java {major}；可将 Java 路径设为 auto 自动匹配");
         }
@@ -147,7 +154,7 @@ pub fn select(config: &Config, required: u64) -> Result<JavaRuntime> {
             path: crate::paths::for_java(
                 &fs::canonicalize(&config.java).unwrap_or_else(|_| PathBuf::from(&config.java)),
             ),
-            major,
+            version,
             description,
         });
     }
@@ -156,8 +163,14 @@ pub fn select(config: &Config, required: u64) -> Result<JavaRuntime> {
 fn choose(runtimes: Vec<JavaRuntime>, required: u64) -> Result<JavaRuntime> {
     runtimes
         .into_iter()
-        .filter(|j| j.major >= required)
-        .min_by_key(|j| j.major)
+        .filter(|j| j.major() >= required)
+        .min_by(|first, second| {
+            first
+                .major()
+                .cmp(&second.major())
+                .then_with(|| first.version.is_preview().cmp(&second.version.is_preview()))
+                .then_with(|| second.version.compare(&first.version))
+        })
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "未找到兼容的 Java {required}；请安装后重新检测，或指定 Java 可执行文件"
@@ -286,7 +299,8 @@ impl Backend {
         } else {
             root.join("jre.bundle/Contents/Home/bin").join(executable())
         };
-        let (major, description) = java_info(&path.to_string_lossy())?;
+        let (version, description) = java_info(&path.to_string_lossy())?;
+        let major = version.major();
         if major != required {
             bail!("下载后的 Java 版本不符：预期 {required}，实际 {major}");
         }
@@ -297,7 +311,7 @@ impl Backend {
         fs::remove_file(root.join(".installing"))?;
         Ok(JavaRuntime {
             path,
-            major,
+            version,
             description,
         })
     }
@@ -367,12 +381,34 @@ mod tests {
         let runtimes = [8, 26, 21, 17]
             .into_iter()
             .map(|major| JavaRuntime {
-                major,
+                version: JavaVersion::parse(&major.to_string()).unwrap(),
                 path: format!("java{major}").into(),
                 description: String::new(),
             })
             .collect();
-        assert_eq!(choose(runtimes, 21).unwrap().major, 21);
+        assert_eq!(choose(runtimes, 21).unwrap().major(), 21);
         assert!(choose(vec![], 21).is_err());
+    }
+    #[test]
+    fn chooses_newest_stable_update_within_the_closest_major_version() {
+        for (versions, required, expected) in [
+            (vec!["1.8.0_51", "1.8.0_451", "17.0.12"], 8, "1.8.0_451"),
+            (vec!["17.0.9", "17.0.10", "21.0.7"], 17, "17.0.10"),
+            (vec!["21.0.8-ea+7", "21.0.7+6", "25"], 21, "21.0.7+6"),
+            (vec!["17.0.12+7", "17.0.12+8"], 17, "17.0.12+8"),
+        ] {
+            let runtimes = versions
+                .into_iter()
+                .map(|text| JavaRuntime {
+                    path: format!("java-{text}").into(),
+                    version: JavaVersion::parse(text).unwrap(),
+                    description: String::new(),
+                })
+                .collect();
+            assert_eq!(
+                choose(runtimes, required).unwrap().version.to_string(),
+                expected
+            );
+        }
     }
 }
