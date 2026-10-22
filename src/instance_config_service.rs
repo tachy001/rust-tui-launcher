@@ -81,6 +81,9 @@ impl InstanceSettings {
         if let Some(server) = &self.server {
             config.server = server.clone();
         }
+        if let Some(language) = &self.game_language {
+            config.game_language = language.clone();
+        }
     }
 }
 

@@ -6,7 +6,6 @@ use crate::{
     logs::LogTail,
     metadata::valid_id,
     process_service::{ProcessMonitor, ProcessOutcome},
-    storage::atomic_write,
     version,
 };
 use anyhow::{bail, Context, Result};
@@ -125,27 +124,28 @@ impl Backend {
         })?;
         let id = installer_profile_id(&installer, game)?;
         let mut mutation = crate::instance_service::InstanceMutation::begin(&root, &id)?;
-        let launcher_profiles = root.join("launcher_profiles.json");
-        if !launcher_profiles.exists() {
-            atomic_write(
-                &launcher_profiles,
-                br#"{"profiles":{},"selectedProfile":""}"#,
-            )?;
-        }
         let resolved = mutation.resolve(game)?;
         let required = resolved.meta["javaVersion"]["majorVersion"]
             .as_u64()
             .unwrap_or(8);
         let effective = config.effective(game)?;
-        let runtime = match java::select(&effective, required) {
+        let runtime = match java::select(&effective, required, &self.control) {
             Ok(runtime) => runtime,
             Err(error) if effective.java == "auto" => {
+                self.control.check()?;
                 self.log(format!("正在准备安装器所需 Java：{error}"));
                 self.install_java_for_version(&effective, game)?
             }
             Err(error) => return Err(error),
         };
         self.control.check()?;
+        let shared_installation = crate::installation_service::LoaderInstallSession::acquire(
+            &root,
+            &self.control,
+            || {
+                self.log("等待另一个加载器安装任务释放游戏目录…");
+            },
+        )?;
         let log_path = cache.join(format!("{artifact}-{full}.log"));
         let output = fs::File::create(&log_path)?;
         let mut tail = LogTail::open(&log_path)?;
@@ -178,6 +178,7 @@ impl Backend {
             );
         }
         version::resolve(&root, &id).context("安装器没有生成完整版本信息")?;
+        drop(shared_installation);
         let _ = self.tx.send(crate::backend::Message::Pauseable(true));
         self.repair_with_session(config, &id, &mut mutation)?;
         self.log(format!("{} 实例已就绪：{id}", kind.name()));

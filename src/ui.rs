@@ -1,3 +1,4 @@
+use crate::localization::tr;
 use crate::{
     accounts::{AccountKind, Accounts},
     backend::{self, Backend, Message},
@@ -68,7 +69,7 @@ const SETTINGS_MENU: [&str; 6] = [
     "导入整合包",
     "CurseForge API 密钥",
 ];
-const SETTINGS: [&str; 15] = [
+const SETTINGS: [&str; 17] = [
     "离线用户名",
     "Java 路径（auto 自动匹配）",
     "最大内存 / MB",
@@ -84,6 +85,8 @@ const SETTINGS: [&str; 15] = [
     "整合包可选文件（true / false）",
     "全屏启动（true / false）",
     "直连服务器（留空进入菜单）",
+    "游戏语言（launcher 跟随 / zh_cn / en_us / keep 保持）",
+    "界面语言 / UI language（zh_cn / en_us）",
 ];
 #[derive(Clone, Copy, PartialEq)]
 enum WorkKind {
@@ -153,6 +156,7 @@ struct App {
     mod_instance: Option<String>,
     mod_list: Vec<ModEntry>,
     confirm_stop: bool,
+    language_picker: Option<usize>,
     log_scroll: usize,
     log_view_height: std::cell::Cell<usize>,
     log_horizontal: u16,
@@ -179,6 +183,7 @@ struct App {
 }
 impl App {
     fn new(config: Config, tx: Sender<Message>, rx: Receiver<Message>) -> Self {
+        crate::localization::set(&config.language);
         let local = backend::installed(&config);
         let selection = config
             .last_version
@@ -197,7 +202,7 @@ impl App {
             logs: VecDeque::new(),
             task: None,
             control: TaskControl::default(),
-            progress: ("空闲".into(), 0, 0),
+            progress: (tr("空闲").into(), 0, 0),
             paused: false,
             task_popup: false,
             task_handoff: false,
@@ -214,6 +219,7 @@ impl App {
             mod_instance,
             mod_list: vec![],
             confirm_stop: false,
+            language_picker: None,
             log_scroll: 0,
             log_view_height: std::cell::Cell::new(1),
             log_horizontal: 0,
@@ -311,7 +317,7 @@ impl App {
         task: impl FnOnce(Backend) -> Result<String> + Send + 'static,
     ) {
         if self.task.is_some() {
-            self.log("已有任务正在运行");
+            self.log(tr("已有任务正在运行"));
             return;
         }
         self.task = Some(kind);
@@ -321,12 +327,14 @@ impl App {
         self.pause_allowed = kind == WorkKind::Download;
         self.control = TaskControl::default();
         self.paused = false;
-        self.progress = ("准备中".into(), 0, 0);
+        self.progress = (tr("准备中").into(), 0, 0);
         self.transfer = None;
         let tx = self.tx.clone();
         let control = self.control.clone();
         let source = self.config.download_source.clone();
+        let language = self.config.language.clone();
         thread::spawn(move || {
+            crate::localization::set(&language);
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 Backend::new(tx.clone()).and_then(|mut b| {
                     b.control = control;
@@ -352,7 +360,7 @@ impl App {
         } else if self.tab == 5 {
             self.refresh_trash();
         } else {
-            self.log("本地版本已刷新");
+            self.log(tr("本地版本已刷新"));
         }
     }
     fn refresh_trash(&mut self) {
@@ -380,7 +388,7 @@ impl App {
             0 => {
                 if let Some(id) = self.selected() {
                     if self.task.is_some() {
-                        self.log("请等待当前任务完成");
+                        self.log(tr("请等待当前任务完成"));
                         return;
                     }
                     self.config.last_version = Some(id.clone());
@@ -402,18 +410,33 @@ impl App {
                 {
                     self.work(WorkKind::Download, move |b| {
                         b.install(&config, &remote)?;
-                        Ok(format!("{} 安装完成", remote.id))
+                        Ok(tformat!("{} 安装完成", remote.id))
                     });
                 }
             }
             2 => {
                 if self.task.is_none() {
-                    self.editor = Some(Editor {
-                        kind: EditKind::Setting,
-                        text: self.setting_value(self.setting),
-                    });
+                    if self.setting == 16 {
+                        if self.scope.is_some() {
+                            self.log(tr("此项为全局设置，按 G 切换到全局后修改"));
+                        } else {
+                            let language =
+                                crate::localization::UiLanguage::parse(&self.config.language).ok();
+                            self.language_picker = Some(
+                                crate::localization::UiLanguage::ALL
+                                    .iter()
+                                    .position(|value| Some(*value) == language)
+                                    .unwrap_or(0),
+                            );
+                        }
+                    } else {
+                        self.editor = Some(Editor {
+                            kind: EditKind::Setting,
+                            text: self.setting_value(self.setting),
+                        });
+                    }
                 } else {
-                    self.log("请等待任务完成再修改设置");
+                    self.log(tr("请等待任务完成再修改设置"));
                 }
             }
             3 if self.task.is_none() => {
@@ -444,7 +467,7 @@ impl App {
                 if let Some(entry) = self.trash.get(self.selection) {
                     let token = entry.token.clone();
                     let result = crate::instances::restore(&self.config, &token);
-                    self.report(result.map(|id| format!("已恢复实例：{id}")));
+                    self.report(result.map(|id| tformat!("已恢复实例：{id}", id = id)));
                     self.local = backend::installed(&self.config);
                     self.names = crate::instances::names(&self.config);
                     self.refresh_trash();
@@ -555,7 +578,7 @@ impl App {
             .clone()
             .filter(|id| self.local.contains(id))
         else {
-            self.log("请先在实例列表选择一个已安装实例");
+            self.log(tr("请先在实例列表选择一个已安装实例"));
             self.primary_page(2);
             return;
         };
@@ -618,10 +641,10 @@ impl App {
                     result,
                     updates: false,
                 });
-                Ok(format!("找到 {total} 个兼容项目"))
+                Ok(tformat!("找到 {total} 个兼容项目", total = total))
             });
         } else {
-            self.log("请先从实例列表进入实例管理 › Mod 管理");
+            self.log(tr("请先从实例列表进入实例管理 › Mod 管理"));
         }
     }
     fn install_online_mod(&mut self, project: String, version: Option<String>) {
@@ -645,7 +668,10 @@ impl App {
                         project,
                         versions,
                     });
-                    Ok(format!("{count} 个兼容版本，Enter 安装所选版本"))
+                    Ok(tformat!(
+                        "{count} 个兼容版本，Enter 安装所选版本",
+                        count = count
+                    ))
                 });
             }
         }
@@ -666,14 +692,17 @@ impl App {
                     },
                     updates: true,
                 });
-                Ok(format!("发现 {total} 个在线管理项目可更新，Enter 安装"))
+                Ok(tformat!(
+                    "发现 {total} 个在线管理项目可更新，Enter 安装",
+                    total = total
+                ))
             });
         }
     }
     fn report(&mut self, result: Result<String>) {
         match result {
             Ok(s) => self.log(s),
-            Err(e) => self.log(format!("错误 · {e:#}")),
+            Err(e) => self.log(tformat!("错误 · {e:#}", e = e)),
         }
     }
     fn install_loader(&mut self, loader: Loader) {
@@ -717,7 +746,7 @@ impl App {
                 let config = self.config.clone();
                 self.work(WorkKind::Download, move |b| {
                     b.repair(&config, &id)?;
-                    Ok(format!("{id} 已校验修复"))
+                    Ok(tformat!("{id} 已校验修复", id = id))
                 });
             }
         }
@@ -730,7 +759,7 @@ impl App {
             .unwrap_or_else(|| Ok(self.config.clone()))
         {
             Ok(config) => config,
-            Err(error) => return format!("配置读取失败：{error:#}"),
+            Err(error) => return tformat!("配置读取失败：{error:#}", error = error),
         };
         match index {
             0 => c.username,
@@ -747,7 +776,9 @@ impl App {
             11 => c.download_source,
             12 => c.optional_pack_files.to_string(),
             13 => c.fullscreen.to_string(),
-            _ => c.server,
+            14 => c.server,
+            15 => c.game_language,
+            _ => c.language,
         }
     }
     fn save_setting(&mut self, value: &str) -> Result<()> {
@@ -762,6 +793,7 @@ impl App {
                 6 => instance.game_args = Some(value.into()),
                 13 => instance.fullscreen = Some(parse_bool(value)?),
                 14 => instance.server = Some(value.trim().into()),
+                15 => instance.game_language = Some(value.trim().into()),
                 _ => bail!("此项为全局设置，按 G 切换到全局后修改"),
             }
             candidate.effective(id)?.validate()?;
@@ -781,13 +813,16 @@ impl App {
                 11 => candidate.download_source = value.trim().into(),
                 12 => candidate.optional_pack_files = parse_bool(value)?,
                 13 => candidate.fullscreen = parse_bool(value)?,
-                _ => candidate.server = value.trim().into(),
+                14 => candidate.server = value.trim().into(),
+                15 => candidate.game_language = value.trim().into(),
+                _ => candidate.language = value.trim().into(),
             }
         }
         candidate.save()?;
         self.config = candidate;
+        crate::localization::set(&self.config.language);
         self.local = backend::installed(&self.config);
-        self.log("设置已保存");
+        self.log(tr("设置已保存"));
         Ok(())
     }
     fn save_editor(&mut self) {
@@ -803,7 +838,7 @@ impl App {
                         let output = std::path::PathBuf::from(editor.text.trim().trim_matches('"'));
                         self.work(WorkKind::Other, move |b| {
                             b.backup_world(&config, &id, &world, &output)?;
-                            Ok(format!("存档已备份：{}", output.display()))
+                            Ok(tformat!("存档已备份：{}", output.display()))
                         });
                     }
                 }
@@ -828,7 +863,7 @@ impl App {
                     let name = editor.text.trim().to_owned();
                     self.work(WorkKind::Other, move |b| {
                         b.import_world(&config, &id, &input, &name)?;
-                        Ok(format!("存档已导入：{name}"))
+                        Ok(tformat!("存档已导入：{name}", name = name))
                     });
                 }
                 Ok(())
@@ -849,7 +884,7 @@ impl App {
                     let target = editor.text.clone();
                     self.work(WorkKind::Other, move |b| {
                         crate::instances::clone_instance(&config, &id, &target, &b.control)?;
-                        Ok(format!("实例已复制：{target}"))
+                        Ok(tformat!("实例已复制：{target}", target = target))
                     });
                     Ok(())
                 } else {
@@ -862,7 +897,7 @@ impl App {
                     let path = std::path::PathBuf::from(editor.text.trim_matches('"'));
                     self.work(WorkKind::Other, move |b| {
                         b.export_pack(&config, &id, &path)?;
-                        Ok(format!("导出完成：{}", path.display()))
+                        Ok(tformat!("导出完成：{}", path.display()))
                     });
                     Ok(())
                 } else {
@@ -881,7 +916,7 @@ impl App {
                 let path = std::path::PathBuf::from(editor.text.trim_matches('"'));
                 self.work(WorkKind::Download, move |b| {
                     let id = b.import_pack(&config, &path, None)?;
-                    Ok(format!("整合包已导入：{id}"))
+                    Ok(tformat!("整合包已导入：{id}", id = id))
                 });
                 Ok(())
             }
@@ -897,12 +932,12 @@ impl App {
             self.log(e.to_string());
             self.editor = Some(editor);
         } else if matches!(editor.kind, EditKind::CurseKey) {
-            self.log("CurseForge API 密钥已保存在系统安全存储");
+            self.log(tr("CurseForge API 密钥已保存在系统安全存储"));
         } else if matches!(editor.kind, EditKind::NameInstance) {
             self.names = crate::instances::names(&self.config);
-            self.log("显示名称已更新，实例 ID 与依赖关系保持稳定");
+            self.log(tr("显示名称已更新，实例 ID 与依赖关系保持稳定"));
         } else if matches!(editor.kind, EditKind::ImportMod) {
-            self.log("Mod 已导入");
+            self.log(tr("Mod 已导入"));
             self.refresh_mods();
         }
     }
@@ -977,11 +1012,11 @@ impl App {
                     let show_result = (self.task_popup && !self.task_handoff) || result.is_err();
                     if show_result {
                         let title = if self.control.cancelled() && result.is_err() {
-                            "任务已取消"
+                            tr("任务已取消")
                         } else if result.is_ok() {
-                            "任务已完成"
+                            tr("任务已完成")
                         } else {
-                            "任务失败"
+                            tr("任务失败")
                         };
                         let message = match &result {
                             Ok(message) | Err(message) => message.clone(),
@@ -1013,7 +1048,7 @@ impl App {
                     }
                     match result {
                         Ok(s) => self.log(s),
-                        Err(e) => self.log(format!("错误 · {e}")),
+                        Err(e) => self.log(tformat!("错误 · {e}", e = e)),
                     }
                 }
             }
@@ -1036,6 +1071,25 @@ impl App {
                 | KeyCode::Backspace
         );
         if key.kind == KeyEventKind::Release || (key.kind == KeyEventKind::Repeat && !repeatable) {
+            return false;
+        }
+        if let Some(selected) = self.language_picker {
+            let count = crate::localization::UiLanguage::ALL.len();
+            match key.code {
+                KeyCode::Up => self.language_picker = Some((selected + count - 1) % count),
+                KeyCode::Down => self.language_picker = Some((selected + 1) % count),
+                KeyCode::Home => self.language_picker = Some(0),
+                KeyCode::End => self.language_picker = Some(count - 1),
+                KeyCode::Esc => self.language_picker = None,
+                KeyCode::Enter => {
+                    let code = crate::localization::UiLanguage::ALL[selected].game_code();
+                    match self.save_setting(code) {
+                        Ok(()) => self.language_picker = None,
+                        Err(error) => self.log(format!("{error:#}")),
+                    }
+                }
+                _ => {}
+            }
             return false;
         }
         if self.task_result.is_some()
@@ -1107,7 +1161,7 @@ impl App {
                 KeyCode::Char('y') => {
                     let result = crate::instances::trash(&self.config, &id);
                     self.report(result.map(|entry| {
-                        format!("实例已移至回收站，可在设置 › 回收站恢复：{}", entry.label)
+                        tformat!("实例已移至回收站，可在设置 › 回收站恢复：{}", entry.label)
                     }));
                     self.confirm_remove = None;
                     self.local = backend::installed(&self.config);
@@ -1141,7 +1195,7 @@ impl App {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                     self.control.cancel();
                     self.confirm_stop = false;
-                    self.log("正在终止游戏…");
+                    self.log(tr("正在终止游戏…"));
                 }
                 KeyCode::Esc | KeyCode::Char('n') => self.confirm_stop = false,
                 _ => {}
@@ -1173,7 +1227,7 @@ impl App {
             } else {
                 self.control.cancel();
                 self.paused = false;
-                self.log("正在取消，等待当前操作结束…");
+                self.log(tr("正在取消，等待当前操作结束…"));
             }
             return false;
         }
@@ -1224,7 +1278,7 @@ impl App {
                             picker.worlds = worlds;
                             picker.selected = 0;
                         }
-                        Err(error) => self.log(format!("读取存档失败：{error}")),
+                        Err(error) => self.log(tformat!("读取存档失败：{error}", error = error)),
                     }
                 }
                 KeyCode::Char('c') if self.task.is_some() => self.control.cancel(),
@@ -1261,7 +1315,10 @@ impl App {
                             &picker.game,
                             requested.as_deref(),
                         )?;
-                        Ok(format!("安装完成：{instance}，请前往本地版本启动"))
+                        Ok(tformat!(
+                            "安装完成：{instance}，请前往本地版本启动",
+                            instance = instance
+                        ))
                     });
                 }
                 _ => (),
@@ -1312,7 +1369,7 @@ impl App {
                                 selected: 0,
                             })
                         }
-                        Err(error) => self.log(format!("读取存档失败：{error}")),
+                        Err(error) => self.log(tformat!("读取存档失败：{error}", error = error)),
                     }
                 }
             }
@@ -1330,14 +1387,14 @@ impl App {
                 if self.task.is_none() {
                     return true;
                 } else {
-                    self.log("任务正在运行；C 取消任务，游戏终止需再按 Y 确认");
+                    self.log(tr("任务正在运行；C 取消任务，游戏终止需再按 Y 确认"));
                 }
             }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if self.task.is_none() {
                     return true;
                 } else {
-                    self.log("请按 C 取消任务后退出");
+                    self.log(tr("请按 C 取消任务后退出"));
                 }
             }
             KeyCode::Right if self.tab == 6 && key.modifiers.contains(KeyModifiers::ALT) => {
@@ -1456,7 +1513,9 @@ impl App {
                         let entry = entries.first().context("没有可恢复的 Mod 备份")?;
                         mods::restore(&self.config, id, &entry.token)
                     });
-                    self.report(result.map(|filename| format!("已恢复 {filename}")));
+                    self.report(
+                        result.map(|filename| tformat!("已恢复 {filename}", filename = filename)),
+                    );
                     self.refresh_mods();
                 }
             }
@@ -1470,7 +1529,7 @@ impl App {
                     (&self.mod_instance, self.mod_list.get(self.selection))
                 {
                     let result = mods::remove(&self.config, id, &entry.filename)
-                        .map(|backup| format!("Mod 已移出，备份：{}", backup.display()));
+                        .map(|backup| tformat!("Mod 已移出，备份：{}", backup.display()));
                     self.report(result);
                     self.refresh_mods();
                 }
@@ -1485,12 +1544,12 @@ impl App {
                     match result {
                         Ok(lines) => {
                             for line in lines {
-                                self.log(format!("游戏 · {line}"));
+                                self.log(tformat!("游戏 · {line}", line = line));
                             }
                             self.tab = 6;
                             self.log_scroll = 0;
                         }
-                        Err(e) => self.log(format!("读取日志失败：{e}")),
+                        Err(e) => self.log(tformat!("读取日志失败：{e}", e = e)),
                     }
                 }
             }
@@ -1504,7 +1563,7 @@ impl App {
                             self.tab = 6;
                             self.log_scroll = 0;
                         }
-                        Err(error) => self.log(format!("诊断失败：{error}")),
+                        Err(error) => self.log(tformat!("诊断失败：{error}", error = error)),
                     }
                 }
             }
@@ -1513,7 +1572,7 @@ impl App {
                     let config = self.config.clone();
                     self.work(WorkKind::Download, move |b| {
                         let runtime = b.install_java_for_version(&config, &id)?;
-                        Ok(format!(
+                        Ok(tformat!(
                             "Java {} 已就绪：{}",
                             runtime.major(),
                             runtime.path.display()
@@ -1597,7 +1656,7 @@ impl App {
             }
             KeyCode::Char('g') if self.tab == 2 => {
                 self.scope = None;
-                self.log("已切换为全局设置");
+                self.log(tr("已切换为全局设置"));
             }
             KeyCode::Char('d') if self.tab == 2 && self.task.is_none() => {
                 if let Some(id) = &self.scope {
@@ -1657,7 +1716,7 @@ impl App {
             KeyCode::Char('v') => {
                 let config = self.config.clone();
                 self.work(WorkKind::Other, move |b| {
-                    let found = java::discover(&config);
+                    let found = java::discover(&config, &b.control)?;
                     for runtime in &found {
                         b.log(format!(
                             "Java {} · {}",
@@ -1668,7 +1727,7 @@ impl App {
                     if found.is_empty() {
                         bail!("没有发现可用 Java");
                     }
-                    Ok(format!(
+                    Ok(tformat!(
                         "发现 {} 个 Java；设置 auto 可自动匹配",
                         found.len()
                     ))
@@ -1680,7 +1739,7 @@ impl App {
                         self.confirm_stop = true;
                     } else {
                         self.control.cancel();
-                        self.log("正在取消，等待当前网络读取返回…");
+                        self.log(tr("正在取消，等待当前网络读取返回…"));
                     }
                 }
             }
@@ -1712,16 +1771,19 @@ impl Drop for TerminalGuard {
     }
 }
 pub fn run(config: Config) -> Result<()> {
+    crate::localization::set(&config.language);
     enable_raw_mode()?;
     let _guard = TerminalGuard;
     execute!(io::stdout(), EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let (tx, rx) = mpsc::channel();
     let mut app = App::new(config, tx, rx);
-    app.log(
+    app.log(tr(
         "欢迎使用 Tui-Launcher。Enter 管理所选实例 · Space 启动 · 1–5 一级导航 · Esc 返回上一级",
-    );
-    app.log("账户 › 微软登录：请先在设置 › 全局游戏与下载设置中配置自己的 OAuth 客户端 ID。");
+    ));
+    app.log(tr(
+        "账户 › 微软登录：请先在设置 › 全局游戏与下载设置中配置自己的 OAuth 客户端 ID。",
+    ));
     loop {
         app.messages();
         terminal.draw(|f| draw(f, &app))?;
@@ -1751,7 +1813,7 @@ fn highlight() -> Style {
 fn render_list(f: &mut Frame, items: Vec<ListItem>, title: String, selected: usize, area: Rect) {
     if items.is_empty() {
         f.render_widget(
-            Paragraph::new("\n  暂无内容\n\n  F1 查看当前页操作")
+            Paragraph::new(tr("\n  暂无内容\n\n  F1 查看当前页操作"))
                 .style(Style::default().fg(MUTED))
                 .block(panel(title)),
             area,
@@ -1784,18 +1846,18 @@ fn dialog_rect(area: Rect, width: u16, height: u16) -> Rect {
 
 fn page_actions(app: &App) -> &'static str {
     match app.tab {
-        0 => "Enter 管理所选实例 · Space 启动\n/ 搜索 · R 刷新\n组件、Mod、存档与修复请进入实例管理",
-        1 => "Enter 安装原版 · R 获取版本目录\nS 切换快照 · / 搜索\n安装后的加载器与 Mod 请在实例管理中配置",
-        7 => "↑↓ 选择功能 · Enter 打开\nEsc 返回实例列表 · Space 启动游戏",
-        8 => "↑↓ 选择设置分类 · Enter 打开\nEsc 返回上一级",
-        9 => "↑↓ 选择加载器 · Enter 选择具体版本\nEsc 返回实例管理",
-        6 => "↑↓ 滚动 · PgUp / PgDn 翻页\n← → 切页 · Alt+← → 查看长行\nHome 最早记录 · End 跟随最新记录",
-        2 => "Enter 编辑 · G 全局设置\nD 清除当前实例覆盖 · V 检测 Java\n编辑：Enter 保存 · Esc 取消 · Ctrl+U 清空",
-        3 if app.mod_versions.is_some() => "Enter 安装所选版本\nBackspace 返回搜索结果 · L 本地 Mod",
-        3 if app.mod_search.is_some() => "Enter 安装 · V 选择版本 · B 搜索\nN 下一页 · P 上一页 · L 本地 Mod",
-        3 => "Enter 启停 · A 导入 JAR · B 在线搜索\nU 检查更新 · Del 移出 · Z 恢复 · R 刷新\nEsc 返回实例管理",
-        4 => "Enter 切换账户 · N 添加离线账户\nA 微软登录 · D 移除账户\nShift+K 配置 CurseForge 密钥\n微软登录：先在设置中填写 OAuth 应用 ID",
-        _ => "Enter 恢复实例 · R 刷新\nEsc 返回设置菜单",
+        0 => tr("Enter 管理所选实例 · Space 启动\n/ 搜索 · R 刷新\n组件、Mod、存档与修复请进入实例管理"),
+        1 => tr("Enter 安装原版 · R 获取版本目录\nS 切换快照 · / 搜索\n安装后的加载器与 Mod 请在实例管理中配置"),
+        7 => tr("↑↓ 选择功能 · Enter 打开\nEsc 返回实例列表 · Space 启动游戏"),
+        8 => tr("↑↓ 选择设置分类 · Enter 打开\nEsc 返回上一级"),
+        9 => tr("↑↓ 选择加载器 · Enter 选择具体版本\nEsc 返回实例管理"),
+        6 => tr("↑↓ 滚动 · PgUp / PgDn 翻页\n← → 切页 · Alt+← → 查看长行\nHome 最早记录 · End 跟随最新记录"),
+        2 => tr("Enter 编辑 · G 全局设置\nD 清除当前实例覆盖 · V 检测 Java\n编辑：Enter 保存 · Esc 取消 · Ctrl+U 清空"),
+        3 if app.mod_versions.is_some() => tr("Enter 安装所选版本\nBackspace 返回搜索结果 · L 本地 Mod"),
+        3 if app.mod_search.is_some() => tr("Enter 安装 · V 选择版本 · B 搜索\nN 下一页 · P 上一页 · L 本地 Mod"),
+        3 => tr("Enter 启停 · A 导入 JAR · B 在线搜索\nU 检查更新 · Del 移出 · Z 恢复 · R 刷新\nEsc 返回实例管理"),
+        4 => tr("Enter 切换账户 · N 添加离线账户\nA 微软登录 · D 移除账户\nShift+K 配置 CurseForge 密钥\n微软登录：先在设置中填写 OAuth 应用 ID"),
+        _ => tr("Enter 恢复实例 · R 刷新\nEsc 返回设置菜单"),
     }
 }
 
@@ -1815,6 +1877,7 @@ fn input_tail(text: &str, width: u16) -> String {
 }
 
 fn draw(f: &mut Frame, app: &App) {
+    crate::localization::set(&app.config.language);
     let area = f.area();
     f.render_widget(
         Block::default().style(Style::default().bg(BG).fg(TEXT)),
@@ -1822,7 +1885,7 @@ fn draw(f: &mut Frame, app: &App) {
     );
     if area.width < 48 || area.height < 16 {
         f.render_widget(
-            Paragraph::new("请将终端调整至至少 48 × 16\nQ 空闲时退出")
+            Paragraph::new(tr("请将终端调整至至少 48 × 16\nQ 空闲时退出"))
                 .style(Style::default().fg(ACCENT))
                 .wrap(Wrap { trim: false }),
             area,
@@ -1853,7 +1916,7 @@ fn draw(f: &mut Frame, app: &App) {
             ),
         ]))
         .block(if area.height >= 24 {
-            panel("方块之间 · 即刻出发")
+            panel(tr("方块之间 · 即刻出发"))
         } else {
             Block::default()
         }),
@@ -1868,16 +1931,16 @@ fn draw(f: &mut Frame, app: &App) {
         let items: Vec<ListItem> = PRIMARY
             .iter()
             .enumerate()
-            .map(|(index, (_, name))| ListItem::new(format!(" {}  {name}", index + 1)))
+            .map(|(index, (_, name))| ListItem::new(format!(" {}  {}", index + 1, tr(name))))
             .collect();
         let mut nav_state = ListState::default().with_selected(Some(app.primary_index()));
         f.render_stateful_widget(
             List::new(items)
                 .block(
                     panel(if app.nav_focused {
-                        "导航 · ↑↓ 选择"
+                        tr("导航 · ↑↓ 选择")
                     } else {
-                        "导航 · Tab 返回"
+                        tr("导航 · Tab 返回")
                     })
                     .border_style(Style::default().fg(if app.nav_focused {
                         ACCENT
@@ -1897,19 +1960,19 @@ fn draw(f: &mut Frame, app: &App) {
         let section = match app.tab {
             2 => {
                 if app.scope.is_some() {
-                    "游戏设置"
+                    tr("游戏设置")
                 } else {
-                    "全局游戏与下载设置"
+                    tr("全局游戏与下载设置")
                 }
             }
-            3 => "Mod 管理",
-            5 => "回收站",
-            6 => "日志",
-            9 => "加载器 / 组件",
+            3 => tr("Mod 管理"),
+            5 => tr("回收站"),
+            6 => tr("日志"),
+            9 => tr("加载器 / 组件"),
             _ => PRIMARY[app.primary_index()].1,
         };
         let context = if app.primary_index() == 1 {
-            app.managed_instance.as_deref().unwrap_or("未选择实例")
+            app.managed_instance.as_deref().unwrap_or(tr("未选择实例"))
         } else {
             ""
         };
@@ -1922,7 +1985,13 @@ fn draw(f: &mut Frame, app: &App) {
             rows[1],
         );
     } else {
-        let tabs = ["1账户", "2实例", "3列表", "4下载", "5设置"];
+        let tabs = [
+            tr("1账户"),
+            tr("2实例"),
+            tr("3列表"),
+            tr("4下载"),
+            tr("5设置"),
+        ];
         f.render_widget(
             Paragraph::new(Line::from(
                 tabs.iter()
@@ -1956,24 +2025,24 @@ fn draw(f: &mut Frame, app: &App) {
         7..=9 => {
             let (title, labels): (String, Vec<&str>) = match app.tab {
                 7 => (
-                    format!(
+                    tformat!(
                         "实例管理 · {}",
                         app.managed_instance
                             .as_ref()
                             .map(|id| app.names.get(id).unwrap_or(id).as_str())
-                            .unwrap_or("请先选择实例")
+                            .unwrap_or(tr("请先选择实例"))
                     ),
                     INSTANCE_MENU.to_vec(),
                 ),
-                8 => ("设置".into(), SETTINGS_MENU.to_vec()),
+                8 => (tr("设置").into(), SETTINGS_MENU.to_vec()),
                 _ => (
-                    "实例管理 › 加载器 / 组件".into(),
+                    tr("实例管理 › 加载器 / 组件").into(),
                     vec!["Fabric", "Quilt", "Forge", "NeoForge"],
                 ),
             };
             let items = labels
                 .into_iter()
-                .map(|label| ListItem::new(format!(" › {label}")))
+                .map(|label| ListItem::new(format!(" › {}", tr(label))))
                 .collect();
             render_list(f, items, title, app.selection, rows[2]);
         }
@@ -1997,9 +2066,9 @@ fn draw(f: &mut Frame, app: &App) {
             let title = format!(
                 "{} · {}{}",
                 if app.tab == 0 {
-                    "实例列表"
+                    tr("实例列表")
                 } else {
-                    "官方版本"
+                    tr("官方版本")
                 },
                 items.len(),
                 if app.query.is_empty() {
@@ -2010,11 +2079,11 @@ fn draw(f: &mut Frame, app: &App) {
             );
             if items.is_empty() {
                 let empty = if !app.query.is_empty() {
-                    "\n 没有匹配的版本。\n 按 /，Ctrl+U 清空搜索后 Enter。"
+                    tr("\n 没有匹配的版本。\n 按 /，Ctrl+U 清空搜索后 Enter。")
                 } else if app.tab == 0 {
-                    "\n 还没有游戏实例。\n 按 4 前往下载，R 获取官方列表。\n 已有游戏可在设置中指定游戏目录。"
+                    tr("\n 还没有游戏实例。\n 按 4 前往下载，R 获取官方列表。\n 已有游戏可在设置中指定游戏目录。")
                 } else {
-                    "\n R 获取 Mojang 官方版本目录。\n Enter 安装原版 · S 显示快照 · / 搜索\n 加载器和 Mod 在安装后的实例管理中配置。"
+                    tr("\n R 获取 Mojang 官方版本目录。\n Enter 安装原版 · S 显示快照 · / 搜索\n 加载器和 Mod 在安装后的实例管理中配置。")
                 };
                 f.render_widget(
                     Paragraph::new(empty)
@@ -2025,24 +2094,24 @@ fn draw(f: &mut Frame, app: &App) {
             } else {
                 render_list(f, items, title, app.selection, cols[0]);
             }
-            let selected = app.selected().unwrap_or_else(|| "尚未选择".into());
+            let selected = app.selected().unwrap_or_else(|| tr("尚未选择").into());
             let effective = app.config.effective(&selected);
             let configuration = match &effective {
                 Ok(config) => format!(
                     "{} MB · {}",
                     config.memory_mb,
                     if config.isolated {
-                        "独立实例目录"
+                        tr("独立实例目录")
                     } else {
-                        "共享游戏目录"
+                        tr("共享游戏目录")
                     }
                 ),
-                Err(error) => format!("配置读取失败：{error:#}"),
+                Err(error) => tformat!("配置读取失败：{error:#}", error = error),
             };
             let help = if app.tab == 0 {
-                "Enter 进入实例管理\nSpace 启动游戏\n\n游戏设置、Mod、存档、组件\n均在所选实例的管理菜单中"
+                tr("Enter 进入实例管理\nSpace 启动游戏\n\n游戏设置、Mod、存档、组件\n均在所选实例的管理菜单中")
             } else {
-                "Enter 安装原版\nS 快照 · / 搜索\n\n安装后进入实例管理\n选择组件与 Mod"
+                tr("Enter 安装原版\nS 快照 · / 搜索\n\n安装后进入实例管理\n选择组件与 Mod")
             };
             f.render_widget(
                 Paragraph::new(format!(
@@ -2053,14 +2122,14 @@ fn draw(f: &mut Frame, app: &App) {
                             "{} · {}",
                             a.name,
                             if a.kind == AccountKind::Microsoft {
-                                "微软"
+                                tr("微软")
                             } else {
-                                "离线"
+                                tr("离线")
                             }
                         ))
-                        .unwrap_or_else(|| format!("{} · 离线", app.config.username)),
+                        .unwrap_or_else(|| tformat!("{} · 离线", app.config.username)),
                 ))
-                .block(panel("当前选择"))
+                .block(panel(tr("当前选择")))
                 .wrap(Wrap { trim: false }),
                 cols[1],
             );
@@ -2091,15 +2160,15 @@ fn draw(f: &mut Frame, app: &App) {
                 .collect::<Vec<_>>();
             f.render_widget(
                 Paragraph::new(lines).scroll((0, app.log_horizontal)).block(
-                    panel("任务日志").title_bottom(format!(
+                    panel(tr("任务日志")).title_bottom(format!(
                         " {}–{} / {} · {} ",
                         if end == 0 { 0 } else { start + 1 },
                         end,
                         app.logs.len(),
                         if app.log_scroll == 0 {
-                            "跟随最新"
+                            tr("跟随最新")
                         } else {
-                            "历史记录"
+                            tr("历史记录")
                         }
                     )),
                 ),
@@ -2112,7 +2181,7 @@ fn draw(f: &mut Frame, app: &App) {
                 .enumerate()
                 .map(|(i, label)| {
                     ListItem::new(vec![
-                        Line::from(Span::styled(*label, Style::default().fg(MUTED))),
+                        Line::from(Span::styled(tr(label), Style::default().fg(MUTED))),
                         Line::from(format!("  {}", app.setting_value(i))),
                     ])
                 })
@@ -2120,16 +2189,16 @@ fn draw(f: &mut Frame, app: &App) {
             let scope = app
                 .scope
                 .as_ref()
-                .map(|id| format!("实例：{id}"))
-                .unwrap_or_else(|| "全局".into());
+                .map(|id| tformat!("实例：{id}", id = id))
+                .unwrap_or_else(|| tr("全局").into());
             render_list(
                 f,
                 items,
-                format!("启动设置 · {scope}"),
+                tformat!("启动设置 · {scope}", scope = scope),
                 app.setting,
                 cols[0],
             );
-            f.render_widget(Paragraph::new(format!("\n Enter 编辑 / 保存\n Ctrl+U 清空输入\n Esc 取消编辑\n\n G 全局设置\n D 清除实例覆盖\n V 检测 Java\n\n 实例可覆盖 Java、内存、\n 隔离与附加参数。\n\n {}",app.logs.back().map(String::as_str).unwrap_or(""))).block(panel("说明")).wrap(Wrap{trim:false}),cols[1]);
+            f.render_widget(Paragraph::new(tformat!("\n Enter 编辑 / 保存\n Ctrl+U 清空输入\n Esc 取消编辑\n\n G 全局设置\n D 清除实例覆盖\n V 检测 Java\n\n 实例可覆盖 Java、内存、\n 隔离与附加参数。\n\n {}",app.logs.back().map(String::as_str).unwrap_or(""))).block(panel(tr("说明"))).wrap(Wrap{trim:false}),cols[1]);
         }
         3 if app.mod_versions.is_some() => {
             let (project, versions) = app.mod_versions.as_ref().unwrap();
@@ -2144,12 +2213,18 @@ fn draw(f: &mut Frame, app: &App) {
                     ))
                 })
                 .collect();
-            render_list(f, items, "选择兼容 Mod 版本".into(), app.selection, cols[0]);
+            render_list(
+                f,
+                items,
+                tr("选择兼容 Mod 版本").into(),
+                app.selection,
+                cols[0],
+            );
             let selected = versions
                 .get(app.selection)
                 .map(|v| v.name.as_str())
-                .unwrap_or("没有兼容版本");
-            f.render_widget(Paragraph::new(format!("\n {selected}\n {project}\n\n Enter 安装所选版本\n Backspace 返回项目\n L 本地 Mod 列表\n\n 自动处理必需依赖，\n 安装前保留旧文件备份。\n\n {}",app.logs.back().map(String::as_str).unwrap_or(""))).block(panel("版本安装")).wrap(Wrap{trim:false}),cols[1]);
+                .unwrap_or(tr("没有兼容版本"));
+            f.render_widget(Paragraph::new(tformat!("\n {selected}\n {project}\n\n Enter 安装所选版本\n Backspace 返回项目\n L 本地 Mod 列表\n\n 自动处理必需依赖，\n 安装前保留旧文件备份。\n\n {}",app.logs.back().map(String::as_str).unwrap_or(""), project = project, selected = selected)).block(panel(tr("版本安装"))).wrap(Wrap{trim:false}),cols[1]);
         }
         3 if app.mod_search.is_some() => {
             let result = app.mod_search.as_ref().unwrap();
@@ -2158,7 +2233,7 @@ fn draw(f: &mut Frame, app: &App) {
                 .iter()
                 .map(|hit| ListItem::new(format!(" {} · {}", hit.title, hit.slug)))
                 .collect();
-            let title = format!(
+            let title = tformat!(
                 "在线 Mod · {} · {} / {}",
                 app.mod_query,
                 result.offset.saturating_add(1),
@@ -2169,8 +2244,8 @@ fn draw(f: &mut Frame, app: &App) {
                 .hits
                 .get(app.selection)
                 .map(|hit| hit.description.as_str())
-                .unwrap_or("没有匹配项目，按 B 修改关键词");
-            f.render_widget(Paragraph::new(format!("\n {description}\n\n Enter 安装兼容稳定版\n V 选择具体版本\n B / / 搜索\n N / P 下一页 / 上一页\n U 检查已管理 Mod 更新\n L 返回本地 Mod\n\n {}",app.logs.back().map(String::as_str).unwrap_or(""))).block(panel("Modrinth")).wrap(Wrap{trim:false}),cols[1]);
+                .unwrap_or(tr("没有匹配项目，按 B 修改关键词"));
+            f.render_widget(Paragraph::new(tformat!("\n {description}\n\n Enter 安装兼容稳定版\n V 选择具体版本\n B / / 搜索\n N / P 下一页 / 上一页\n U 检查已管理 Mod 更新\n L 返回本地 Mod\n\n {}",app.logs.back().map(String::as_str).unwrap_or(""), description = description)).block(panel("Modrinth")).wrap(Wrap{trim:false}),cols[1]);
         }
         3 => {
             let items = app
@@ -2188,14 +2263,14 @@ fn draw(f: &mut Frame, app: &App) {
             render_list(
                 f,
                 items,
-                format!(
+                tformat!(
                     "Mod 管理 · {}",
-                    app.mod_instance.as_deref().unwrap_or("请先选择实例")
+                    app.mod_instance.as_deref().unwrap_or(tr("请先选择实例"))
                 ),
                 app.selection,
                 cols[0],
             );
-            f.render_widget(Paragraph::new("\n Enter 启用 / 禁用\n Del 移出并备份\n Z 恢复最近移除项\n A 导入本地 JAR\n B / / 在线搜索\n U 检查更新 · L 本地列表\n R 刷新\n\n 在本地版本页按 M 选择实例。\n\n 禁用使用 .jar.disabled 后缀，\n 原文件内容保持完整。\n\n Mod 变更在下次启动时生效。").block(panel("管理")).wrap(Wrap{trim:false}),cols[1]);
+            f.render_widget(Paragraph::new(tr("\n Enter 启用 / 禁用\n Del 移出并备份\n Z 恢复最近移除项\n A 导入本地 JAR\n B / / 在线搜索\n U 检查更新 · L 本地列表\n R 刷新\n\n 在本地版本页按 M 选择实例。\n\n 禁用使用 .jar.disabled 后缀，\n 原文件内容保持完整。\n\n Mod 变更在下次启动时生效。")).block(panel(tr("管理"))).wrap(Wrap{trim:false}),cols[1]);
         }
         4 => {
             let items = app
@@ -2212,15 +2287,15 @@ fn draw(f: &mut Frame, app: &App) {
                         },
                         account.name,
                         if account.kind == AccountKind::Microsoft {
-                            "微软正版"
+                            tr("微软正版")
                         } else {
-                            "离线"
+                            tr("离线")
                         }
                     ))
                 })
                 .collect();
-            render_list(f, items, "账户管理".into(), app.selection, cols[0]);
-            f.render_widget(Paragraph::new(format!("\n Enter 选择账户\n N 添加离线账户\n A 微软设备代码登录\n Shift+K 配置 CurseForge 密钥\n D 移除账户与本机凭证\n\n 微软凭证保存在系统安全存储。\n 在设置中填写自己的应用 ID\n 后即可开始登录。\n\n {}",app.logs.back().map(String::as_str).unwrap_or(""))).block(panel("登录")).wrap(Wrap{trim:false}),cols[1]);
+            render_list(f, items, tr("账户管理").into(), app.selection, cols[0]);
+            f.render_widget(Paragraph::new(tformat!("\n Enter 选择账户\n N 添加离线账户\n A 微软设备代码登录\n Shift+K 配置 CurseForge 密钥\n D 移除账户与本机凭证\n\n 微软凭证保存在系统安全存储。\n 在设置中填写自己的应用 ID\n 后即可开始登录。\n\n {}",app.logs.back().map(String::as_str).unwrap_or(""))).block(panel(tr("登录"))).wrap(Wrap{trim:false}),cols[1]);
         }
         _ => {
             let items = app
@@ -2228,8 +2303,8 @@ fn draw(f: &mut Frame, app: &App) {
                 .iter()
                 .map(|entry| ListItem::new(format!(" {} · {}", entry.label, entry.id)))
                 .collect();
-            render_list(f, items, "实例回收站".into(), app.selection, cols[0]);
-            f.render_widget(Paragraph::new(format!("\n Enter 恢复选择的实例\n R 刷新\n\n 同名实例存在时不会覆盖。\n 回收站保留实例目录的数据。\n\n 在本地页按 Delete 移入。\n 有其他实例依赖的父版本\n 不能直接移除。\n\n {}",app.logs.back().map(String::as_str).unwrap_or(""))).block(panel("恢复")).wrap(Wrap{trim:false}),cols[1]);
+            render_list(f, items, tr("实例回收站").into(), app.selection, cols[0]);
+            f.render_widget(Paragraph::new(tformat!("\n Enter 恢复选择的实例\n R 刷新\n\n 同名实例存在时不会覆盖。\n 回收站保留实例目录的数据。\n\n 在本地页按 Delete 移入。\n 有其他实例依赖的父版本\n 不能直接移除。\n\n {}",app.logs.back().map(String::as_str).unwrap_or(""))).block(panel(tr("恢复"))).wrap(Wrap{trim:false}),cols[1]);
         }
     }
     let (label, done, total) = &app.progress;
@@ -2245,13 +2320,13 @@ fn draw(f: &mut Frame, app: &App) {
         (*done as f64 / *total as f64).clamp(0.0, 1.0)
     };
     let status = if app.paused {
-        "已暂停 · P 继续 / C 取消"
+        tr("已暂停 · P 继续 / C 取消")
     } else if app.task.is_some() && app.pause_allowed {
-        "进行中 · P 暂停下载 / C 取消"
+        tr("进行中 · P 暂停下载 / C 取消")
     } else if app.task.is_some() {
-        "进行中 · C 取消"
+        tr("进行中 · C 取消")
     } else {
-        "就绪"
+        tr("就绪")
     };
     if app.task.is_some() {
         f.render_widget(
@@ -2262,7 +2337,7 @@ fn draw(f: &mut Frame, app: &App) {
                 .label(if app.task.is_some() {
                     if let Some((transfer, updated)) = &app.transfer {
                         if !app.paused && updated.elapsed() > Duration::from_secs(3) {
-                            format!("{} · 等待数据或校验中", transfer.label)
+                            tformat!("{} · 等待数据或校验中", transfer.label)
                         } else {
                             transfer.display(app.paused)
                         }
@@ -2270,19 +2345,19 @@ fn draw(f: &mut Frame, app: &App) {
                         format!("{label} {done}/{total}")
                     }
                 } else {
-                    "等待下一次冒险".into()
+                    tr("等待下一次冒险").into()
                 }),
             rows[3],
         );
     } else {
         f.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled(" ● 就绪  ", Style::default().fg(ACCENT)),
+                Span::styled(tr(" ● 就绪  "), Style::default().fg(ACCENT)),
                 Span::raw(
                     app.logs
                         .back()
                         .map(String::as_str)
-                        .unwrap_or("选择游戏，开始冒险"),
+                        .unwrap_or(tr("选择游戏，开始冒险")),
                 ),
             ])),
             rows[3],
@@ -2294,9 +2369,9 @@ fn draw(f: &mut Frame, app: &App) {
             Line::styled(primary, Style::default().fg(ACCENT)),
             Line::styled(
                 if app.nav_focused {
-                    "↑↓ 选择导航 · Enter / → 进入 · Tab 切换焦点"
+                    tr("↑↓ 选择导航 · Enter / → 进入 · Tab 切换焦点")
                 } else {
-                    "↑↓ 选择内容 · ← / Tab 导航 · Esc 返回 · F6 任务"
+                    tr("↑↓ 选择内容 · ← / Tab 导航 · Esc 返回 · F6 任务")
                 },
                 Style::default().fg(MUTED),
             ),
@@ -2308,7 +2383,7 @@ fn draw(f: &mut Frame, app: &App) {
         f.render_widget(Clear, dialog);
         let mut state = ListState::default().with_selected(Some(picker.selected));
         let items: Vec<_> = if picker.worlds.is_empty() {
-            vec![ListItem::new("暂无存档，按 I 导入 ZIP")]
+            vec![ListItem::new(tr("暂无存档，按 I 导入 ZIP"))]
         } else {
             picker
                 .worlds
@@ -2319,8 +2394,8 @@ fn draw(f: &mut Frame, app: &App) {
         f.render_stateful_widget(
             List::new(items)
                 .block(
-                    panel(format!("{} · 存档", picker.instance))
-                        .title_bottom(" Enter 备份 · I 导入 · R 刷新 · Esc 返回 "),
+                    panel(tformat!("{} · 存档", picker.instance))
+                        .title_bottom(tr(" Enter 备份 · I 导入 · R 刷新 · Esc 返回 ")),
                 )
                 .style(Style::default().bg(BG).fg(TEXT))
                 .highlight_style(Style::default().bg(ACCENT).fg(BG)),
@@ -2331,12 +2406,12 @@ fn draw(f: &mut Frame, app: &App) {
     if let Some(picker) = &app.loader_picker {
         let dialog = dialog_rect(area, 86, 24);
         f.render_widget(Clear, dialog);
-        let mut items = vec![ListItem::new("自动选择推荐 / 稳定版本")];
+        let mut items = vec![ListItem::new(tr("自动选择推荐 / 稳定版本"))];
         items.extend(picker.versions.iter().map(|entry| {
             ListItem::new(format!(
                 "{}{}",
                 entry.version,
-                if entry.stable { "" } else { "  [预览]" }
+                if entry.stable { "" } else { tr("  [预览]") }
             ))
         }));
         let mut state = ListState::default().with_selected(Some(picker.selected));
@@ -2348,7 +2423,7 @@ fn draw(f: &mut Frame, app: &App) {
                         picker.kind.name(),
                         picker.game
                     ))
-                    .title_bottom(" ↑↓ / PgUp / PgDn 选择 · Enter 安装 · Esc 返回 "),
+                    .title_bottom(tr(" ↑↓ / PgUp / PgDn 选择 · Enter 安装 · Esc 返回 ")),
                 )
                 .style(Style::default().bg(BG).fg(TEXT))
                 .highlight_style(Style::default().bg(ACCENT).fg(BG)),
@@ -2360,11 +2435,11 @@ fn draw(f: &mut Frame, app: &App) {
         let dialog = dialog_rect(area, 76, 13);
         f.render_widget(Clear, dialog);
         let state = if app.control.cancelled() {
-            "正在取消 · 等待当前操作结束"
+            tr("正在取消 · 等待当前操作结束")
         } else if app.paused {
-            "已暂停"
+            tr("已暂停")
         } else {
-            "任务进行中"
+            tr("任务进行中")
         };
         let block = panel(state).style(Style::default().bg(BG).fg(TEXT));
         let inner = block.inner(dialog);
@@ -2392,21 +2467,21 @@ fn draw(f: &mut Frame, app: &App) {
                 .label(if known {
                     format!("{:.0}%", ratio * 100.0)
                 } else {
-                    "处理中 · 等待进度".into()
+                    tr("处理中 · 等待进度").into()
                 }),
             sections[1],
         );
         let detail = app.transfer.as_ref().map_or_else(
             || {
                 if *total > 0 {
-                    format!("{done} / {total} 项")
+                    tformat!("{done} / {total} 项", done = done, total = total)
                 } else {
-                    "准备或处理文件中".into()
+                    tr("准备或处理文件中").into()
                 }
             },
             |(transfer, updated)| {
                 if !app.paused && updated.elapsed() > Duration::from_secs(3) {
-                    "等待数据或校验中".into()
+                    tr("等待数据或校验中").into()
                 } else {
                     transfer.display(app.paused)
                 }
@@ -2423,11 +2498,11 @@ fn draw(f: &mut Frame, app: &App) {
             sections[3],
         );
         let controls = if app.control.cancelled() {
-            "Esc 后台等待 · L 查看日志"
+            tr("Esc 后台等待 · L 查看日志")
         } else if app.pause_allowed {
-            "P 暂停/继续 · C 取消\nEsc 后台运行 · L 日志 · F6 任务"
+            tr("P 暂停/继续 · C 取消\nEsc 后台运行 · L 日志 · F6 任务")
         } else {
-            "C 取消 · Esc 后台运行\nL 日志 · F6 任务"
+            tr("C 取消 · Esc 后台运行\nL 日志 · F6 任务")
         };
         f.render_widget(
             Paragraph::new(controls).style(Style::default().fg(ACCENT)),
@@ -2438,7 +2513,7 @@ fn draw(f: &mut Frame, app: &App) {
         let dialog = dialog_rect(area, 76, 12);
         f.render_widget(Clear, dialog);
         let block =
-            panel(title.as_str()).title_bottom(" ↑↓ / PgUp PgDn 滚动 · Enter 关闭 · L 日志 ");
+            panel(title.as_str()).title_bottom(tr(" ↑↓ / PgUp PgDn 滚动 · Enter 关闭 · L 日志 "));
         let inner = block.inner(dialog);
         let paragraph = Paragraph::new(message.as_str())
             .style(Style::default().bg(BG).fg(TEXT))
@@ -2459,19 +2534,19 @@ fn draw(f: &mut Frame, app: &App) {
         let dialog = dialog_rect(area, 88, 7);
         f.render_widget(Clear, dialog);
         let title = match editor.kind {
-            EditKind::BackupWorld => "备份 ZIP 路径 · 不覆盖已有文件 · Enter 备份",
-            EditKind::ImportWorldZip => "输入世界 ZIP 路径 · Enter 下一步",
-            EditKind::ImportWorldName => "新存档目录名 · 不覆盖现有世界 · Enter 导入",
-            EditKind::Search => "搜索 · Enter 应用 · Ctrl+U 清空",
-            EditKind::Setting => "编辑设置 · Enter 保存 · Esc 取消",
-            EditKind::ImportMod => "输入本地 JAR 路径 · Enter 导入",
-            EditKind::OfflineAccount => "输入离线用户名 · Enter 添加并选择",
-            EditKind::ImportPack => "输入 Modrinth .mrpack / CurseForge ZIP 路径",
-            EditKind::NameInstance => "实例显示名称 · Enter 保存 · ID 保持稳定",
-            EditKind::CloneInstance => "新实例 ID · 复制配置、Mod 与存档",
-            EditKind::ExportPack => "输出 .mrpack 路径 · 不包含存档与账户",
-            EditKind::CurseKey => "输入自己的 CurseForge API 密钥 · 系统安全存储",
-            EditKind::ModQuery => "Modrinth 搜索关键词 · 按当前实例版本与加载器筛选",
+            EditKind::BackupWorld => tr("备份 ZIP 路径 · 不覆盖已有文件 · Enter 备份"),
+            EditKind::ImportWorldZip => tr("输入世界 ZIP 路径 · Enter 下一步"),
+            EditKind::ImportWorldName => tr("新存档目录名 · 不覆盖现有世界 · Enter 导入"),
+            EditKind::Search => tr("搜索 · Enter 应用 · Ctrl+U 清空"),
+            EditKind::Setting => tr("编辑设置 · Enter 保存 · Esc 取消"),
+            EditKind::ImportMod => tr("输入本地 JAR 路径 · Enter 导入"),
+            EditKind::OfflineAccount => tr("输入离线用户名 · Enter 添加并选择"),
+            EditKind::ImportPack => tr("输入 Modrinth .mrpack / CurseForge ZIP 路径"),
+            EditKind::NameInstance => tr("实例显示名称 · Enter 保存 · ID 保持稳定"),
+            EditKind::CloneInstance => tr("新实例 ID · 复制配置、Mod 与存档"),
+            EditKind::ExportPack => tr("输出 .mrpack 路径 · 不包含存档与账户"),
+            EditKind::CurseKey => tr("输入自己的 CurseForge API 密钥 · 系统安全存储"),
+            EditKind::ModQuery => tr("Modrinth 搜索关键词 · 按当前实例版本与加载器筛选"),
         };
         let display = if matches!(editor.kind, EditKind::CurseKey) {
             "•".repeat(editor.text.chars().count())
@@ -2489,7 +2564,7 @@ fn draw(f: &mut Frame, app: &App) {
                     Span::styled(&visible, Style::default().fg(ACCENT)),
                 ]),
             ])
-            .block(panel(heading).title_bottom(" Enter 确认 · Esc 取消 · Ctrl+U 清空 "))
+            .block(panel(heading).title_bottom(tr(" Enter 确认 · Esc 取消 · Ctrl+U 清空 ")))
             .style(Style::default().bg(BG).fg(ACCENT)),
             dialog,
         );
@@ -2502,10 +2577,12 @@ fn draw(f: &mut Frame, app: &App) {
         let dialog = dialog_rect(area, 72, 7);
         f.render_widget(Clear, dialog);
         f.render_widget(
-            Paragraph::new("游戏会立即终止，未保存的进度可能丢失。\nY 确认终止 · N / Esc 返回")
-                .block(panel("终止游戏确认"))
-                .style(Style::default().fg(Color::Yellow).bg(BG))
-                .wrap(Wrap { trim: false }),
+            Paragraph::new(tr(
+                "游戏会立即终止，未保存的进度可能丢失。\nY 确认终止 · N / Esc 返回",
+            ))
+            .block(panel(tr("终止游戏确认")))
+            .style(Style::default().fg(Color::Yellow).bg(BG))
+            .wrap(Wrap { trim: false }),
             dialog,
         );
     }
@@ -2513,24 +2590,47 @@ fn draw(f: &mut Frame, app: &App) {
         let dialog = dialog_rect(area, 72, 7);
         f.render_widget(Clear, dialog);
         f.render_widget(
-            Paragraph::new(format!(
-                "将 {id} 移至回收站，数据可恢复。\nY 确认 · N / Esc 返回"
+            Paragraph::new(tformat!(
+                "将 {id} 移至回收站，数据可恢复。\nY 确认 · N / Esc 返回",
+                id = id
             ))
-            .block(panel("移除实例"))
+            .block(panel(tr("移除实例")))
             .style(Style::default().bg(BG).fg(Color::Yellow))
             .wrap(Wrap { trim: false }),
             dialog,
+        );
+    }
+    if let Some(selected) = app.language_picker {
+        let dialog = dialog_rect(area, 78, 16);
+        f.render_widget(Clear, dialog);
+        let items: Vec<_> = crate::localization::UiLanguage::ALL
+            .iter()
+            .map(|language| {
+                let (translated, total) = language.coverage();
+                ListItem::new(format!(
+                    "{}  [{}]  {translated}/{total}",
+                    language.name(),
+                    language.game_code()
+                ))
+            })
+            .collect();
+        let mut state = ListState::default().with_selected(Some(selected));
+        f.render_stateful_widget(
+            List::new(items)
+                .block(panel("Language / 语言").title_bottom(" ↑↓ · Enter Select · Esc Back "))
+                .style(Style::default().bg(BG).fg(TEXT))
+                .highlight_style(highlight()),
+            dialog,
+            &mut state,
         );
     }
     if app.help {
         let dialog = dialog_rect(area, 88, 16);
         f.render_widget(Clear, dialog);
         f.render_widget(
-            Paragraph::new(format!(
-                "{}\n\nTab / Shift+Tab 切换导航与内容焦点\n导航 ↑↓ 选择 · Enter / → 进入内容\n内容 ← 返回导航 · 1–5 直达入口\nEnter 打开 · Esc 返回上一级\nPgUp / PgDn 翻页\n任务：F6 进度 · C 取消 · P 暂停 / 继续\nQ 空闲时退出",
-                page_actions(app)
-            ))
-            .block(panel("当前页面 · 操作帮助").title_bottom(" ↑↓ 滚动 · F1 / Esc 返回 "))
+            Paragraph::new(tformat!("{}\n\nTab / Shift+Tab 切换导航与内容焦点\n导航 ↑↓ 选择 · Enter / → 进入内容\n内容 ← 返回导航 · 1–5 直达入口\nEnter 打开 · Esc 返回上一级\nPgUp / PgDn 翻页\n任务：F6 进度 · C 取消 · P 暂停 / 继续\nQ 空闲时退出",
+                page_actions(app)))
+            .block(panel(tr("当前页面 · 操作帮助")).title_bottom(tr(" ↑↓ 滚动 · F1 / Esc 返回 ")))
             .style(Style::default().bg(BG).fg(TEXT))
             .scroll((app.help_scroll, 0))
             .wrap(Wrap { trim: false }),
@@ -2542,6 +2642,76 @@ fn draw(f: &mut Frame, app: &App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn multilingual_picker_navigation_and_all_language_frames() {
+        let mut app = app();
+        app.tab = 2;
+        app.setting = 16;
+        app.action();
+        assert_eq!(app.language_picker, Some(0));
+        app.key(event::KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(app.language_picker, Some(9));
+        app.key(event::KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.language_picker, Some(0));
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        for language in crate::localization::UiLanguage::ALL {
+            app.config.language = language.game_code().into();
+            terminal.draw(|f| draw(f, &app)).unwrap();
+            app.language_picker = None;
+            for tab in [0, 2, 4, 6, 8] {
+                app.tab = tab;
+                terminal.draw(|f| draw(f, &app)).unwrap();
+            }
+            app.language_picker = Some(0);
+        }
+        app.key(event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.language_picker.is_none());
+        assert_eq!(app.config.language, "lzh");
+        app.tab = 2;
+        app.scope = Some("1.21.1".into());
+        app.action();
+        assert!(app.language_picker.is_none());
+    }
+    #[test]
+    fn english_pages_translate_controls_and_preserve_user_names() {
+        let mut app = app();
+        app.config.language = "en_us".into();
+        app.names.insert("1.21.1".into(), "账户".into());
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(140, 44)).unwrap();
+        for (tab, expected) in [
+            (0, "Instances"),
+            (2, "Launchsettings"),
+            (4, "Accounts"),
+            (8, "Globalgame/downloadsettings"),
+        ] {
+            app.tab = tab;
+            let rendered = terminal.draw(|f| draw(f, &app)).unwrap();
+            let text = rendered
+                .buffer
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
+            assert!(
+                text.replace(' ', "").contains(expected),
+                "missing {expected}"
+            );
+            assert!(!text.contains("↑↓ 选择"));
+            if tab == 0 {
+                assert!(text.replace(' ', "").contains("账户"));
+            }
+        }
+        app.config.language = "zh_cn".into();
+        app.tab = 0;
+        let rendered = terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = rendered
+            .buffer
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(text.replace(' ', "").contains("实例列表"));
+    }
     #[test]
     fn responsive_pages_and_dialogs_fit() {
         let mut app = app();

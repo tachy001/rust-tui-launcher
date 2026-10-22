@@ -44,9 +44,6 @@ struct OAuthToken {
     #[serde(default)]
     refresh_token: String,
 }
-fn save_secret(account: &Account, kind: &str, secret: &str) -> Result<()> {
-    crate::account_service::SystemCredentials.write(account, kind, secret)
-}
 fn read_secret(account: &Account, kind: &str) -> Result<Zeroizing<String>> {
     crate::account_service::SystemCredentials
         .read(account, kind)?
@@ -195,7 +192,7 @@ impl Backend {
         &self,
         client_id: &str,
         oauth: &OAuthToken,
-        expected_account: Option<&str>,
+        refresh_session: Option<&crate::account_service::RefreshSession<'_>>,
     ) -> Result<String> {
         self.control.check()?;
         self.log("微软授权完成，正在验证 Xbox 与 Minecraft 资格…");
@@ -256,44 +253,49 @@ impl Backend {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .into(),
+            generation: 0,
         };
         if oauth.refresh_token.is_empty() {
             bail!("微软未返回刷新令牌，请确认请求了 offline_access 权限");
         }
-        if expected_account.is_some_and(|id| id != account.id) {
+        if refresh_session.is_some_and(|session| session.account().id != account.id) {
             bail!("刷新后的 Minecraft 账户身份不一致，请重新登录");
         }
         self.control.check()?;
-        crate::account_service::AccountService::new(
-            &crate::account_service::FileAccountIndex,
-            &crate::account_service::SystemCredentials,
-        )
-        .commit_login(
-            account,
-            &oauth.refresh_token,
-            access,
-            expected_account.is_none(),
-        )?;
+        if let Some(session) = refresh_session {
+            session.commit(account, access)?;
+        } else {
+            crate::account_service::AccountService::new(
+                &crate::account_service::FileAccountIndex,
+                &crate::account_service::SystemCredentials,
+            )
+            .commit_login(account, &oauth.refresh_token, access)?;
+        }
         Ok(format!("正版账户已登录：{name}"))
     }
     fn refresh_account(&self, account: &Account) -> Result<()> {
         validate_client_id(&account.client_id)?;
-        let refresh = read_secret(account, "refresh")?;
+        self.control.check()?;
+        let mut refresh_session = crate::account_service::AccountService::new(
+            &crate::account_service::FileAccountIndex,
+            &crate::account_service::SystemCredentials,
+        )
+        .begin_refresh(account)?;
         let value = send_json(
             self.client.post(TOKEN_URL).form(&[
                 ("grant_type", "refresh_token"),
                 ("client_id", account.client_id.as_str()),
-                ("refresh_token", refresh.as_str()),
+                ("refresh_token", refresh_session.token()),
                 ("scope", SCOPE),
             ]),
             "刷新微软令牌",
         )?;
         let mut oauth: OAuthToken = serde_json::from_value(value)?;
         if oauth.refresh_token.is_empty() {
-            oauth.refresh_token = refresh.to_string();
+            oauth.refresh_token = refresh_session.token().to_owned();
         }
-        save_secret(account, "refresh", &oauth.refresh_token)?;
-        self.finish_auth(&account.client_id, &oauth, Some(&account.id))?;
+        refresh_session.save_refresh(&oauth.refresh_token)?;
+        self.finish_auth(&account.client_id, &oauth, Some(&refresh_session))?;
         Ok(())
     }
     pub fn account_session(&self, config: &Config) -> Result<Session> {
@@ -367,6 +369,7 @@ mod tests {
             client_id: "app".into(),
             expires_at: 123,
             xuid: "123".into(),
+            generation: 0,
         });
         let json = serde_json::to_string(&accounts).unwrap();
         assert!(!json.contains("token"));

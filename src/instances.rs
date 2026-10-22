@@ -395,6 +395,7 @@ pub fn clone_instance(
         game_args: Some(effective.game_args),
         fullscreen: Some(effective.fullscreen),
         server: Some(effective.server),
+        game_language: Some(effective.game_language),
     };
     atomic_write(
         &dest.join("tui-mc-instance.json"),

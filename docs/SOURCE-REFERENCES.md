@@ -82,6 +82,60 @@
 
 11 项相关本地检查通过，涵盖三端平台条件、架构正则 / 别名、版本不可用、规则顺序、功能标签及现有参数生成；测试使用替代版本提供者，不运行系统探测命令、Java 或游戏。实际系统版本探测及三端游戏运行验收仍单独保留。
 
+## 账户状态提交与修改互斥
+
+阅读 [HMCL Accounts.java](https://github.com/HMCL-dev/HMCL/blob/main/HMCL/src/main/java/org/jackhuang/hmcl/setting/Accounts.java) 中账户文件可写性、移除与覆盖入口，以及 PCL `ModLaunch` 的 OAuth 刷新、Xbox / Minecraft 分阶段认证和结果持久化。上游账户文件管理与本项目的系统安全凭证存储不同，不能直接照搬其保存方式或把上游单进程状态管理当作本项目跨进程保证。
+
+本项目为 AccountIndexStore 增加必需的修改会话锁；生产通过 `.tui-mc/accounts.lock` 的 OS 排他锁保护读改写、凭证变化与回滚。锁冲突明确报错，不让两个进程各自用旧索引覆盖对方结果；锁文件保留，句柄释放即解锁。AccountService 的提前刷新令牌保存同样使用锁，并检查账户存在、类型与 OAuth 客户端配置，避免删除后重新写入凭证或旧客户端覆盖新客户端登录。
+
+初批 16 项检查覆盖本地修改互斥，包含真实辅助子进程先被锁阻止、释放后成功进入的验证。随后新增 `RefreshSession`，让 OAuth、Xbox 与 Minecraft 流程共享同一账户的独立刷新锁；全局索引锁仅覆盖本地读写，其他账户刷新和账户选择不必等待网络。
+
+索引增加默认 0 的 revision，账户增加默认 0 的 generation；新登录与成功刷新单调分配代际，删除保留 revision，拒绝删除后重加或同客户端重新登录后的旧请求。保存 OAuth 刷新结果和提交 Minecraft 结果两处都复查代际；同时比较当前安全存储与会话的凭证快照，防止新登录保存失败、已保留新刷新令牌但索引尚未更新时，旧会话仍覆盖该凭证。
+
+本项目采用服务对象管理刷新生命周期，没有照搬上游的普通配置令牌保存方式。26 项相关检查通过，覆盖同账户互斥、其他账户独立运行、相同客户端 / 过期时间的重新登录、删除重加、失败提交、失败登录保留令牌、计数溢出及旧索引兼容；系统凭证由带账户命名空间的内存提供者替代，不访问真实密钥环或微软。不同工作目录不共享此锁及代际；崩溃时跨存储原子性和真实登录仍未验收。
+
+## Java 探测超时与取消
+
+继续阅读 [PCL PCLCS/Java.cs](https://github.com/Hex-Dragon/PCL2/blob/main/PCLCS/Java.cs) 的 `CheckAsync`：使用 15000 ms 的程序超时和调用方取消令牌；HMCL `JavaInfo.fromReleaseFile` 则展示了不执行程序时读取运行时元数据的另一种能力，两者不可直接视作相同的可执行性验证。
+
+本项目原先用阻塞的 `Command.output()` 检查每个候选，异常程序可能永久阻塞发现。现由 `JavaProbe` 统一执行，保留现有 `-version` 检查，加入 15 秒运行超时、25 ms 轮询取消和 1 MiB 输出预算；游戏本身的等待策略不改变。自动发现会传播取消，不把取消当作无 Java；Forge / NeoForge 在尝试安装建议 Java 前也重新检查取消。CLI Java / doctor 安装 Ctrl+C 处理，TUI 仅接入探测服务的新接口。
+
+stdout / stderr 使用本次探测的私有临时文件捕获，不使用需等待 EOF 的管道读线程；直接子进程退出或被终止后清理自己的捕获目录。Unix 目录 / 文件权限分别为 0700 / 0600。输出预算在轮询时检查，并限制最终内存读取，未宣称文件系统写入瞬时流量有硬性上限。探测不使用 release 文件替代实际执行，也未增加架构识别。
+
+4 项针对性检查通过，实际运行的是测试程序自身的辅助子进程，验证正常 stderr 版本输出、非零退出、超时、运行中取消、过量输出、预先取消及临时文件清理，没有运行 Java 或游戏。Clippy 通过；系统版本查询命令仍为独立实现，进程树清理与三端真实 Java 探测仍需继续验收。
+
+## 安装会话与共享状态
+
+继续阅读 [HMCL MojangJavaDownloadTask.java](https://github.com/HMCL-dev/HMCL/blob/main/HMCLCore/src/main/java/org/jackhuang/hmcl/download/java/mojang/MojangJavaDownloadTask.java) 的 `execute` / `postExecute`：先验证 / 下载依赖，依赖成功后才把临时运行时移交至目标目录。该顺序说明单个文件下载完成不能等同于整个运行时安装完成。初批补安装范围的互斥与标记提交，随后进一步接入 RuntimeGeneration，按完整代际发布新运行时。
+
+新增 `RuntimeInstallSession`，按实际组件目录获取 OS 排他下载租约，覆盖清单、文件下载、链接 / 权限处理、运行时探测及完成标记。等待结束才写入 `.installing`，等待被取消不触碰其他任务的状态；失败保留安装中标记，避免发现模块把半成品当作可用运行时。最后检查取消，原子写入清单 SHA-1 对应的 `.complete` 后再移除 `.installing`。无有效清单 SHA-1 不开始写状态，清单也不能覆盖启动器保留路径。
+
+Forge / NeoForge 不同实例仍共享根目录的 `launcher_profiles.json` 及安装器工作目录。新增 `LoaderInstallSession`，复用已有可取消 OS 文件租约，在官方安装器运行期间串行保护根目录；已有配置逐字保留，只有缺失时创建默认配置，格式 / 读取错误不静默覆盖。该锁不跨后续实例资源修复持有，独立游戏根目录不互相阻塞。
+
+初批 7 项本地文件 / 并发检查通过，其中 6 项被沙箱文件原子替换权限阻止，只在沙箱外复查这些临时目录项后通过，没有实际启动安装器、Java 或游戏。
+
+RuntimeGeneration 采用独立 `.pending-<manifest hash>` 目录准备，复用相同清单的中断下载。验证和完成标记通过后，将整个目录移交至新的 generation-*，再原子切换 current.json；不用 HMCL 的清理旧目标目录方式，避免触碰在用 JVM 文件。旧代保留，指针发布失败保留旧记录；已完整移交但未发布的目录也不参与发现，后续孤立目录回收仍待实现。
+
+托管发现只读取当前记录，通用 Java 扫描跳过 `.tui-managed`，旧平铺安装兼容。相同清单的已发布代际须验证声明文件 hash / 大小及链接和 Unix 执行权限，并通过 JavaProbe，才可复用；损坏时建立新代，不直接覆盖旧代。Windows 短路径返回值规范化为一致的物理路径。
+
+新增 5 项相关检查通过，4 项目录原子操作检查在沙箱外复查。包括旧 Windows Java 文件以拒绝写入 / 删除方式打开时仍能发布新代、同大小内容损坏不能通过复用、中断续传、模拟指针写入失败及旧布局发现。未运行真实 JVM、安装器或游戏。真实在用 JVM 的更新、各平台目录耐久性、断电恢复和历史代回收仍需验收，不能把原子指针切换等同于所有崩溃场景已恢复。
+
 ## 后续对照方式
 
 后端改动先定位对应源码中的行为、适用版本和失败处理，再核对本项目差异；记录采用规则及未采用原因。优先继续对照 Java 完整版本、Forge / NeoForge 安装及依赖修复、认证刷新和实例隔离。保持服务对象与可替换依赖，不因参考其他启动器而大改 TUI。
+
+
+## 界面与游戏语言（2026-10-22）
+
+实际阅读本地 HMCL-main：
+- HMCL/src/main/java/org/jackhuang/hmcl/util/i18n/SupportedLocale.java：getLocaleByName、默认语言与 ResourceBundle 候选 / 缓存。
+- 同目录 I18n.java：当前语言、集中翻译查询和缺失键回退。
+- HMCL/src/main/java/org/jackhuang/hmcl/ui/main/SettingsPage.java：语言列表双向绑定，标注重启后生效。
+- HMCL/src/main/java/org/jackhuang/hmcl/setting/SettingsManager.java：设置初始化时同时设置 Java Locale 与 I18n Locale。
+- HMCL/src/main/java/org/jackhuang/hmcl/game/HMCLGameLauncher.java：generateOptionsTxt、normalizedLanguageTag；1.0 无语言选项，1.1–1.10 要求 zh_CN 等区域大写格式，1.11 起小写；已有 options.txt 或特殊整合包配置时不生成默认文件。
+
+采用语言选择、翻译查询、游戏语言转换分离的设计，缺少所选语言译文时先回退英语，再回退源文案；菜单和带变量的模板先翻译，再插入实例名 / 路径，不替换用户数据。模板现改为受限运行时插值，所有内置目录均通过测试核对占位符。按本项目用户要求增加每次启动同步与 keep 开关、全局 / 实例优先级，切换即时生效；尚未移植 HMCL 的系统区域推断或特殊整合包配置探测。旧版语言另检查实际 JAR / 资源索引，避免写入不存在的语言。
+
+参考链接：[SupportedLocale](https://github.com/HMCL-dev/HMCL/blob/main/HMCL/src/main/java/org/jackhuang/hmcl/util/i18n/SupportedLocale.java)、[I18n](https://github.com/HMCL-dev/HMCL/blob/main/HMCL/src/main/java/org/jackhuang/hmcl/util/i18n/I18n.java)、[HMCLGameLauncher](https://github.com/HMCL-dev/HMCL/blob/main/HMCL/src/main/java/org/jackhuang/hmcl/game/HMCLGameLauncher.java)。
+
+追加核对 HMCL/src/main/resources/assets/lang/I18N*.properties：本地快照共有基础英语与 zh_Hans、zh_Hant、ja、de、es、ru、uk、ar、lzh 共十份资源。项目增加对应十种语言的独立 JSON 资源，新增八种语言目前仅主要界面译文，不视为达到 HMCL 的翻译完整度；缺项按英语回退，选择器展示真实条数。文言文低于 1.16 回退简中，来自 normalizedLanguageTag 的版本处理。资源为针对本项目文案重新编写，没有复制 HMCL 的 properties 或翻译内容。

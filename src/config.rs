@@ -12,6 +12,7 @@ pub struct InstanceSettings {
     pub game_args: Option<String>,
     pub fullscreen: Option<bool>,
     pub server: Option<String>,
+    pub game_language: Option<String>,
 }
 #[cfg(test)]
 mod tests {
@@ -38,6 +39,8 @@ mod tests {
         assert!(config.microsoft_client_id.is_empty());
         assert!(!config.fullscreen);
         assert!(config.server.is_empty());
+        assert_eq!(config.language, "zh_cn");
+        assert_eq!(config.game_language, "launcher");
     }
     #[test]
     fn instance_overrides_do_not_modify_global_settings() {
@@ -117,6 +120,27 @@ mod tests {
             .insert("../outside".into(), InstanceSettings::default());
         assert!(config.validate().is_err());
     }
+
+    #[test]
+    fn language_settings_inherit_and_validate_without_changing_global() {
+        let mut config = Config::default();
+        config.instances.insert(
+            "test".into(),
+            InstanceSettings {
+                game_language: Some("keep".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(config.effective("test").unwrap().game_language, "keep");
+        assert_eq!(config.game_language, "launcher");
+        config.validate().unwrap();
+        config.instances.get_mut("test").unwrap().game_language =
+            Some("zh_cn\nfullscreen:true".into());
+        assert!(config.validate().is_err());
+        config.instances.clear();
+        config.language = "unknown".into();
+        assert!(config.validate().is_err());
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -139,6 +163,8 @@ pub struct Config {
     pub optional_pack_files: bool,
     pub fullscreen: bool,
     pub server: String,
+    pub game_language: String,
+    pub language: String,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -160,6 +186,8 @@ impl Default for Config {
             optional_pack_files: true,
             fullscreen: false,
             server: String::new(),
+            game_language: "launcher".into(),
+            language: "zh_cn".into(),
         }
     }
 }
@@ -197,6 +225,8 @@ impl Config {
         Ok(())
     }
     fn validate_values(&self) -> Result<()> {
+        crate::localization::UiLanguage::parse(&self.language)?;
+        crate::language_service::GameLanguage::parse(&self.game_language)?;
         crate::launch_options::server_address(&self.server)?;
         crate::sources::validate(&self.download_source)?;
         if self.username.is_empty()

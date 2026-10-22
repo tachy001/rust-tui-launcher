@@ -59,6 +59,8 @@ mod tests {
         assert_eq!(active.name, "Player");
         assert!(active.client_id.is_empty());
         assert_eq!(active.expires_at, 0);
+        assert_eq!(active.generation, 0);
+        assert_eq!(accounts.revision, 0);
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -72,10 +74,13 @@ pub struct Account {
     pub expires_at: u64,
     #[serde(default)]
     pub xuid: String,
+    #[serde(default)]
+    pub generation: u64,
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Accounts {
+    pub revision: u64,
     pub active: Option<String>,
     pub entries: Vec<Account>,
 }

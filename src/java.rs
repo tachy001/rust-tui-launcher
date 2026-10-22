@@ -1,9 +1,6 @@
 use crate::{
-    backend::{java_info, Backend},
-    config::Config,
-    download::Download,
-    java_version::JavaVersion,
-    metadata::{safe_path, valid_id},
+    backend::Backend, config::Config, download::Download, java_version::JavaVersion,
+    metadata::valid_id,
 };
 use anyhow::{bail, Context, Result};
 use std::{
@@ -23,8 +20,10 @@ impl JavaRuntime {
         self.version.major()
     }
 }
-pub fn discover(config: &Config) -> Vec<JavaRuntime> {
-    let mut paths = vec![PathBuf::from("java")];
+pub fn discover(config: &Config, control: &crate::task::TaskControl) -> Result<Vec<JavaRuntime>> {
+    control.check()?;
+    let mut paths = crate::runtime_repository::installed_paths(config, control)?;
+    paths.push(PathBuf::from("java"));
     for name in ["JAVA_HOME", "JDK_HOME"] {
         if let Some(home) = std::env::var_os(name) {
             paths.push(PathBuf::from(home).join("bin").join(executable()));
@@ -78,11 +77,14 @@ pub fn discover(config: &Config) -> Vec<JavaRuntime> {
     }
     let mut visited = HashSet::new();
     for root in roots {
+        control.check()?;
         scan(&root, 0, &mut 800, &mut visited, &mut paths);
     }
     let mut seen = HashSet::new();
     let mut found = vec![];
+    let probe = crate::java_probe::JavaProbe::new(control);
     for path in paths {
+        control.check()?;
         let canonical = crate::paths::for_java(&fs::canonicalize(&path).unwrap_or(path));
         let key = if cfg!(windows) {
             canonical.to_string_lossy().to_lowercase()
@@ -92,7 +94,7 @@ pub fn discover(config: &Config) -> Vec<JavaRuntime> {
         if !seen.insert(key) {
             continue;
         }
-        if let Ok((version, description)) = java_info(&canonical.to_string_lossy()) {
+        if let Ok((version, description)) = probe.inspect(&canonical) {
             found.push(JavaRuntime {
                 path: canonical,
                 version,
@@ -100,8 +102,9 @@ pub fn discover(config: &Config) -> Vec<JavaRuntime> {
             });
         }
     }
+    control.check()?;
     found.sort_by_key(JavaRuntime::major);
-    found
+    Ok(found)
 }
 fn scan(
     root: &Path,
@@ -110,6 +113,12 @@ fn scan(
     visited: &mut HashSet<PathBuf>,
     paths: &mut Vec<PathBuf>,
 ) {
+    if root.file_name().is_some_and(|name| {
+        name.to_string_lossy()
+            .eq_ignore_ascii_case(crate::runtime_repository::MANAGED_DIR)
+    }) {
+        return;
+    }
     if root.join(".installing").exists() {
         return;
     }
@@ -143,9 +152,14 @@ fn executable() -> &'static str {
         "java"
     }
 }
-pub fn select(config: &Config, required: u64) -> Result<JavaRuntime> {
+pub fn select(
+    config: &Config,
+    required: u64,
+    control: &crate::task::TaskControl,
+) -> Result<JavaRuntime> {
     if config.java != "auto" {
-        let (version, description) = java_info(&config.java)?;
+        let (version, description) =
+            crate::java_probe::JavaProbe::new(control).inspect(Path::new(&config.java))?;
         let major = version.major();
         if major < required {
             bail!("需要 Java {required}，当前 Java {major}；可将 Java 路径设为 auto 自动匹配");
@@ -158,7 +172,7 @@ pub fn select(config: &Config, required: u64) -> Result<JavaRuntime> {
             description,
         });
     }
-    choose(discover(config), required)
+    choose(discover(config, control)?, required)
 }
 fn choose(runtimes: Vec<JavaRuntime>, required: u64) -> Result<JavaRuntime> {
     runtimes
@@ -224,14 +238,20 @@ impl Backend {
         let root = config
             .root()?
             .join("runtime")
+            .join(crate::runtime_repository::MANAGED_DIR)
             .join(component)
             .join(platform);
-        fs::create_dir_all(&root)?;
-        fs::write(
-            root.join(".installing"),
-            b"Java runtime installation in progress",
-        )?;
         let descriptor = &candidate["manifest"];
+        let fingerprint = descriptor["sha1"].as_str().context("Java 清单缺少 SHA-1")?;
+        let session = crate::runtime_repository::RuntimeGeneration::begin(
+            &root,
+            fingerprint,
+            &self.control,
+            || {
+                self.log("等待另一个任务完成同一 Java 组件安装…");
+            },
+        )?;
+        let root = session.root();
         let manifest_path = root.join(".manifest.json");
         self.downloader().fetch(&Download {
             url: descriptor["url"]
@@ -239,15 +259,40 @@ impl Backend {
                 .context("Java 清单没有 URL")?
                 .into(),
             dest: manifest_path.clone(),
-            sha1: descriptor["sha1"].as_str().map(str::to_owned),
+            sha1: Some(fingerprint.into()),
             size: descriptor["size"].as_u64(),
             alternatives: vec![],
         })?;
         let manifest: serde_json::Value = serde_json::from_slice(&fs::read(manifest_path)?)?;
         let files = manifest["files"].as_object().context("Java 文件清单无效")?;
+        match session.reusable(files) {
+            Ok(Some(existing)) => {
+                let path = crate::runtime_repository::executable(&existing);
+                match crate::java_probe::JavaProbe::new(&self.control).inspect(&path) {
+                    Ok((version, description)) if version.major() == required => {
+                        self.log("已验证并复用现有 Java 运行时");
+                        return Ok(JavaRuntime {
+                            path,
+                            version,
+                            description,
+                        });
+                    }
+                    Ok(_) => self.log("现有 Java 主版本不符，将准备独立运行时"),
+                    Err(error) => {
+                        self.control.check()?;
+                        self.log(format!("现有 Java 无法复用，将准备新目录：{error:#}"));
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.control.check()?;
+                self.log(format!("已发布 Java 校验失败，将准备独立运行时：{error:#}"));
+            }
+        }
         let mut downloads = vec![];
         for (name, file) in files {
-            let dest = safe_path(&root, name)?;
+            let dest = session.destination(name)?;
             match file["type"].as_str() {
                 Some("directory") => fs::create_dir_all(dest)?,
                 Some("file") => {
@@ -268,10 +313,10 @@ impl Backend {
             .many(downloads, config.download_threads, "Java 运行时")?;
         for (name, file) in files {
             self.control.check()?;
-            let dest = safe_path(&root, name)?;
+            let dest = session.destination(name)?;
             if file["type"] == "link" {
                 let target = file["target"].as_str().context("Java 链接没有目标")?;
-                let source = checked_link_target(&root, &dest, target)?;
+                let source = checked_link_target(root, &dest, target)?;
                 if !dest.exists() {
                     if let Some(parent) = dest.parent() {
                         fs::create_dir_all(parent)?;
@@ -299,16 +344,14 @@ impl Backend {
         } else {
             root.join("jre.bundle/Contents/Home/bin").join(executable())
         };
-        let (version, description) = java_info(&path.to_string_lossy())?;
+        let (version, description) =
+            crate::java_probe::JavaProbe::new(&self.control).inspect(&path)?;
         let major = version.major();
         if major != required {
             bail!("下载后的 Java 版本不符：预期 {required}，实际 {major}");
         }
-        fs::write(
-            root.join(".complete"),
-            descriptor["sha1"].as_str().unwrap_or("ok"),
-        )?;
-        fs::remove_file(root.join(".installing"))?;
+        let published = session.publish()?;
+        let path = crate::runtime_repository::executable(&published);
         Ok(JavaRuntime {
             path,
             version,
@@ -327,7 +370,7 @@ impl Backend {
         self.install_java(config, &component, major)
     }
 }
-fn checked_link_target(root: &Path, dest: &Path, target: &str) -> Result<PathBuf> {
+pub(crate) fn checked_link_target(root: &Path, dest: &Path, target: &str) -> Result<PathBuf> {
     use std::path::Component;
     let base = dest.parent().context("Java 链接没有父目录")?;
     let mut resolved = base.to_path_buf();
@@ -410,5 +453,21 @@ mod tests {
                 expected
             );
         }
+    }
+    #[test]
+    fn generic_scan_keeps_legacy_java_but_does_not_enter_managed_generations() {
+        let workspace = crate::test_support::Workspace::new();
+        let root = workspace.path.join("runtime");
+        let legacy = root.join("legacy/bin");
+        let private = root
+            .join(crate::runtime_repository::MANAGED_DIR)
+            .join("component/platform/.pending-hash/bin");
+        for dir in [&legacy, &private] {
+            fs::create_dir_all(dir).unwrap();
+            fs::write(dir.join(executable()), b"fixture, never executed").unwrap();
+        }
+        let mut paths = vec![];
+        scan(&root, 0, &mut 800, &mut HashSet::new(), &mut paths);
+        assert_eq!(paths, [legacy.join(executable())]);
     }
 }

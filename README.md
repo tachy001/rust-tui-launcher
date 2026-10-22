@@ -1,6 +1,6 @@
 # Tui-Launcher
 
-Rust 编写的 Minecraft Java 版终端启动器，使用 Ratatui + Crossterm。界面和后端分离，支持中文和纯键盘操作。
+Rust 编写的 Minecraft Java 版终端启动器，使用 Ratatui + Crossterm。界面和后端分离，支持多语言界面和纯键盘操作。
 
 ## 功能
 
@@ -16,6 +16,7 @@ Rust 编写的 Minecraft Java 版终端启动器，使用 Ratatui + Crossterm。
 - 多离线账户；可配置微软设备代码登录、Xbox / Minecraft 资格检查、令牌刷新与系统安全凭证存储。
 - 实时游戏日志、历史日志查看、退出状态、明确确认后终止游戏、后台任务错误恢复。
 - TUI、命令行、F1 操作帮助和原子配置保存。
+- 10 种界面语言即时切换，语言列表显示译文完成数（新增语言尚有英文回退，阿拉伯语排版为实验支持）；游戏语言可跟随启动器或按实例指定，兼容旧版语言代码。
 
 **实现不等于全部实测。** Windows 上已实际安装并启动原版 1.21.1 和 Fabric 0.19.5，完成图形、声音与资源初始化；也已下载并运行 Mojang Java 21。Forge 52.1.20 与 NeoForge 21.1.264 已完成官方安装器、客户端补丁生成和后续资源校验，详见 [Forge 记录](docs/FORGE-VALIDATION.md)与 [NeoForge 记录](docs/NEOFORGE-VALIDATION.md)，尚未启动这两个游戏实例。微软真实登录及跨平台行为仍未验收；整合包已有本地 ZIP 导入与修复证据，真实平台联网导入仍需验证，详见 [ROADMAP.md](ROADMAP.md)。
 

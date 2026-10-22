@@ -143,7 +143,7 @@ impl JavaRuntimeSource for Backend {
         self.control.check()
     }
     fn select(&self, config: &Config, required: u64) -> Result<JavaRuntime> {
-        crate::java::select(config, required)
+        crate::java::select(config, required, &self.control)
     }
     fn install(&self, config: &Config, instance: &str, _required: u64) -> Result<JavaRuntime> {
         self.install_java_for_version(config, instance)

@@ -65,6 +65,8 @@ const HELP: &str = "Tui-Launcher — Minecraft Java 终端启动器
   --memory <MB>  --threads <1-16>  --shared  --isolated
   --source <official|bmclapi|HTTPS根地址>  --no-optional
   --fullscreen / --windowed  --server <主机[:端口]>  --no-server
+  --language <launcher / zh_cn / zh_tw / en_us / keep>  启动前同步游戏语言
+  --ui-language <代码>  zh_cn / en_us / zh_tw / ja_jp / de_de / es_es / ru_ru / uk_ua / ar_sa / lzh
 ";
 struct Options {
     config: Config,
@@ -76,6 +78,7 @@ fn parse(mut config: Config, raw: Vec<String>) -> Result<Options> {
     let mut snapshots = false;
     let mut fullscreen_override = None;
     let mut server_override = None;
+    let mut language_override = None;
     let mut iter = raw.into_iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -97,6 +100,9 @@ fn parse(mut config: Config, raw: Vec<String>) -> Result<Options> {
                     .context("线程数应为整数")?
             }
             "--source" => config.download_source = iter.next().context("--source 缺少值")?,
+            "--ui-language" => {
+                config.language = iter.next().context("--ui-language 缺少语言代码")?
+            }
             "--no-optional" => config.optional_pack_files = false,
             "--shared" => config.isolated = false,
             "--isolated" => config.isolated = true,
@@ -117,6 +123,10 @@ fn parse(mut config: Config, raw: Vec<String>) -> Result<Options> {
                 config.server.clear();
                 server_override = Some(String::new());
             }
+            "--language" => {
+                config.game_language = iter.next().context("--language 缺少语言代码")?;
+                language_override = Some(config.game_language.clone());
+            }
             _ => args.push(arg),
         }
     }
@@ -129,6 +139,9 @@ fn parse(mut config: Config, raw: Vec<String>) -> Result<Options> {
             }
             if let Some(server) = server_override {
                 instance.server = Some(server);
+            }
+            if let Some(language) = language_override {
+                instance.game_language = Some(language);
             }
         }
     }
@@ -254,7 +267,10 @@ pub fn run(config: Config, raw: Vec<String>) -> Result<()> {
             if args[0] != "java" {
                 println!("本地版本: {}", backend::installed(&config).join(", "));
             }
-            let found = java::discover(&config);
+            let control = TaskControl::default();
+            let signal = control.clone();
+            ctrlc::set_handler(move || signal.cancel()).context("无法安装 Ctrl+C 处理器")?;
+            let found = java::discover(&config, &control)?;
             for runtime in &found {
                 println!(
                     "Java {} · {} · {}",
@@ -644,6 +660,46 @@ mod tests {
             options.config.effective("test").unwrap().server,
             "[::1]:25566"
         );
+    }
+    #[test]
+    fn language_flags_override_instance_and_reject_invalid_values() {
+        let mut config = Config::default();
+        config.instances.insert(
+            "test".into(),
+            crate::config::InstanceSettings {
+                game_language: Some("zh_tw".into()),
+                ..Default::default()
+            },
+        );
+        let options = parse(
+            config,
+            [
+                "launch",
+                "test",
+                "--language",
+                "launcher",
+                "--ui-language",
+                "en_us",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        )
+        .unwrap();
+        let effective = options.config.effective("test").unwrap();
+        assert_eq!(effective.language, "en_us");
+        assert_eq!(effective.game_language, "launcher");
+        for args in [
+            vec!["--language"],
+            vec!["--language", "zh_cn\nfullscreen:true"],
+            vec!["--ui-language", "unknown"],
+        ] {
+            assert!(parse(
+                Config::default(),
+                args.into_iter().map(str::to_owned).collect()
+            )
+            .is_err());
+        }
     }
     #[test]
     fn options_do_not_consume_command_arguments() {

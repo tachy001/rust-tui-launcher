@@ -444,6 +444,35 @@ impl Backend {
             )?;
         }
         self.control.check()?;
+        // Hold the directory lease until exit: shared game directories must not
+        // have their options changed by another launcher process during a game.
+        let _game_options = crate::download_lock::DownloadLease::acquire(
+            &game_dir.join("options.txt"),
+            &self.control,
+            || self.log("等待使用同一游戏目录的进程退出…"),
+        )?;
+        let language = crate::language_service::GameLanguage::parse(&config.game_language)?
+            .resolve(&config.language)?;
+        if language.enabled() {
+            if let Some(code) =
+                language.for_version(resolved.chain.first().context("版本链为空")?, meta)
+            {
+                let options = crate::language_service::GameOptionsService;
+                if code != code.to_lowercase()
+                    && !options.legacy_language_available(&jar, &index, &code)?
+                {
+                    self.log(format!(
+                        "旧版游戏不含语言 {code}，保留原语言，避免旧版语言加载崩溃"
+                    ));
+                } else {
+                    options.synchronize(&game_dir, &code)?;
+                    self.log(format!("游戏语言：{code}"));
+                }
+            } else {
+                self.log("此版本不支持语言设置或无法确认语言格式，保留游戏原设置");
+            }
+        }
+        self.control.check()?;
         let launch_started = std::time::SystemTime::now();
         let output = fs::File::create(&log_path)?;
         let mut tail = crate::logs::LogTail::open(&log_path)?;
@@ -538,21 +567,6 @@ pub fn installed(config: &Config) -> Vec<String> {
     versions.sort();
     versions.reverse();
     versions
-}
-pub fn java_info(java: &str) -> Result<(crate::java_version::JavaVersion, String)> {
-    let output = Command::new(java)
-        .arg("-version")
-        .output()
-        .context("找不到 Java，请在设置中指定 java 可执行文件")?;
-    let info = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stderr),
-        String::from_utf8_lossy(&output.stdout)
-    );
-    if !output.status.success() {
-        bail!("Java 检测失败：{info}");
-    }
-    crate::java_version::JavaVersion::from_output(&info)
 }
 pub fn offline_uuid(name: &str) -> String {
     let mut bytes: [u8; 16] = Md5::digest(format!("OfflinePlayer:{name}").as_bytes()).into();
