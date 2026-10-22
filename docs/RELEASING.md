@@ -25,7 +25,7 @@ git remote add origin https://github.com/OWNER/REPO.git
 git push -u origin main
 ```
 
-项目名称为 Tui-Launcher，建议 GitHub 仓库名为 `tui-launcher`。
+项目名称为 Rust TUI Launcher，GitHub 仓库名为 `rust-tui-launcher`。
 提交前查看暂存清单，确认没有游戏文件、账号索引、令牌或 API 密钥。
 此文档不会自动创建仓库或上传内容。
 
@@ -61,16 +61,14 @@ Windows 直接提供独立 EXE；Unix 包内仅包含可执行文件，解压后
    git push origin v0.14.0
    ```
 
-4. 标签构建通过后，工作流创建 **Draft + Prerelease**，只上传三个包：
+4. 标签构建通过后，工作流自动创建并发布名为 **Rust TUI Launcher v版本** 的 Release，只上传三个包：
    Windows x64 `.exe`、Linux x64 `.tar.gz`、macOS Universal `.tar.gz`。
    macOS 包包含通过 `lipo` 合并并检查的 Intel / Apple Silicon 双架构程序。
    任一平台失败，不会进入草稿创建阶段。
-5. 在 GitHub Releases 检查附件、说明和实测范围，再手动发布。
-   当前 macOS / Linux 实机以及微软登录仍待验收，建议首版保持预发布标记。
+5. 在 GitHub Releases 检查附件、说明和实测范围。
 
 普通 push / PR 只生成 Actions 构建附件，不创建 Release。
-失败重跑会先上传这三个包，成功后清除草稿中的其他附件；已公开的 Release 不会被该工作流覆盖。
-工作流仅在生成草稿的任务申请仓库写权限。
+失败重跑会先上传这三个包，成功后清除草稿中的其他附件；同一标签的 Release 可被工作流更新。
 
 GitHub 自动提供的 Source code 下载入口由平台生成，不属于工作流上传的附件。
 Linux ARM64 仍可自行源码构建，暂不提供单独的 Release 包。

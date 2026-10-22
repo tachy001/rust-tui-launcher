@@ -11,7 +11,7 @@ use crate::{
 use anyhow::{bail, Context, Result};
 use std::{path::Path, sync::mpsc, thread};
 
-const HELP: &str = "Tui-Launcher — Minecraft Java 终端启动器
+const HELP: &str = "Rust TUI Launcher — Minecraft Java 终端启动器
 
 不带命令进入交互界面。
   list                         列出本地版本

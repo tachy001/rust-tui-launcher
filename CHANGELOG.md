@@ -42,7 +42,7 @@
 
 ## 0.14.0
 
-项目对外名称调整为 Tui-Launcher，Cargo 包名与程序名统一为 `tui-launcher`。
+项目对外名称调整为 Rust TUI Launcher，GitHub 仓库统一为 `rust-tui-launcher`；程序文件名继续保持 `tui-launcher` 以兼容既有发布包与脚本。
 旧账户、实例元数据及凭证服务标识保持兼容。首页与使用指南、更新记录分离；
 增加统一发布打包脚本、SHA-256 校验文件和标签触发的 GitHub Release 草稿流程。
 

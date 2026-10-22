@@ -1,4 +1,4 @@
-name: Cross-platform build
+name: Rust TUI Launcher release
 
 on:
   push:
@@ -84,7 +84,7 @@ jobs:
           pattern: release-*
           path: dist
           merge-multiple: true
-      - name: Create or update latest release
+      - name: Create or update Rust TUI Launcher release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -108,7 +108,7 @@ jobs:
                   gh release delete-asset "$RELEASE_TAG" "$asset" --yes
                 fi
               done
-            gh release edit "$RELEASE_TAG" --draft=false --prerelease=false --latest
+            gh release edit "$RELEASE_TAG" --title "Rust TUI Launcher $RELEASE_TAG" --draft=false --prerelease=false --latest
           else
-            gh release create "$RELEASE_TAG" "${packages[@]}" --verify-tag --latest --generate-notes
+            gh release create "$RELEASE_TAG" "${packages[@]}" --verify-tag --latest --title "Rust TUI Launcher $RELEASE_TAG" --generate-notes
           fi

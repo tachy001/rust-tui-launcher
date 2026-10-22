@@ -1,4 +1,4 @@
-# Tui-Launcher
+# Rust TUI Launcher
 
 Rust 编写的 Minecraft Java 版终端启动器，使用 Ratatui + Crossterm。界面和后端分离，支持多语言界面和纯键盘操作。
 
@@ -63,7 +63,7 @@ Cargo.lock           固定依赖版本，需提交 Git
 ```
 
 `target/`、`.tools/`、`.tui-mc/`、游戏目录和本机配置不进入仓库或发布包。
-项目由 TUI / MC 更名为 Tui-Launcher；已有 `.tui-mc/`、`tui-mc-*`
+项目对外名称为 Rust TUI Launcher；已有 `.tui-mc/`、`tui-mc-*`
 数据文件名和系统凭证服务标识保持兼容，避免丢失账户或实例管理记录。
 
 ## 许可证与参考
