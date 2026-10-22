@@ -2,7 +2,7 @@ use crate::{metadata::safe_path, task::TaskControl};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
-use std::path::Path;
+use std::{fs, path::Path};
 
 pub(crate) struct BundledArtifact {
     name: &'static str,
