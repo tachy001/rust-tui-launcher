@@ -2,7 +2,7 @@ use crate::{metadata::safe_path, task::TaskControl};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
-use std::{fs, path::Path};
+use std::path::Path;
 
 pub(crate) struct BundledArtifact {
     name: &'static str,
@@ -57,6 +57,7 @@ impl BundledArtifact {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     #[test]
     fn discovery_bridge_contains_the_spi_registration_and_java_eight_class() {
         use std::io::Read;
