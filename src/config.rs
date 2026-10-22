@@ -13,6 +13,7 @@ pub struct InstanceSettings {
     pub fullscreen: Option<bool>,
     pub server: Option<String>,
     pub game_language: Option<String>,
+    pub patch_natives: Option<bool>,
 }
 #[cfg(test)]
 mod tests {
@@ -41,6 +42,7 @@ mod tests {
         assert!(config.server.is_empty());
         assert_eq!(config.language, "zh_cn");
         assert_eq!(config.game_language, "launcher");
+        assert!(config.patch_natives);
     }
     #[test]
     fn instance_overrides_do_not_modify_global_settings() {
@@ -164,7 +166,10 @@ pub struct Config {
     pub fullscreen: bool,
     pub server: String,
     pub game_language: String,
+    pub patch_natives: bool,
     pub language: String,
+    #[serde(skip)]
+    pub(crate) active_profile: Option<(String, serde_json::Value)>,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -187,7 +192,9 @@ impl Default for Config {
             fullscreen: false,
             server: String::new(),
             game_language: "launcher".into(),
+            patch_natives: true,
             language: "zh_cn".into(),
+            active_profile: None,
         }
     }
 }
@@ -261,8 +268,18 @@ impl Config {
     pub fn effective(&self, id: &str) -> Result<Self> {
         let source = crate::instance_config_service::FileInstanceConfigSource {
             game_dir: &self.game_dir,
+            profile: self
+                .active_profile
+                .as_ref()
+                .filter(|(target, _)| target == id)
+                .map(|(_, profile)| profile),
         };
         crate::instance_config_service::InstanceConfigResolver::new(self, &source).resolve(id)
+    }
+    pub(crate) fn with_profile(&self, id: &str, profile: &serde_json::Value) -> Self {
+        let mut config = self.clone();
+        config.active_profile = Some((id.into(), profile.clone()));
+        config
     }
     pub fn instance_dir(&self, id: &str) -> Result<PathBuf> {
         crate::metadata::valid_id(id)?;

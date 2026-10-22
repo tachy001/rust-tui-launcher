@@ -103,7 +103,13 @@ impl JavaVersion {
         self.preview
     }
     pub fn compare(&self, other: &Self) -> Ordering {
-        let release = (0..self.numbers.len().max(other.numbers.len()))
+        self.compare_release(other)
+            .then_with(|| other.preview.cmp(&self.preview))
+            .then_with(|| self.build.unwrap_or(0).cmp(&other.build.unwrap_or(0)))
+    }
+    /// Compatibility update boundaries apply to every vendor build of a release.
+    pub(crate) fn compare_release(&self, other: &Self) -> Ordering {
+        (0..self.numbers.len().max(other.numbers.len()))
             .map(|index| {
                 self.numbers
                     .get(index)
@@ -111,10 +117,7 @@ impl JavaVersion {
                     .cmp(other.numbers.get(index).unwrap_or(&0))
             })
             .find(|order| *order != Ordering::Equal)
-            .unwrap_or(Ordering::Equal);
-        release
-            .then_with(|| other.preview.cmp(&self.preview))
-            .then_with(|| self.build.unwrap_or(0).cmp(&other.build.unwrap_or(0)))
+            .unwrap_or(Ordering::Equal)
     }
 }
 impl std::fmt::Display for JavaVersion {

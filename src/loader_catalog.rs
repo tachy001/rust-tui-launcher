@@ -8,6 +8,7 @@ pub enum InstallerKind {
     Quilt,
     Forge,
     NeoForge,
+    OptiFine,
 }
 impl InstallerKind {
     pub fn name(self) -> &'static str {
@@ -16,6 +17,7 @@ impl InstallerKind {
             Self::Quilt => "Quilt",
             Self::Forge => "Forge",
             Self::NeoForge => "NeoForge",
+            Self::OptiFine => "OptiFine",
         }
     }
     pub fn parse(name: &str) -> Result<Self> {
@@ -24,7 +26,8 @@ impl InstallerKind {
             "quilt" => Ok(Self::Quilt),
             "forge" => Ok(Self::Forge),
             "neoforge" => Ok(Self::NeoForge),
-            _ => bail!("加载器应为 fabric / quilt / forge / neoforge"),
+            "optifine" => Ok(Self::OptiFine),
+            _ => bail!("组件应为 fabric / quilt / forge / neoforge / optifine"),
         }
     }
 }
@@ -34,7 +37,7 @@ pub struct LoaderVersion {
     pub stable: bool,
 }
 
-fn json_versions(value: Value) -> Result<Vec<LoaderVersion>> {
+pub(crate) fn json_versions(value: Value) -> Result<Vec<LoaderVersion>> {
     let mut result = vec![];
     for entry in value.as_array().context("加载器版本列表格式错误")? {
         let version = entry["loader"]["version"]
@@ -83,6 +86,14 @@ impl Backend {
     pub fn loader_versions(&self, kind: InstallerKind, game: &str) -> Result<Vec<LoaderVersion>> {
         valid_id(game)?;
         let versions = match kind {
+            InstallerKind::OptiFine => self
+                .optifine_versions(game)?
+                .into_iter()
+                .map(|version| LoaderVersion {
+                    version: version.identity.version(),
+                    stable: version.stable,
+                })
+                .collect(),
             InstallerKind::Fabric | InstallerKind::Quilt => {
                 let base = if matches!(kind, InstallerKind::Fabric) {
                     "https://meta.fabricmc.net/v2"
@@ -93,10 +104,12 @@ impl Backend {
                 url.path_segments_mut()
                     .map_err(|_| anyhow::anyhow!("无效 API 地址"))?
                     .extend(["versions", "loader", game]);
-                json_versions(self.get_json(url.as_str())?)?
+                self.cached_metadata(url.as_str(), |bytes| {
+                    json_versions(serde_json::from_slice(bytes)?)
+                })?
             }
             InstallerKind::Forge => maven_versions(
-                &self.text(
+                &self.maven_metadata(
                     "https://maven.minecraftforge.net/net/minecraftforge/forge/maven-metadata.xml",
                 )?,
                 &format!("{game}-"),
@@ -107,7 +120,7 @@ impl Backend {
                 } else {
                     "neoforge"
                 };
-                maven_versions(&self.text(&format!("https://maven.neoforged.net/releases/net/neoforged/{artifact}/maven-metadata.xml"))?,
+                maven_versions(&self.maven_metadata(&format!("https://maven.neoforged.net/releases/net/neoforged/{artifact}/maven-metadata.xml"))?,
                     &crate::forge::neoforge_prefix(game)?)?
             }
         };
@@ -124,6 +137,7 @@ impl Backend {
         version: Option<&str>,
     ) -> Result<String> {
         match kind {
+            InstallerKind::OptiFine => self.install_optifine(config, game, version),
             InstallerKind::Fabric => self.install_loader(config, Loader::Fabric, game, version),
             InstallerKind::Quilt => self.install_loader(config, Loader::Quilt, game, version),
             InstallerKind::Forge => self.install_forge(config, ForgeKind::Forge, game, version),

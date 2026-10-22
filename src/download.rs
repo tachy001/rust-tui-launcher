@@ -339,7 +339,7 @@ fn commit(partial: &Path, dest: &Path) -> Result<()> {
     fs::rename(partial, dest)?;
     Ok(())
 }
-fn cached(entry: &Download) -> Result<bool> {
+pub(crate) fn cached(entry: &Download) -> Result<bool> {
     if !entry.dest.is_file() {
         return Ok(false);
     }
@@ -356,7 +356,12 @@ fn cached(entry: &Download) -> Result<bool> {
     Ok(false)
 }
 pub fn valid_file(path: &Path, expected: Option<&str>, size: Option<u64>) -> Result<bool> {
-    if size.is_some_and(|size| fs::metadata(path).map(|m| m.len() != size).unwrap_or(true)) {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).context("无法读取文件校验信息"),
+    };
+    if !metadata.is_file() || size.is_some_and(|size| metadata.len() != size) {
         return Ok(false);
     }
     let Some(expected) = expected else {
@@ -378,6 +383,24 @@ pub fn valid_file(path: &Path, expected: Option<&str>, size: Option<u64>) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn file_validation_requires_a_real_file_even_without_hash_or_size() {
+        let workspace = crate::test_support::Workspace::new();
+        let missing = workspace.path.join("missing.bin");
+        assert!(!valid_file(&missing, None, None).unwrap());
+        assert!(!valid_file(&missing, Some(&"a".repeat(40)), None).unwrap());
+        assert!(!valid_file(&workspace.path, None, None).unwrap());
+        let file = workspace.path.join("file.bin");
+        fs::write(&file, b"abc").unwrap();
+        assert!(valid_file(&file, None, None).unwrap());
+        assert!(!valid_file(&file, None, Some(4)).unwrap());
+        assert!(valid_file(
+            &file,
+            Some("A9993E364706816ABA3E25717850C26C9CD0D89D"),
+            Some(3)
+        )
+        .unwrap());
+    }
     use std::net::TcpListener;
     fn planned_entry(hash: Option<&str>, size: Option<u64>) -> Download {
         Download {

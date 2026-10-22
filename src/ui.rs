@@ -307,7 +307,7 @@ impl App {
             5 => self.trash.len(),
             7 => INSTANCE_MENU.len(),
             8 => SETTINGS_MENU.len(),
-            9 => 4,
+            9 => 5,
             _ => 0,
         }
     }
@@ -592,7 +592,8 @@ impl App {
                 KeyCode::Char('u'),
                 KeyCode::Char('h'),
                 KeyCode::Char('n'),
-            ][self.selection.min(3)]
+                KeyCode::F(7),
+            ][self.selection.min(4)]
         } else {
             [
                 KeyCode::Enter,
@@ -1640,6 +1641,9 @@ impl App {
                 }
             }
             KeyCode::Char('f') if self.tab < 2 => self.install_loader(Loader::Fabric),
+            KeyCode::F(7) if self.tab < 2 => {
+                self.choose_loader(crate::loader_catalog::InstallerKind::OptiFine)
+            }
             KeyCode::Char('u') if self.tab < 2 => self.install_loader(Loader::Quilt),
             KeyCode::Char('h') if self.tab < 2 => {
                 self.install_forge(crate::forge::ForgeKind::Forge)
@@ -2037,7 +2041,7 @@ fn draw(f: &mut Frame, app: &App) {
                 8 => (tr("设置").into(), SETTINGS_MENU.to_vec()),
                 _ => (
                     tr("实例管理 › 加载器 / 组件").into(),
-                    vec!["Fabric", "Quilt", "Forge", "NeoForge"],
+                    vec!["Fabric", "Quilt", "Forge", "NeoForge", "OptiFine"],
                 ),
             };
             let items = labels

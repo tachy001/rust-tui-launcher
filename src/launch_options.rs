@@ -1,4 +1,4 @@
-use crate::{config::Config, metadata::arguments_with_features};
+use crate::config::Config;
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -80,7 +80,19 @@ pub fn server_address(input: &str) -> Result<Option<ServerAddress>> {
     Ok(Some(ServerAddress { host, port }))
 }
 
+#[cfg(test)]
 pub fn game_arguments(config: &Config, meta: &Value) -> Result<Vec<String>> {
+    game_arguments_for(
+        config,
+        meta,
+        &crate::platform_rule_service::PlatformRuleEvaluator::current(),
+    )
+}
+pub(crate) fn game_arguments_for(
+    config: &Config,
+    meta: &Value,
+    platform: &crate::platform_rule_service::PlatformRuleEvaluator<'_>,
+) -> Result<Vec<String>> {
     let server = server_address(&config.server)?;
     let modern = meta["arguments"]["game"].as_array().is_some_and(|items| {
         items.iter().any(|item| {
@@ -100,7 +112,7 @@ pub fn game_arguments(config: &Config, meta: &Value) -> Result<Vec<String>> {
     let mut args = if let Some(legacy) = meta["minecraftArguments"].as_str() {
         shlex::split(legacy).context("无法解析旧版启动参数")?
     } else {
-        arguments_with_features(&meta["arguments"]["game"], &features)
+        crate::metadata::arguments_for(&meta["arguments"]["game"], &features, platform)
     };
     if !args.iter().any(|arg| arg == "--width") {
         args.extend(["--width".into(), config.width.to_string()]);

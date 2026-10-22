@@ -252,6 +252,11 @@ mod tests {
     fn every_catalog_preserves_template_arguments() {
         let english = UiLanguage::English.catalog();
         for language in UiLanguage::ALL {
+            assert_eq!(
+                language.catalog().len(),
+                english.len(),
+                "incomplete built-in catalog: {language:?}"
+            );
             for (key, value) in language.catalog() {
                 assert!(english.contains_key(key), "unknown key: {language:?} {key}");
                 assert!(!value.trim().is_empty(), "empty value: {language:?} {key}");

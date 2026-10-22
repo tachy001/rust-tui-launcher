@@ -138,4 +138,85 @@ RuntimeGeneration 采用独立 `.pending-<manifest hash>` 目录准备，复用�
 
 参考链接：[SupportedLocale](https://github.com/HMCL-dev/HMCL/blob/main/HMCL/src/main/java/org/jackhuang/hmcl/util/i18n/SupportedLocale.java)、[I18n](https://github.com/HMCL-dev/HMCL/blob/main/HMCL/src/main/java/org/jackhuang/hmcl/util/i18n/I18n.java)、[HMCLGameLauncher](https://github.com/HMCL-dev/HMCL/blob/main/HMCL/src/main/java/org/jackhuang/hmcl/game/HMCLGameLauncher.java)。
 
-追加核对 HMCL/src/main/resources/assets/lang/I18N*.properties：本地快照共有基础英语与 zh_Hans、zh_Hant、ja、de、es、ru、uk、ar、lzh 共十份资源。项目增加对应十种语言的独立 JSON 资源，新增八种语言目前仅主要界面译文，不视为达到 HMCL 的翻译完整度；缺项按英语回退，选择器展示真实条数。文言文低于 1.16 回退简中，来自 normalizedLanguageTag 的版本处理。资源为针对本项目文案重新编写，没有复制 HMCL 的 properties 或翻译内容。
+追加核对 HMCL/src/main/resources/assets/lang/I18N*.properties：本地快照共有基础英语与 zh_Hans、zh_Hant、ja、de、es、ru、uk、ar、lzh 共十份资源。项目对应十种语言的独立 JSON 资源现均包含本项目当前目录的 220 条文案，不视为达到 HMCL 全部功能和翻译完整度；缺项按英语回退，选择器展示真实条数。SupportedLocale.isExperimentalSupported 将阿拉伯语列为实验支持；本项目同样保留终端 RTL 未验收说明。文言文低于 1.16 回退简中，来自 normalizedLanguageTag 的版本处理。资源为针对本项目文案重新编写，没有复制 HMCL 的 properties 或翻译内容。
+
+## JVM 架构与目标依赖（2026-10-22）
+
+本批实际读取本地 PCL-main/PCLCS/Java.cs 的 CheckAsync：使用 -XshowSettings:properties -version、15 秒超时与取消，读取属性；当前 PCL 直接拒绝没有 64-bit 标记的 Java。读取 HMCL-main/HMCL/src/main/java/org/jackhuang/hmcl/java/JavaManager.java 的架构兼容判断和 findSuitableJava：区分系统 / 当前架构及 JVM 架构，识别部分 Windows、Linux x86 兼容与 macOS Rosetta；自动候选偏好系统架构，ARM 上极旧游戏有 x86 特例。
+
+本项目借鉴一次属性探测与区分 JVM 目标，解析 os.arch 及可选位数属性，不复制 PCL 的统一禁用 32 位策略。目标规则、native 分类和参数均来自所选 JVM；同主版本优先启动器编译架构，显式路径保留。与 HMCL 仍有差距：未探测独立物理宿主架构 / 仿真能力，没有移植极旧版本强制 x86 或 ARM native 替换。探测成功只表明该 JVM 可运行属性查询，不证明游戏 native ABI 兼容。
+
+## ARM64 native 替换与旧格式库解析（2026-10-22）
+
+本轮实际阅读 HMCL/src/main/java/org/jackhuang/hmcl/util/NativePatcher.java 的 getNatives、patchNative、checkSupportedStatus，及 HMCL/src/main/resources/assets/natives.json 的 linux-arm64、macos-arm64、windows-arm64 数据。核对 LWJGL API / native 配套替换、1.19+ Windows / macOS 官方 ARM 边界、Sodium issue2561 属性，以及 null 表示禁用而非未知的区别。另阅读 HMCLCore 的 Library.isNative / classifier 和 JavaVersionConstraint 中 VANILLA_LINUX_JAVA_8、VANILLA_X86 的边界说明；这些 Java 限制本轮没有全部移植。
+
+阅读 PCL-main/Plain Craft Launcher 2/Modules/Minecraft/ModMinecraft.vb 的 McLibListGet 中 ordinary / natives 分支：没有普通下载 artifact 的 native 条目不需要额外的普通 JAR，库的 null 可选属性会被移除。LibraryResolver 据此修正旧格式 native-only 的多余下载，保留显式 artifact + classifier 组合。
+
+本项目原创 Rust NativePatchService / NativePatchCatalog / NativeArtifact 分离策略与目录数据，以标准依赖形式接入既有下载和解压。assets/native-patches.json 重新组织上述三个目标的 187 项 Maven 替换 / 禁用关系及 83 项去重下载事实（坐标、URL、SHA-1、大小和解压方式），不包含 HMCL Java 代码；来源记录在 assets/NATIVE-PATCHES.md。没有盲目按名称拼接未提供的 ARM 下载地址。
+
+差异：本项目把合并的 artifact / native 分别匹配，禁用 native 时保留显式 Java API；保留用户显式 ARM64 同坐标 native 及其 API。LWJGL API 改变时预置 Sodium 属性，无 Sodium 时不生效，不像 HMCL 先扫描 Mod。未实现 HMCL 自定义 natives 目录、系统 OpenAL / GLFW、其他架构目录、渲染器及 Java agent 补丁。当前仅本地验证目录和接入，没有宣称 ARM 真机或全部真实工件校验完成。
+
+## Forge 旧 / 中间格式与内置库（2026-10-22）
+
+实际阅读本地 HMCLCore/src/main/java/org/jackhuang/hmcl/download/forge/ForgeOldInstallTask.java：读取 install_profile.json 的 install / versionInfo，将 install.filePath 内置 JAR 写到 install.path 的 Maven 位置，返回版本补丁并继续依赖补全。另阅读 ForgeInstallProfile / ForgeInstall 的字段、ForgeInstallTask 的格式判断与 ForgeNewInstallTask 中的 processor 执行段。
+
+实际阅读 PCL-main/Plain Craft Launcher 2/Pages/PageDownload/ModDownloadLib.vb 中 McDownloadForgelikeLoader 的非新版安装分支：Legacy 方式 1 读取 json 字段指向的版本描述并复制 maven/ 支持库；方式 2 提取 install.filePath 到 install.path，补 inheritsFrom 并保存 versionInfo。由此补上“只有 spec: 0、没有 install”的中间格式，避免把同为 1.12.2 的安装包一律当成旧 universal 或新版处理器包。
+
+本项目用原创 Rust ForgeInstallerPlan / DirectForgePlan / InstallerArtifactService 实现结构分流、受限读取与标准依赖发布；额外加入固定安装器来源及条目恢复记录、内容校验和共享文件锁，接入既有安装草稿。没有复制 Java / VB 实现；未复制 HMCL 全部 processor / 游戏补丁模型，也未采用 PCL 的整个归档解压到工作目录方式。
+
+实际只读核对四份官方安装包：Forge 1.7.10-10.13.4.1614-1.7.10（install / versionInfo）、Forge 1.12.2-14.23.5.2859（spec: 0 / maven）、Forge 1.21.1-52.1.20 与 NeoForge 21.1.264（保留官方安装器路径）。前两份本轮从官方 Maven 获取并核对 SHA-1，后两份使用已有本地缓存，检查过程中未执行安装器。真实包结构 / 内置 JAR 解析证据不等于已完成真实安装或启动游戏。
+
+## 安装器 Java 与 JAR 入口（2026-10-22）
+
+实际阅读 PCL-main/Plain Craft Launcher 2/Pages/PageDownload/ModDownloadLib.vb 的 ForgelikeInjector：为其自定义 com.bangbang93.ForgeInstaller 辅助入口选择至少 Java 8u60，并与 JavaWrapper 组合执行。HMCLCore ForgeNewInstallTask 为 processor 读取 JAR Main-Class，使用自身默认 Java 组成独立进程命令。两者都说明安装工具的 Java 选择有独立上下文；本项目直接执行官方安装器，不能无依据照搬 PCL 自定义辅助程序的 8u60 更新号。
+
+新增 RunnableJarSource / JarEntryPointSource 与 InstallerJavaRequirement / InstallerJavaService，以实际入口 class 下限配合游戏要求，并为补装指定满足安装器需求的已知 Java 主版本。只读检查本地 Forge 1.21.1-52.1.20、NeoForge 21.1.264，二者 SimpleInstaller 基础入口均为 Java 8 字节码；游戏仍要求 Java 21。保留这一事实区别，不把入口 Java 8 等同于整个安装链可用 Java 8。
+
+清单主段、Main-Class、续行参考 [JAR 文件规范](https://docs.oracle.com/en/java/javase/17/docs/specs/jar/jar.html)；class 主次版本及预览标记参考 [JVMS 第 4 章](https://docs.oracle.com/javase/specs/jvms/se23/html/jvms-4.html)。实现只读基础入口，不采用构建 JDK 字段推断运行最低版本，也不移植任意外部 Class-Path 或全量 Multi-Release 选择。
+
+另实际检查当前依赖 zip 2.6.1 的 src/read.rs：SharedBuilder.build 把 Vec 插入 IndexMap，file_names 只返回其 keys，同名项在此消失。本轮增加原始中央目录记录计数与解析后名称表长度比较，并以人工构造的重名 ZIP 验证，修正之前计数式“重复条目检查”实际上不成立的问题。此检查现共用于安装描述、内置库恢复和 Java 入口读取。
+
+
+## Forge 的 Java 更新号与候选筛选（2026-10-22）
+
+实际重新阅读本地 PCL-main/Plain Craft Launcher 2/Modules/Minecraft/ModJava.vb::GetJavaRequirement，重点是 Forge 34.0.0–36.2.25 的 Java 8u320 上限，以及 36.2.26、37.0.79、45.0.21 / 45.0.65 / 45.0.66、47.4.8 的范围边界。同步阅读 HMCLCore/src/main/java/org/jackhuang/hmcl/game/JavaVersionConstraint.java：GAME_JSON、MODDED_JAVA_7 / 8 / 16 / 17、VANILLA_JAVA_8_51 等，核对强制规则与建议规则的差异。
+
+本批只采用 PCL 已明确限定的五段 Forge 上限，并将完整 JavaRequirement 下沉至自动候选选择，保留已有 HMCL LaunchWrapper 上限与 PCL Fabric 限制；不将 HMCL 的所有建议直接提升为硬限制。Forge 身份依靠启用库坐标及实际入口，不依赖用户重命名后的实例 ID。未知后缀、范围外的新 Forge 不自动套用上限。
+
+JavaVersion 对兼容范围只比较发行数字，厂商 build 仍用于同范围的优先排序。修复新更新被拒绝后不再检查其他已安装 Java 的漏洞；“安装建议 Java”也在返回前检查完整约束。PCL 用户自定义范围、自动获取特定旧 JRE、JVM 架构与剩余历史加载器规则尚未移植或验收。
+
+
+## 缺省 Java 元数据与客户端内置版本（2026-10-22）
+
+实际阅读本地 HMCLCore/src/main/java/org/jackhuang/hmcl/game/GameJavaVersion.java::getMinimumJavaVersion：1.17 → 16、1.18 → 17、1.20.5 → 21、26.1 → 25；GameVersion.java::getVersionFromJson / minecraftVersion 从 JAR version.json 读 id，并去掉“ / ”之后的发行修饰。PCL ModMinecraft.vb::McInstance.JsonVersion 从版本 JAR 读取 version.json；ModJava.vb::GetJavaRequirement 读取 java_version / java_component，并以 2021-05-11、2021-11-16、2024-04-02 作为缺乏有效游戏版本号时的 Java 下限切换点。
+
+本项目新增 GameJavaResolver 与可替换 ClientVersionSource：显式启动元数据优先，缺省时读取实际 resolved.jar_id 对应客户端，继承与重命名不改变 JAR 归属。采用上述版本边界与客户端字段，另读取固定 vanilla Main.class 前 8 字节作为运行时最低版本证据，防止缺失 / 偏低的推断值低于实际字节码要求；此增强不是复制 HMCL 的类常量扫描。对于损坏 / 无法读取的已有 JAR，本项目明确要求修复，区别于 HMCL 部分识别失败后记录警告再尝试其他历史识别方法。
+
+读取有长度和取消检查；已知组件与推断主版本不一致时报错，高版本已知组件可提高缺省要求。没有移植历史 SHA-1 / 类常量映射、全部快照、系统架构选择与所有模组发行版规则。测试仅使用本地 ZIP 与模拟提供者，不是历史 Minecraft 运行验收。
+
+
+## 公开元数据缓存与备用来源（2026-10-22）
+
+实际读取 HMCLCore/.../task/FetchTask.java 中的 CacheRepository、304 NOT_MODIFIED / useCachedResult、缓存失效后移除记录并重新请求的路径，以及 download/quilt/QuiltInstallTask.java 中对 launchMetaTask 设置缓存仓库的调用。实际读取 PCL ModDownload.vb 的 DlClientListBmclapiMain 和 DlVersionListOrder：要求有效版本列表，检查请求的目标版本是否存在，并控制官方与镜像源顺序。
+
+本项目将网络来源与持久化分为 MetadataSource / MetadataStore，MetadataCache 负责校验后保存和失败回退。业务校验位于每个来源的尝试内部，因此 HTTP 成功但业务数据不可用会继续尝试备用来源。按 PCL 的目标版本存在性检查强化 remote_version，未照搬“列表至少 200 项”的固定数量；增加逐项 ID / URL / SHA-1 和重复 ID 检查，以支持独立小型夹具及未来列表格式。
+
+HMCL 的 HTTP 条件缓存仅作为缓存接入与失效处理参考，未宣称实现其 ETag / 304 全流程。本项目当前为每次联网优先、失败后复用同请求的经验证旧数据，写缓存失败仅记录警告并保留实时结果。缓存包含版本目录、四种加载器的公开准备元数据、安装器 SHA-1 和 Java 组件目录，不包含认证。真实断网安装、条件请求、过期 / 容量管理仍待完成。
+
+
+## 安装草稿与延迟发布（2026-10-22）
+
+实际读取本地 HMCLCore/src/main/java/org/jackhuang/hmcl/download/game/GameInstallTask.java：下载基础组件返回 GameInstancePatch，不直接发布仓库状态，客户端下载及资源 / 库准备由依赖任务完成；FabricInstallTask.java 同样先形成 patch 并追加 GameLibrariesTask。DefaultDependencyManager.java::updateInstanceAsync 明确要求实例 ID 保持一致，客户端下载先进入 cache / draft，任务失败中止草稿并保留已发布文件，共享缓存保留；它不更新引用的其他实例客户端。
+
+本项目将原版 / Fabric / Quilt 的正式 JSON 写入延迟到准备完成，新增只读候选继承解析和 InstanceDraft。客户端沿用标准 versions/id/id.jar 布局，以保持官方 Forge 安装器的路径兼容；普通提交异常时通过旧客户端备份回滚，下载暂存保留以供重试。引用的父客户端只允许校验复用，父版本须先修复。个人设置通过独立文件与仅内存候选快照保留。
+
+没有复制 HMCL 仓库 draft 实现，也不声称拥有其完整事务特性：本项目尚无持久恢复日志，不保证断电时 JAR 与 JSON 一起提交，尚未处理整个共享缓存 / 玩家目录的事务回滚，以及官方 Forge / NeoForge 安装器的输出回滚。此前对 PCL 下载源排序 / 取消的对照继续保留，本批具体草稿机制主要参考上述 HMCL 符号。
+
+
+## 提交恢复与读取保护（2026-10-22）
+
+实际重新阅读 HMCLCore/src/main/java/org/jackhuang/hmcl/game/DefaultGameRepositoryDraft.java::commit / applyPrimaryJar / applyManifest 相关路径。它记录 AppliedFile，先应用客户端，再应用配置，异常时用 backupFile 恢复；这是本项目客户端 / 配置提交顺序和普通回滚的行为依据。
+
+本项目在该行为之上新增自己的持久恢复协议，不宣称 HMCL 使用相同日志格式：固定实例目录内的 .tui-mc-install-journal.json 保存 schema、实例 ID、暂存指纹与文件指纹，旧配置放在所属暂存目录备份。按实际文件状态判断提交已完成或应回滚，恢复可重复执行，遇到未知编辑则保留现场。没有借用 HMCL / PCL 的发行标识、凭证或代码实现。
+
+版本解析改为每个节点上锁后再读。启动对父版本共享读取，对需恢复的父版本先取得独占锁恢复并重新取得共享锁；显式 jar 引用的归属也受保护。验证包含辅助 Rust 子进程退出和锁释放，不包含真实断电或 Minecraft 运行，不能将进程退出恢复等同于所有存储故障均可恢复。

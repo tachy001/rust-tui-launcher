@@ -22,6 +22,8 @@ const HELP: &str = "Tui-Launcher — Minecraft Java 终端启动器
   quilt <版本> [加载器版本]    安装 Quilt
   forge <版本> [加载器版本]    使用官方安装器安装 Forge
   neoforge <版本> [加载器版本] 使用官方安装器安装 NeoForge
+  optifine <版本> [HD_U_发布号] 安装在线 OptiFine
+  optifine-local <父实例> <安装包JAR> [新实例ID]  从本地安装包安装或混装 OptiFine
   loader-versions <类型> <游戏版本>  列出 Fabric / Quilt / Forge / NeoForge 版本
   launch <实例>                启动，Ctrl+C 终止游戏
   show <实例>                  查看解析后的版本信息
@@ -65,6 +67,7 @@ const HELP: &str = "Tui-Launcher — Minecraft Java 终端启动器
   --memory <MB>  --threads <1-16>  --shared  --isolated
   --source <official|bmclapi|HTTPS根地址>  --no-optional
   --fullscreen / --windowed  --server <主机[:端口]>  --no-server
+  --native-patches / --no-native-patches（启动时 ARM 原生库兼容替换）
   --language <launcher / zh_cn / zh_tw / en_us / keep>  启动前同步游戏语言
   --ui-language <代码>  zh_cn / en_us / zh_tw / ja_jp / de_de / es_es / ru_ru / uk_ua / ar_sa / lzh
 ";
@@ -78,6 +81,7 @@ fn parse(mut config: Config, raw: Vec<String>) -> Result<Options> {
     let mut snapshots = false;
     let mut fullscreen_override = None;
     let mut server_override = None;
+    let mut native_patches_override = None;
     let mut language_override = None;
     let mut iter = raw.into_iter();
     while let Some(arg) = iter.next() {
@@ -123,6 +127,10 @@ fn parse(mut config: Config, raw: Vec<String>) -> Result<Options> {
                 config.server.clear();
                 server_override = Some(String::new());
             }
+            "--native-patches" | "--no-native-patches" => {
+                config.patch_natives = arg == "--native-patches";
+                native_patches_override = Some(config.patch_natives);
+            }
             "--language" => {
                 config.game_language = iter.next().context("--language 缺少语言代码")?;
                 language_override = Some(config.game_language.clone());
@@ -139,6 +147,9 @@ fn parse(mut config: Config, raw: Vec<String>) -> Result<Options> {
             }
             if let Some(server) = server_override {
                 instance.server = Some(server);
+            }
+            if let Some(enabled) = native_patches_override {
+                instance.patch_natives = Some(enabled);
             }
             if let Some(language) = language_override {
                 instance.game_language = Some(language);
@@ -590,6 +601,26 @@ pub fn run(config: Config, raw: Vec<String>) -> Result<()> {
                 )?;
                 println!("实例已安装：{id}");
             }
+            "optifine" => {
+                if !(2..=3).contains(&args.len()) {
+                    bail!("用法：optifine <游戏版本> [HD_U_发布号]");
+                }
+                let id =
+                    backend.install_optifine(&config, &args[1], args.get(2).map(String::as_str))?;
+                println!("实例已安装：{id}");
+            }
+            "optifine-local" => {
+                if !(3..=4).contains(&args.len()) {
+                    bail!("用法：optifine-local <父实例> <安装包JAR> [新实例ID]");
+                }
+                let id = backend.install_optifine_local(
+                    &config,
+                    &args[1],
+                    Path::new(&args[2]),
+                    args.get(3).map(String::as_str),
+                )?;
+                println!("实例已安装：{id}");
+            }
             "forge" | "neoforge" => {
                 if !(2..=3).contains(&args.len()) {
                     bail!("用法：{} <游戏版本> [加载器版本]", args[0]);
@@ -638,14 +669,21 @@ mod tests {
         );
         let options = parse(
             config,
-            ["launch", "test", "--windowed", "--no-server"]
-                .into_iter()
-                .map(str::to_owned)
-                .collect(),
+            [
+                "launch",
+                "test",
+                "--windowed",
+                "--no-server",
+                "--no-native-patches",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
         )
         .unwrap();
         let effective = options.config.effective("test").unwrap();
         assert!(!effective.fullscreen);
+        assert!(!effective.patch_natives);
         assert!(effective.server.is_empty());
         let options = parse(
             Config::default(),
@@ -660,6 +698,18 @@ mod tests {
             options.config.effective("test").unwrap().server,
             "[::1]:25566"
         );
+        let mut saved = Config::default();
+        saved
+            .instances
+            .entry("test".into())
+            .or_default()
+            .patch_natives = Some(false);
+        let options = parse(
+            saved,
+            vec!["launch".into(), "test".into(), "--native-patches".into()],
+        )
+        .unwrap();
+        assert!(options.config.effective("test").unwrap().patch_natives);
     }
     #[test]
     fn language_flags_override_instance_and_reject_invalid_values() {

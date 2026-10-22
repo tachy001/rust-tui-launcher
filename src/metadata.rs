@@ -73,12 +73,25 @@ pub fn allowed_with_features(
 ) -> bool {
     crate::platform_rule_service::PlatformRuleEvaluator::current().allowed(item, features)
 }
+#[cfg(test)]
 pub fn arguments(value: &Value) -> Vec<String> {
     arguments_with_features(value, &std::collections::HashMap::new())
 }
+#[cfg(test)]
 pub fn arguments_with_features(
     value: &Value,
     features: &std::collections::HashMap<&str, bool>,
+) -> Vec<String> {
+    arguments_for(
+        value,
+        features,
+        &crate::platform_rule_service::PlatformRuleEvaluator::current(),
+    )
+}
+pub(crate) fn arguments_for(
+    value: &Value,
+    features: &std::collections::HashMap<&str, bool>,
+    platform: &crate::platform_rule_service::PlatformRuleEvaluator<'_>,
 ) -> Vec<String> {
     value
         .as_array()
@@ -89,7 +102,7 @@ pub fn arguments_with_features(
                     if let Some(s) = item.as_str() {
                         return vec![s.to_owned()];
                     }
-                    if !allowed_with_features(item, features) {
+                    if !platform.allowed(item, features) {
                         return vec![];
                     }
                     match &item["value"] {

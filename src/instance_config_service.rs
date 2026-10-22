@@ -16,6 +16,7 @@ pub(crate) trait InstanceConfigSource {
 }
 pub(crate) struct FileInstanceConfigSource<'a> {
     pub(crate) game_dir: &'a Path,
+    pub(crate) profile: Option<&'a serde_json::Value>,
 }
 impl FileInstanceConfigSource<'_> {
     fn read_optional<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
@@ -36,8 +37,10 @@ impl InstanceConfigSource for FileInstanceConfigSource<'_> {
         crate::metadata::valid_id(id)?;
         let dir = self.game_dir.join("versions").join(id);
         let info: Option<InstanceInfo> = Self::read_optional(&dir.join("tui-mc-instance.json"))?;
-        let profile: Option<serde_json::Value> =
-            Self::read_optional(&dir.join(format!("{id}.json")))?;
+        let profile: Option<serde_json::Value> = match self.profile {
+            Some(value) => Some(value.clone()),
+            None => Self::read_optional(&dir.join(format!("{id}.json")))?,
+        };
         if profile.as_ref().is_some_and(|value| !value.is_object()) {
             anyhow::bail!(
                 "实例版本配置必须为 JSON 对象：{}",
@@ -83,6 +86,9 @@ impl InstanceSettings {
         }
         if let Some(language) = &self.game_language {
             config.game_language = language.clone();
+        }
+        if let Some(enabled) = self.patch_natives {
+            config.patch_natives = enabled;
         }
     }
 }
@@ -145,6 +151,7 @@ mod tests {
             "test".into(),
             InstanceSettings {
                 fullscreen: Some(false),
+                patch_natives: Some(false),
                 server: Some(String::new()),
                 isolated: Some(false),
                 ..Default::default()
@@ -155,6 +162,7 @@ mod tests {
             .unwrap();
         assert_eq!(effective.memory_mb, 4096);
         assert!(!effective.fullscreen);
+        assert!(!effective.patch_natives);
         assert!(!effective.isolated);
         assert!(effective.server.is_empty());
         assert_eq!(config.memory_mb, 2048);

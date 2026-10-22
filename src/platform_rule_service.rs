@@ -52,6 +52,9 @@ impl<'a> PlatformRuleEvaluator<'a> {
             &HostVersion,
         )
     }
+    pub(crate) fn for_java(arch: &'static str) -> PlatformRuleEvaluator<'static> {
+        PlatformRuleEvaluator::new(crate::metadata::os_name(), arch, &HostVersion)
+    }
     fn aliases(&self) -> &[&str] {
         match self.arch {
             "x86_64" | "amd64" | "x64" | "x86-64" => &["x86_64", "amd64", "x64", "x86-64"],

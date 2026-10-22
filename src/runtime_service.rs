@@ -6,12 +6,132 @@ use serde_json::Value;
 pub struct JavaRequirement {
     recommended: u64,
     maximum: Option<JavaCeiling>,
+    profile: Option<Value>,
 }
 struct JavaCeiling {
     major: u64,
+    release: Option<crate::java_version::JavaVersion>,
     component: &'static str,
 }
+impl JavaCeiling {
+    fn major(major: u64, component: &'static str) -> Self {
+        Self {
+            major,
+            release: None,
+            component,
+        }
+    }
+    fn allows(&self, runtime: &JavaRuntime) -> bool {
+        runtime.major() <= self.major
+            && self.release.as_ref().is_none_or(|release| {
+                runtime.version.compare_release(release) != std::cmp::Ordering::Greater
+            })
+    }
+    fn limit(&self) -> String {
+        self.release
+            .as_ref()
+            .map_or_else(|| self.major.to_string(), ToString::to_string)
+    }
+    fn stricter_than(&self, other: &Self) -> bool {
+        self.major < other.major
+            || (self.major == other.major
+                && match (&self.release, &other.release) {
+                    (Some(first), Some(second)) => {
+                        first.compare_release(second) == std::cmp::Ordering::Less
+                    }
+                    (Some(_), None) => true,
+                    _ => false,
+                })
+    }
+}
 impl JavaRequirement {
+    fn restrict(&mut self, ceiling: JavaCeiling) {
+        if self
+            .maximum
+            .as_ref()
+            .is_none_or(|current| ceiling.stricter_than(current))
+        {
+            self.maximum = Some(ceiling);
+        }
+    }
+    fn forge_ceiling(meta: &Value) -> Result<Option<JavaCeiling>> {
+        if !matches!(
+            meta["mainClass"].as_str(),
+            Some("cpw.mods.modlauncher.Launcher" | "cpw.mods.bootstraplauncher.BootstrapLauncher")
+        ) {
+            return Ok(None);
+        }
+        let mut found = None;
+        for library in meta["libraries"].as_array().into_iter().flatten() {
+            if !crate::metadata::allowed(library) {
+                continue;
+            }
+            let Some(name) = library["name"].as_str() else {
+                continue;
+            };
+            let (coordinate, extension) = name.split_once('@').unwrap_or((name, "jar"));
+            if extension != "jar" {
+                continue;
+            }
+            let parts: Vec<_> = coordinate.split(':').collect();
+            if !(3..=4).contains(&parts.len())
+                || parts[0] != "net.minecraftforge"
+                || !matches!(
+                    parts[1],
+                    "forge" | "fmlloader" | "fmlcore" | "javafmllanguage" | "mclanguage"
+                )
+            {
+                continue;
+            }
+            let text = match parts[2].split_once('-') {
+                Some((game, forge))
+                    if game.starts_with("1.")
+                        && game.split('.').all(|part| {
+                            !part.is_empty() && part.bytes().all(|c| c.is_ascii_digit())
+                        }) =>
+                {
+                    forge
+                }
+                Some(_) => continue,
+                None => parts[2],
+            };
+            let Ok(numbers) = text
+                .split('.')
+                .map(str::parse::<u64>)
+                .collect::<std::result::Result<Vec<_>, _>>()
+            else {
+                continue;
+            };
+            let Ok(version): std::result::Result<[u64; 3], _> = numbers.try_into() else {
+                continue;
+            };
+            if found.is_some_and(|previous| previous != version) {
+                bail!("当前平台包含互相冲突的 Forge 版本，请修复实例依赖");
+            }
+            found = Some(version);
+        }
+        let Some(version) = found else {
+            return Ok(None);
+        };
+        let ceiling = if ([34, 0, 0]..=[36, 2, 25]).contains(&version) {
+            JavaCeiling {
+                major: 8,
+                release: Some(crate::java_version::JavaVersion::parse("8u320")?),
+                component: "Forge 34.0.0–36.2.25",
+            }
+        } else if ([36, 2, 26]..[37, 0, 0]).contains(&version) {
+            JavaCeiling::major(23, "Forge 36.2.26–36.x")
+        } else if ([37, 0, 0]..=[37, 0, 79]).contains(&version) {
+            JavaCeiling::major(16, "Forge 37.0.0–37.0.79")
+        } else if ([45, 0, 21]..=[45, 0, 65]).contains(&version) {
+            JavaCeiling::major(19, "Forge 45.0.21–45.0.65")
+        } else if ([45, 0, 66]..=[47, 4, 8]).contains(&version) {
+            JavaCeiling::major(21, "Forge 45.0.66–47.4.8")
+        } else {
+            return Ok(None);
+        };
+        Ok(Some(ceiling))
+    }
     fn library_version(library: &Value, group: &str, artifact: &str) -> Option<Vec<u64>> {
         if !crate::metadata::allowed(library) {
             return None;
@@ -34,6 +154,22 @@ impl JavaRequirement {
             .ok()
     }
     pub fn from_metadata(meta: &Value) -> Result<Self> {
+        // A host-only conflict must not discard a valid JVM target (e.g. Rosetta).
+        // Unconditional malformed metadata / incompatible limits still fail here.
+        let mut requirement = match Self::from_profile(meta) {
+            Ok(requirement) => requirement,
+            Err(host_error) => crate::java_architecture::JavaArchitecture::ALL
+                .into_iter()
+                .find_map(|arch| {
+                    let profile = crate::launch_platform::LaunchPlatform::new(arch).profile(meta);
+                    Self::from_profile(&profile).ok()
+                })
+                .ok_or(host_error)?,
+        };
+        requirement.profile = Some(meta.clone());
+        Ok(requirement)
+    }
+    fn from_profile(meta: &Value) -> Result<Self> {
         let recommended = match meta.pointer("/javaVersion/majorVersion") {
             None => 8,
             Some(value) => value
@@ -73,33 +209,36 @@ impl JavaRequirement {
                 )
             })
         });
-        let maximum = if legacy_wrapper {
-            Some(JavaCeiling {
-                major: 8,
-                component: "旧 LaunchWrapper",
-            })
-        } else if old_fabric {
-            Some(JavaCeiling {
-                major: 24,
-                component: "Fabric Loader 0.17.0 之前的版本",
-            })
-        } else {
-            None
+        let mut requirement = Self {
+            recommended,
+            maximum: None,
+            profile: None,
         };
-        if let Some(maximum) = &maximum {
+        if legacy_wrapper {
+            requirement.restrict(JavaCeiling::major(8, "旧 LaunchWrapper"));
+        }
+        if old_fabric {
+            requirement.restrict(JavaCeiling::major(24, "Fabric Loader 0.17.0 之前的版本"));
+        }
+        if let Some(ceiling) = Self::forge_ceiling(meta)? {
+            requirement.restrict(ceiling);
+        }
+        if let Some(maximum) = &requirement.maximum {
             if recommended > maximum.major {
                 bail!("版本 Java 要求冲突：元数据要求 Java {recommended}，{} 最高支持 Java {}；请升级加载器或修正实例配置", maximum.component, maximum.major);
             }
         }
-        Ok(Self {
-            recommended,
-            maximum,
-        })
+        Ok(requirement)
     }
     pub fn recommended(&self) -> u64 {
         self.recommended
     }
-    fn check(&self, runtime: JavaRuntime) -> Result<JavaRuntime> {
+    fn check_runtime(&self, runtime: &JavaRuntime) -> Result<()> {
+        if let Some(profile) = &self.profile {
+            let profile =
+                crate::launch_platform::LaunchPlatform::new(runtime.architecture).profile(profile);
+            return Self::from_profile(&profile)?.check_runtime(runtime);
+        }
         if runtime.major() < self.recommended {
             bail!(
                 "需要 Java {}，当前 Java {}",
@@ -108,23 +247,48 @@ impl JavaRequirement {
             );
         }
         if let Some(maximum) = &self.maximum {
-            if runtime.major() > maximum.major {
+            if !maximum.allows(runtime) {
                 bail!(
                     "{} 不兼容 Java {}，最高支持 Java {}；建议为此实例使用 Java {}",
                     maximum.component,
-                    runtime.major(),
-                    maximum.major,
+                    runtime.version,
+                    maximum.limit(),
                     self.recommended
                 );
             }
         }
+        Ok(())
+    }
+    pub(crate) fn check(&self, runtime: JavaRuntime) -> Result<JavaRuntime> {
+        self.check_runtime(&runtime)?;
         Ok(runtime)
+    }
+    pub(crate) fn choose(&self, runtimes: Vec<JavaRuntime>) -> Result<JavaRuntime> {
+        let mut first_error = None;
+        let compatible = runtimes
+            .into_iter()
+            .filter(|runtime| match self.check_runtime(runtime) {
+                Ok(()) => true,
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                    false
+                }
+            })
+            .collect();
+        crate::java::choose(compatible, self.recommended).with_context(|| match first_error {
+            Some(error) => format!(
+                "本机没有满足 Java {} 与目标平台加载器要求的运行时：{error:#}",
+                self.recommended
+            ),
+            None => format!("本机没有满足 Java {} 要求的运行时", self.recommended),
+        })
     }
     #[cfg(test)]
     fn minimum(recommended: u64) -> Self {
         Self {
             recommended,
             maximum: None,
+            profile: None,
         }
     }
 }
@@ -134,7 +298,7 @@ pub trait JavaRuntimeSource {
     fn check_task(&self) -> Result<()> {
         Ok(())
     }
-    fn select(&self, config: &Config, required: u64) -> Result<JavaRuntime>;
+    fn select(&self, config: &Config, requirement: &JavaRequirement) -> Result<JavaRuntime>;
     fn install(&self, config: &Config, instance: &str, required: u64) -> Result<JavaRuntime>;
 }
 
@@ -142,8 +306,12 @@ impl JavaRuntimeSource for Backend {
     fn check_task(&self) -> Result<()> {
         self.control.check()
     }
-    fn select(&self, config: &Config, required: u64) -> Result<JavaRuntime> {
-        crate::java::select(config, required, &self.control)
+    fn select(&self, config: &Config, requirement: &JavaRequirement) -> Result<JavaRuntime> {
+        if config.java == "auto" {
+            requirement.choose(crate::java::discover(config, &self.control)?)
+        } else {
+            crate::java::select(config, requirement.recommended(), &self.control)
+        }
     }
     fn install(&self, config: &Config, instance: &str, _required: u64) -> Result<JavaRuntime> {
         self.install_java_for_version(config, instance)
@@ -181,7 +349,7 @@ impl<'a> JavaRuntimeService<'a> {
         let required = requirement.recommended();
         let selected = self
             .source
-            .select(config, required)
+            .select(config, &requirement)
             .and_then(|runtime| requirement.check(runtime));
         self.source.check_task()?;
         if config.java != "auto"
@@ -233,6 +401,201 @@ impl<'a> JavaRuntimeService<'a> {
 mod tests {
     use super::*;
     use std::cell::Cell;
+    #[test]
+    fn loader_limits_follow_each_candidate_jvm_instead_of_launcher_architecture() {
+        let mut profile = forge_profile("36.2.25", 8);
+        profile["libraries"][0]["rules"] = serde_json::json!([
+            {"action":"allow","os":{"arch":"aarch64"}}
+        ]);
+        let requirement = JavaRequirement::from_metadata(&profile).unwrap();
+        let mut arm = full_runtime("8u451");
+        arm.architecture = crate::java_architecture::JavaArchitecture::Arm64;
+        let mut x64 = arm.clone();
+        x64.architecture = crate::java_architecture::JavaArchitecture::X64;
+        assert!(requirement.check(arm.clone()).is_err());
+        assert!(requirement.check(x64.clone()).is_ok());
+        assert_eq!(
+            requirement.choose(vec![arm, x64]).unwrap().architecture,
+            crate::java_architecture::JavaArchitecture::X64
+        );
+
+        profile["javaVersion"]["majorVersion"] = 17.into();
+        let requirement = JavaRequirement::from_metadata(&profile).unwrap();
+        let mut arm = full_runtime("17");
+        arm.architecture = crate::java_architecture::JavaArchitecture::Arm64;
+        let mut x64 = arm.clone();
+        x64.architecture = crate::java_architecture::JavaArchitecture::X64;
+        assert!(requirement.check(arm).is_err());
+        assert!(requirement.check(x64).is_ok());
+    }
+    fn forge_profile(build: &str, java: u64) -> Value {
+        serde_json::json!({"id":"renamed-instance","mainClass":"cpw.mods.modlauncher.Launcher",
+            "javaVersion":{"majorVersion":java},
+            "libraries":[{"name":format!("net.minecraftforge:forge:1.16.5-{build}:universal")} ]})
+    }
+    fn full_runtime(version: &str) -> JavaRuntime {
+        JavaRuntime {
+            path: format!("java-{version}").into(),
+            version: crate::java_version::JavaVersion::parse(version).unwrap(),
+            description: String::new(),
+            architecture: crate::java_architecture::JavaArchitecture::X64,
+        }
+    }
+    #[test]
+    fn forge_update_ceiling_accepts_vendor_builds_but_rejects_newer_updates() {
+        let requirement = JavaRequirement::from_metadata(&forge_profile("36.2.25", 8)).unwrap();
+        for text in ["8u51", "1.8.0_312-b07", "1.8.0_320-b99"] {
+            assert!(requirement.check(full_runtime(text)).is_ok(), "{text}");
+        }
+        for text in ["8u321", "8u451", "11", "21"] {
+            assert!(requirement.check(full_runtime(text)).is_err(), "{text}");
+        }
+    }
+    #[test]
+    fn chooses_latest_compatible_update_from_all_local_candidates() {
+        let requirement = JavaRequirement::from_metadata(&forge_profile("36.2.25", 8)).unwrap();
+        let chosen = requirement
+            .choose(
+                ["8u451", "8u312", "1.8.0_320-b07", "17"]
+                    .into_iter()
+                    .map(full_runtime)
+                    .collect(),
+            )
+            .unwrap();
+        assert_eq!(chosen.version.to_string(), "1.8.0_320-b07");
+    }
+    #[test]
+    fn forge_ranges_have_exact_transition_boundaries() {
+        for (forge, java, allowed, denied) in [
+            ("34.0.0", 8, "8u320", "8u321"),
+            ("36.2.26", 8, "23", "24"),
+            ("36.3.99", 8, "23", "24"),
+            ("37.0.0", 16, "16", "17"),
+            ("37.0.79", 16, "16", "17"),
+            ("45.0.21", 17, "19", "20"),
+            ("45.0.65", 17, "19", "20"),
+            ("45.0.66", 17, "21", "22"),
+            ("47.4.8", 17, "21", "22"),
+        ] {
+            let requirement = JavaRequirement::from_metadata(&forge_profile(forge, java)).unwrap();
+            assert!(requirement.check(full_runtime(allowed)).is_ok(), "{forge}");
+            assert!(requirement.check(full_runtime(denied)).is_err(), "{forge}");
+        }
+        for forge in ["33.0.0", "37.0.80", "45.0.20", "47.4.9", "36.2.25-beta"] {
+            assert!(
+                JavaRequirement::from_metadata(&forge_profile(forge, 8))
+                    .unwrap()
+                    .check(runtime(25))
+                    .is_ok(),
+                "{forge}"
+            );
+        }
+    }
+    #[test]
+    fn forge_detection_requires_active_identity_and_rejects_conflicts() {
+        let mut profile = forge_profile("36.2.25", 8);
+        profile["libraries"][0]["rules"] = serde_json::json!([{"action":"disallow"}]);
+        assert!(JavaRequirement::from_metadata(&profile)
+            .unwrap()
+            .check(runtime(21))
+            .is_ok());
+        profile = forge_profile("36.2.25", 8);
+        profile["mainClass"] = "net.minecraft.client.main.Main".into();
+        assert!(JavaRequirement::from_metadata(&profile)
+            .unwrap()
+            .check(runtime(21))
+            .is_ok());
+        profile = forge_profile("36.2.25", 8);
+        profile["libraries"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"name":"net.minecraftforge:fmlloader:1.16.5-36.2.26"}));
+        assert!(JavaRequirement::from_metadata(&profile).is_err());
+        assert!(JavaRequirement::from_metadata(&forge_profile("36.2.25", 17)).is_err());
+        for name in [
+            "net.minecraftforge:forge:1.16.5-36.2.25:universal@jar",
+            "net.minecraftforge:fmlloader:36.2.25",
+        ] {
+            let mut profile = forge_profile("36.2.25", 8);
+            profile["libraries"][0]["name"] = name.into();
+            profile["mainClass"] = "cpw.mods.bootstraplauncher.BootstrapLauncher".into();
+            assert!(JavaRequirement::from_metadata(&profile)
+                .unwrap()
+                .check(full_runtime("8u321"))
+                .is_err());
+        }
+        for name in [
+            "net.minecraftforge:forge:36.2.25-beta",
+            "net.minecraftforge:forge:garbage-36.2.25",
+            "net.minecraftforge:mergetool:36.2.25",
+            "net.neoforged:forge:1.16.5-36.2.25",
+        ] {
+            let mut profile = forge_profile("36.2.25", 8);
+            profile["libraries"][0]["name"] = name.into();
+            assert!(JavaRequirement::from_metadata(&profile)
+                .unwrap()
+                .check(runtime(25))
+                .is_ok());
+        }
+    }
+    struct RuntimePool {
+        versions: Vec<&'static str>,
+        installed: &'static str,
+        installs: Cell<usize>,
+    }
+    impl JavaRuntimeSource for RuntimePool {
+        fn select(&self, config: &Config, requirement: &JavaRequirement) -> Result<JavaRuntime> {
+            if config.java != "auto" {
+                return Ok(full_runtime(self.versions[0]));
+            }
+            requirement.choose(self.versions.iter().map(|s| full_runtime(s)).collect())
+        }
+        fn install(&self, _: &Config, _: &str, _: u64) -> Result<JavaRuntime> {
+            self.installs.set(self.installs.get() + 1);
+            Ok(full_runtime(self.installed))
+        }
+    }
+    #[test]
+    fn local_compatible_update_avoids_download_and_manual_path_is_not_replaced() {
+        let pool = RuntimePool {
+            versions: vec!["8u451", "8u312"],
+            installed: "8u51",
+            installs: Cell::new(0),
+        };
+        let requirement = || JavaRequirement::from_metadata(&forge_profile("36.2.25", 8)).unwrap();
+        let result = JavaRuntimeService::new(&pool)
+            .resolve(&Config::default(), "test", requirement())
+            .unwrap();
+        assert_eq!(result.into_runtime().version.to_string(), "8u312");
+        assert_eq!(pool.installs.get(), 0);
+        let explicit = Config {
+            java: "manual-java".into(),
+            ..Config::default()
+        };
+        assert!(JavaRuntimeService::new(&pool)
+            .resolve(&explicit, "test", requirement())
+            .is_err());
+        assert_eq!(pool.installs.get(), 0);
+    }
+    #[test]
+    fn downloaded_runtime_must_satisfy_update_ceiling() {
+        let mut pool = RuntimePool {
+            versions: vec!["8u451"],
+            installed: "8u451",
+            installs: Cell::new(0),
+        };
+        let requirement = || JavaRequirement::from_metadata(&forge_profile("36.2.25", 8)).unwrap();
+        let error = JavaRuntimeService::new(&pool)
+            .resolve(&Config::default(), "test", requirement())
+            .err()
+            .unwrap();
+        assert!(format!("{error:#}").contains("8u320"));
+        pool.installed = "8u312";
+        let result = JavaRuntimeService::new(&pool)
+            .resolve(&Config::default(), "test", requirement())
+            .unwrap();
+        assert_eq!(result.into_runtime().version.to_string(), "8u312");
+    }
     struct Source {
         local: Option<u64>,
         installed: Option<u64>,
@@ -243,10 +606,11 @@ mod tests {
             path: format!("java{major}").into(),
             version: crate::java_version::JavaVersion::parse(&major.to_string()).unwrap(),
             description: String::new(),
+            architecture: crate::java_architecture::JavaArchitecture::X64,
         }
     }
     impl JavaRuntimeSource for Source {
-        fn select(&self, _config: &Config, _required: u64) -> Result<JavaRuntime> {
+        fn select(&self, _config: &Config, _requirement: &JavaRequirement) -> Result<JavaRuntime> {
             self.local
                 .map(runtime)
                 .ok_or_else(|| anyhow::anyhow!("未安装 Java"))
@@ -273,7 +637,11 @@ mod tests {
                 }
                 Ok(())
             }
-            fn select(&self, _config: &Config, _required: u64) -> Result<JavaRuntime> {
+            fn select(
+                &self,
+                _config: &Config,
+                _requirement: &JavaRequirement,
+            ) -> Result<JavaRuntime> {
                 Ok(runtime(25))
             }
             fn install(

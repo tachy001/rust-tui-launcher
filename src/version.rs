@@ -10,22 +10,47 @@ pub struct ResolvedVersion {
     pub chain: Vec<String>,
 }
 pub fn resolve(root: &Path, id: &str) -> Result<ResolvedVersion> {
-    resolve_inner(root, id, &mut HashSet::new())
+    resolve_guarded(root, id, None, |_| Ok(()))
 }
-fn resolve_inner(root: &Path, id: &str, seen: &mut HashSet<String>) -> Result<ResolvedVersion> {
+pub(crate) fn resolve_guarded(
+    root: &Path,
+    id: &str,
+    profile: Option<&Value>,
+    mut guard: impl FnMut(&str) -> Result<()>,
+) -> Result<ResolvedVersion> {
+    resolve_inner(
+        root,
+        id,
+        &mut HashSet::new(),
+        profile.map(|profile| (id, profile)),
+        &mut guard,
+    )
+}
+fn resolve_inner(
+    root: &Path,
+    id: &str,
+    seen: &mut HashSet<String>,
+    candidate: Option<(&str, &Value)>,
+    guard: &mut impl FnMut(&str) -> Result<()>,
+) -> Result<ResolvedVersion> {
     valid_id(id)?;
     if seen.len() >= 32 || !seen.insert(id.to_owned()) {
         bail!("版本继承存在循环或超过 32 层：{id}");
     }
+    guard(id)?;
     let path = root.join("versions").join(id).join(format!("{id}.json"));
-    let child: Value = serde_json::from_slice(
-        &fs::read(&path).with_context(|| format!("缺少版本 {id} 的元数据，请先安装父版本"))?,
-    )?;
+    let child: Value = if let Some((_, profile)) = candidate.filter(|(target, _)| *target == id) {
+        profile.clone()
+    } else {
+        serde_json::from_slice(
+            &fs::read(&path).with_context(|| format!("缺少版本 {id} 的元数据，请先安装父版本"))?,
+        )?
+    };
     if !child.is_object() {
         bail!("版本元数据必须为 JSON 对象：{id}");
     }
     let mut resolved = if let Some(parent) = child["inheritsFrom"].as_str() {
-        let mut base = resolve_inner(root, parent, seen)?;
+        let mut base = resolve_inner(root, parent, seen, candidate, guard)?;
         base.meta = merge(&base.meta, &child);
         base.chain.push(id.to_owned());
         if child.pointer("/downloads/client").is_some() {

@@ -2,7 +2,6 @@ use crate::{
     backend::{Backend, GameProcess},
     config::Config,
     download::Download,
-    java,
     logs::LogTail,
     metadata::valid_id,
     process_service::{ProcessMonitor, ProcessOutcome},
@@ -12,8 +11,6 @@ use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use std::{
     fs,
-    io::Read,
-    path::Path,
     process::{Command, Stdio},
 };
 
@@ -31,12 +28,8 @@ impl ForgeKind {
     }
 }
 impl Backend {
-    pub(crate) fn text(&self, url: &str) -> Result<String> {
-        self.control.check()?;
-        if !url.starts_with("https://") {
-            bail!("安装器地址必须为 HTTPS");
-        }
-        Ok(self.client.get(url).send()?.error_for_status()?.text()?)
+    pub(crate) fn maven_metadata(&self, url: &str) -> Result<String> {
+        self.cached_metadata(url, parse_maven_metadata)
     }
     pub fn install_forge(
         &self,
@@ -53,7 +46,7 @@ impl Backend {
                     .unwrap_or(version)
                     .to_owned(),
                 None => {
-                    let promos=self.get_json("https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json")?;
+                    let promos=self.cached_metadata("https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json",parse_promotions)?;
                     promos["promos"][format!("{game}-recommended")]
                         .as_str()
                         .or_else(|| promos["promos"][format!("{game}-latest")].as_str())
@@ -77,7 +70,7 @@ impl Backend {
             let full = if let Some(version) = requested {
                 version.to_owned()
             } else {
-                let metadata = self.text(&format!("{base}/maven-metadata.xml"))?;
+                let metadata = self.maven_metadata(&format!("{base}/maven-metadata.xml"))?;
                 let re = regex::Regex::new(r"<version>([^<]+)</version>")?;
                 let mut versions = re
                     .captures_iter(&metadata)
@@ -103,41 +96,63 @@ impl Backend {
         let remote = self.remote_version(game)?;
         self.install(config, &remote)?;
         let url = format!("{base}/{full}/{artifact}-{full}-installer.jar");
-        let checksum = self.text(&format!("{url}.sha1"))?;
-        let checksum = checksum
-            .split_whitespace()
-            .next()
-            .context("安装器缺少 SHA-1")?;
-        if checksum.len() != 40 || !checksum.bytes().all(|c| c.is_ascii_hexdigit()) {
-            bail!("官方安装器 SHA-1 响应无效");
-        }
+        let checksum = self.cached_metadata(&format!("{url}.sha1"), parse_installer_sha1)?;
         let root = config.root()?;
         let cache = root.join("tui-mc-installers");
         fs::create_dir_all(&cache)?;
-        let installer = cache.join(format!("{artifact}-{full}-installer.jar"));
-        self.downloader().fetch(&Download {
+        let source = crate::forge_installer_service::InstallerSource {
             url,
+            sha1: checksum,
+        };
+        let installer = source.cache_path(&root)?;
+        let previous = cache.join(format!("{artifact}-{full}-installer.jar"));
+        if !installer.exists() && crate::download::valid_file(&previous, Some(&source.sha1), None)?
+        {
+            crate::storage::atomic_copy(&installer, &mut fs::File::open(previous)?)?;
+        }
+        self.downloader().fetch(&Download {
+            url: source.url.clone(),
             dest: installer.clone(),
-            sha1: Some(checksum.into()),
+            sha1: Some(source.sha1.clone()),
             size: None,
             alternatives: vec![],
         })?;
-        let id = installer_profile_id(&installer, game)?;
+        let plan = crate::forge_installer_service::ForgeInstallerPlan::inspect(
+            &installer,
+            game,
+            (kind == ForgeKind::Forge).then_some(full.as_str()),
+            &self.control,
+        )?;
+        let id = plan.id;
         let mut mutation = crate::instance_service::InstanceMutation::begin(&root, &id)?;
+        if let Some(legacy) = plan.direct {
+            self.log("检测到可直接安装的 Forge 描述，提取内置库并通过安装草稿发布");
+            self.install_profile_with_session(config, &id, legacy.profile(source)?, &mut mutation)?;
+            self.log(format!("{} 实例已就绪：{id}", kind.name()));
+            return Ok(id);
+        }
         let resolved = mutation.resolve(game)?;
-        let required = resolved.meta["javaVersion"]["majorVersion"]
-            .as_u64()
-            .unwrap_or(8);
+        let game_plan = crate::game_java_service::GameJavaResolver::new(
+            &crate::game_java_service::JarClientVersionSource,
+        )
+        .resolve(&root, &resolved, &self.control)?;
+        let requirement = crate::installer_java_service::InstallerJavaRequirement::inspect(
+            &crate::installer_java_service::JarEntryPointSource,
+            &installer,
+            game_plan.requirement.recommended(),
+            &self.control,
+        )?;
         let effective = config.effective(game)?;
-        let runtime = match java::select(&effective, required, &self.control) {
-            Ok(runtime) => runtime,
-            Err(error) if effective.java == "auto" => {
-                self.control.check()?;
-                self.log(format!("正在准备安装器所需 Java：{error}"));
-                self.install_java_for_version(&effective, game)?
-            }
-            Err(error) => return Err(error),
-        };
+        let runtime = crate::installer_java_service::InstallerJavaService::new(self)
+            .resolve(&effective, &requirement)?;
+        self.log(format!(
+            "安装器 Java {} · {}（入口 {} 至少 Java {}，游戏至少 Java {}）",
+            runtime.major(),
+            runtime.path.display(),
+            requirement.main_class,
+            requirement.installer_minimum,
+            requirement.game_minimum
+        ));
         self.control.check()?;
         let shared_installation = crate::installation_service::LoaderInstallSession::acquire(
             &root,
@@ -185,34 +200,58 @@ impl Backend {
         Ok(id)
     }
 }
-fn installer_profile_id(path: &Path, game: &str) -> Result<String> {
-    let mut archive = zip::ZipArchive::new(fs::File::open(path)?)?;
-    let profile = match archive.by_name("version.json") {
-        Ok(mut entry) => {
-            let mut bytes = vec![];
-            entry.read_to_end(&mut bytes)?;
-            serde_json::from_slice::<Value>(&bytes)?
-        }
-        Err(_) => Value::Null,
-    };
-    let profile = if profile.is_null() {
-        let entry = archive.by_name("install_profile.json")?;
-        let install: Value = serde_json::from_reader(entry)?;
-        install["versionInfo"].clone()
-    } else {
-        profile
-    };
-    if profile["inheritsFrom"]
-        .as_str()
-        .is_some_and(|parent| parent != game)
+fn parse_promotions(bytes: &[u8]) -> Result<Value> {
+    let value: Value = serde_json::from_slice(bytes)?;
+    for version in value["promos"]
+        .as_object()
+        .context("Forge 推荐目录缺少 promos")?
+        .values()
     {
-        bail!("官方安装器的父版本与选择不一致");
+        valid_id(version.as_str().context("Forge 推荐版本格式无效")?)?;
     }
-    let id = profile["id"]
-        .as_str()
-        .context("无法识别安装器中的客户端版本 ID；此旧安装器可能不支持命令行安装")?;
-    valid_id(id)?;
-    Ok(id.into())
+    Ok(value)
+}
+fn parse_installer_sha1(bytes: &[u8]) -> Result<String> {
+    let checksum = std::str::from_utf8(bytes)?
+        .split_whitespace()
+        .next()
+        .context("安装器缺少 SHA-1")?;
+    if checksum.len() != 40 || !checksum.bytes().all(|c| c.is_ascii_hexdigit()) {
+        bail!("官方安装器 SHA-1 响应无效");
+    }
+    Ok(checksum.to_ascii_lowercase())
+}
+fn parse_maven_metadata(bytes: &[u8]) -> Result<String> {
+    let text = std::str::from_utf8(bytes).context("Maven 元数据不是 UTF-8")?;
+    let mut content = text.trim_start_matches('\u{feff}').trim();
+    if content.starts_with("<?xml") {
+        content = content
+            .split_once("?>")
+            .context("Maven XML 声明不完整")?
+            .1
+            .trim_start();
+    }
+    if !content
+        .strip_prefix("<metadata")
+        .is_some_and(|rest| rest.starts_with('>') || rest.starts_with(char::is_whitespace))
+        || !content.ends_with("</metadata>")
+        || !content.contains("<versioning>")
+        || !content.contains("</versioning>")
+        || !content.contains("<versions>")
+        || !content.contains("</versions>")
+    {
+        bail!("Maven 版本目录格式无效");
+    }
+    let versions = regex::Regex::new(r"<version>\s*([^<\s]+)\s*</version>")?;
+    let mut count = 0;
+    for entry in versions.captures_iter(content) {
+        valid_id(&entry[1])?;
+        count += 1;
+    }
+    if count == 0 {
+        bail!("Maven 版本目录为空");
+    }
+    Ok(text.into())
 }
 pub(crate) fn neoforge_prefix(game: &str) -> Result<String> {
     if game == "1.20.1" {
@@ -240,6 +279,23 @@ pub(crate) fn natural_key(version: &str) -> Vec<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cache_validators_reject_html_and_malformed_public_metadata() {
+        let xml=br#"<?xml version="1.0"?><metadata><versioning><versions><version>21.1.264</version></versions></versioning></metadata>"#;
+        assert!(parse_maven_metadata(xml).is_ok());
+        for invalid in [b"<html>service unavailable</html>".as_slice(),b"<metadata><versioning><versions></versions></versioning></metadata>",b"<metadatawrong><versioning><versions><version>21.1.1</version></versions></versioning></metadata>"] {
+            assert!(parse_maven_metadata(invalid).is_err());
+        }
+        assert!(parse_promotions(br#"{"promos":{"1.21.1-recommended":"52.1.20"}}"#).is_ok());
+        assert!(parse_promotions(br#"{"error":"unavailable"}"#).is_err());
+        assert!(parse_promotions(br#"{"promos":{"1.21.1-latest":"../bad"}}"#).is_err());
+        let hash = "A".repeat(40);
+        assert_eq!(
+            parse_installer_sha1(format!("{hash}  installer.jar\n").as_bytes()).unwrap(),
+            "a".repeat(40)
+        );
+        assert!(parse_installer_sha1(b"<html>unavailable</html>").is_err());
+    }
     #[test]
     fn neoforge_version_ranges() {
         assert_eq!(neoforge_prefix("1.21.1").unwrap(), "21.1.");

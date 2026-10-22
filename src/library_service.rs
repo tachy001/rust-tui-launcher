@@ -30,9 +30,12 @@ impl<'a> LibraryResolver<'a> {
             bail!("依赖库必须为 JSON 对象");
         }
         let mut entries = vec![];
-        if let Some(artifact) = library.pointer("/downloads/artifact") {
+        if let Some(artifact) = library
+            .pointer("/downloads/artifact")
+            .filter(|value| !value.is_null())
+        {
             entries.push((self.complete(artifact, library, None)?, false));
-        } else if library.get("downloads").is_none() {
+        } else if library["downloads"].is_null() && library["natives"].is_null() {
             entries.push((self.legacy(library, None)?, false));
         }
         if let Some(classifier) = library["natives"][self.os].as_str() {
@@ -42,7 +45,7 @@ impl<'a> LibraryResolver<'a> {
                 .and_then(|items| items.get(&classifier))
             {
                 Some(entry) => self.complete(entry, library, Some(&classifier))?,
-                None if library.get("downloads").is_none() => {
+                None if library["downloads"].is_null() => {
                     self.legacy(library, Some(&classifier))?
                 }
                 None => bail!("当前平台缺少 native 分类：{classifier}"),
@@ -123,26 +126,45 @@ impl<'a> LibraryResolver<'a> {
 mod tests {
     use super::*;
     #[test]
+    fn null_legacy_optional_fields_are_absent_and_native_only_libraries_need_no_main_jar() {
+        let resolver = LibraryResolver::new("windows", "64");
+        assert_eq!(
+            resolver
+                .resolve(&json!({"name":"test:api:1","downloads":null,"natives":null}))
+                .unwrap()
+                .len(),
+            1
+        );
+        let native = resolver
+            .resolve(&json!({"name":"test:platform:1","downloads":null,
+            "natives":{"windows":"natives-windows-${arch}"}}))
+            .unwrap();
+        assert_eq!(native.len(), 1);
+        assert!(native[0].1);
+        assert_eq!(
+            native[0].0["path"],
+            "test/platform/1/platform-1-natives-windows-64.jar"
+        );
+    }
+    #[test]
     fn legacy_natives_use_the_classifier_and_do_not_reuse_main_jar_checksums() {
         let library = json!({"name":"org.example:binding:1.2", "url":"https://repo.example/maven/",
             "sha1":"main-hash", "size":42, "natives":{"windows":"natives-windows-${arch}"}});
         let resolved = LibraryResolver::new("windows", "64")
             .resolve(&library)
             .unwrap();
-        assert_eq!(resolved.len(), 2);
-        assert!(!resolved[0].1);
-        assert_eq!(resolved[0].0["sha1"], "main-hash");
-        assert!(resolved[1].1);
+        assert_eq!(resolved.len(), 1);
+        assert!(resolved[0].1);
         assert_eq!(
-            resolved[1].0["path"],
+            resolved[0].0["path"],
             "org/example/binding/1.2/binding-1.2-natives-windows-64.jar"
         );
         assert_eq!(
-            resolved[1].0["url"],
+            resolved[0].0["url"],
             "https://repo.example/maven/org/example/binding/1.2/binding-1.2-natives-windows-64.jar"
         );
-        assert!(resolved[1].0.get("sha1").is_none());
-        assert!(resolved[1].0.get("size").is_none());
+        assert!(resolved[0].0.get("sha1").is_none());
+        assert!(resolved[0].0.get("size").is_none());
     }
     #[test]
     fn modern_paths_can_be_derived_while_native_integrity_is_retained() {
@@ -174,6 +196,12 @@ mod tests {
         let entries = LibraryResolver::new("linux", "64").resolve(&json!({
             "name":"a:b:1", "url":"http://libraries.minecraft.net/", "natives":{"windows":"natives-windows"}
         })).unwrap();
+        assert!(entries.is_empty());
+        let entries = LibraryResolver::new("linux", "64")
+            .resolve(&json!({
+                "name":"a:b:1", "url":"http://libraries.minecraft.net/"
+            }))
+            .unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(
             entries[0].0["url"],

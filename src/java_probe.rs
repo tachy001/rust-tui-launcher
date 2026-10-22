@@ -1,4 +1,5 @@
 use crate::{
+    java_architecture::JavaArchitecture,
     java_version::JavaVersion,
     process_service::{ManagedProcess, ProcessHandle},
     task::TaskControl,
@@ -86,10 +87,13 @@ impl<'a> JavaProbe<'a> {
             root: std::env::temp_dir(),
         }
     }
-    pub(crate) fn inspect(&self, executable: &Path) -> Result<(JavaVersion, String)> {
-        self.run(Command::new(executable).arg("-version"))
+    pub(crate) fn inspect(
+        &self,
+        executable: &Path,
+    ) -> Result<(JavaVersion, JavaArchitecture, String)> {
+        self.run(Command::new(executable).args(["-XshowSettings:properties", "-version"]))
     }
-    fn run(&self, command: &mut Command) -> Result<(JavaVersion, String)> {
+    fn run(&self, command: &mut Command) -> Result<(JavaVersion, JavaArchitecture, String)> {
         self.control.check()?;
         let directory = CaptureDirectory::create(&self.root)?;
         let mut stdout = directory.file("stdout")?;
@@ -152,7 +156,9 @@ impl<'a> JavaProbe<'a> {
         if !status.success() {
             bail!("Java 检测失败（{status}）：{info}");
         }
-        JavaVersion::from_output(&info)
+        let (version, description) = JavaVersion::from_output(&info)?;
+        let architecture = JavaArchitecture::from_output(&info)?;
+        Ok((version, architecture, description))
     }
 }
 
@@ -195,10 +201,12 @@ mod tests {
     fn real_helper_probe_reads_stderr_version_and_cleans_capture_files() {
         let workspace = crate::test_support::Workspace::new();
         let control = TaskControl::default();
-        let (version, description) = probe(&workspace, &control, Duration::from_secs(5), 65536)
-            .run(&mut command("version"))
-            .unwrap();
+        let (version, architecture, description) =
+            probe(&workspace, &control, Duration::from_secs(5), 65536)
+                .run(&mut command("version"))
+                .unwrap();
         assert_eq!(version.to_string(), "21.0.7+6-LTS");
+        assert_eq!(architecture, JavaArchitecture::Arm64);
         assert!(description.starts_with("openjdk version"));
         assert_clean(&workspace);
     }
@@ -267,7 +275,7 @@ mod tests {
             return;
         };
         match mode.as_str() {
-            "version" => eprintln!("openjdk version \"21.0.7+6-LTS\" 2025-04-15"),
+            "version" => eprintln!("Property settings:\n    os.arch = aarch64\n    sun.arch.data.model = 64\nopenjdk version \"21.0.7+6-LTS\" 2025-04-15"),
             "flood" => std::io::stderr().write_all(&vec![b'x'; 8192]).unwrap(),
             "hang" => {
                 if let Some(ready) = std::env::var_os("TUI_JAVA_PROBE_READY") {

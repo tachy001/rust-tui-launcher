@@ -13,6 +13,7 @@ use std::{
 pub struct JavaRuntime {
     pub path: PathBuf,
     pub version: JavaVersion,
+    pub architecture: crate::java_architecture::JavaArchitecture,
     pub description: String,
 }
 impl JavaRuntime {
@@ -94,10 +95,11 @@ pub fn discover(config: &Config, control: &crate::task::TaskControl) -> Result<V
         if !seen.insert(key) {
             continue;
         }
-        if let Ok((version, description)) = probe.inspect(&canonical) {
+        if let Ok((version, architecture, description)) = probe.inspect(&canonical) {
             found.push(JavaRuntime {
                 path: canonical,
                 version,
+                architecture,
                 description,
             });
         }
@@ -158,7 +160,7 @@ pub fn select(
     control: &crate::task::TaskControl,
 ) -> Result<JavaRuntime> {
     if config.java != "auto" {
-        let (version, description) =
+        let (version, architecture, description) =
             crate::java_probe::JavaProbe::new(control).inspect(Path::new(&config.java))?;
         let major = version.major();
         if major < required {
@@ -169,12 +171,13 @@ pub fn select(
                 &fs::canonicalize(&config.java).unwrap_or_else(|_| PathBuf::from(&config.java)),
             ),
             version,
+            architecture,
             description,
         });
     }
     choose(discover(config, control)?, required)
 }
-fn choose(runtimes: Vec<JavaRuntime>, required: u64) -> Result<JavaRuntime> {
+pub(crate) fn choose(runtimes: Vec<JavaRuntime>, required: u64) -> Result<JavaRuntime> {
     runtimes
         .into_iter()
         .filter(|j| j.major() >= required)
@@ -183,6 +186,12 @@ fn choose(runtimes: Vec<JavaRuntime>, required: u64) -> Result<JavaRuntime> {
                 .major()
                 .cmp(&second.major())
                 .then_with(|| first.version.is_preview().cmp(&second.version.is_preview()))
+                .then_with(|| {
+                    second
+                        .architecture
+                        .is_launcher_arch()
+                        .cmp(&first.architecture.is_launcher_arch())
+                })
                 .then_with(|| second.version.compare(&first.version))
         })
         .ok_or_else(|| {
@@ -226,7 +235,7 @@ impl Backend {
         valid_id(component)?;
         self.control.check()?;
         let platform = platform()?;
-        let catalog = self.get_json(RUNTIME_MANIFEST)?;
+        let catalog = self.cached_metadata(RUNTIME_MANIFEST, parse_runtime_catalog)?;
         let candidate = catalog[platform][component]
             .as_array()
             .and_then(|a| a.first())
@@ -269,15 +278,18 @@ impl Backend {
             Ok(Some(existing)) => {
                 let path = crate::runtime_repository::executable(&existing);
                 match crate::java_probe::JavaProbe::new(&self.control).inspect(&path) {
-                    Ok((version, description)) if version.major() == required => {
+                    Ok((version, architecture, description))
+                        if version.major() == required && architecture.is_launcher_arch() =>
+                    {
                         self.log("已验证并复用现有 Java 运行时");
                         return Ok(JavaRuntime {
                             path,
                             version,
+                            architecture,
                             description,
                         });
                     }
-                    Ok(_) => self.log("现有 Java 主版本不符，将准备独立运行时"),
+                    Ok(_) => self.log("现有 Java 主版本或架构不符，将准备独立运行时"),
                     Err(error) => {
                         self.control.check()?;
                         self.log(format!("现有 Java 无法复用，将准备新目录：{error:#}"));
@@ -344,31 +356,73 @@ impl Backend {
         } else {
             root.join("jre.bundle/Contents/Home/bin").join(executable())
         };
-        let (version, description) =
+        let (version, architecture, description) =
             crate::java_probe::JavaProbe::new(&self.control).inspect(&path)?;
         let major = version.major();
         if major != required {
             bail!("下载后的 Java 版本不符：预期 {required}，实际 {major}");
+        }
+        if !architecture.is_launcher_arch() {
+            bail!(
+                "下载后的 Java 架构不符：预期 {}，实际 {}",
+                std::env::consts::ARCH,
+                architecture.rule_name()
+            );
         }
         let published = session.publish()?;
         let path = crate::runtime_repository::executable(&published);
         Ok(JavaRuntime {
             path,
             version,
+            architecture,
             description,
         })
     }
     pub fn install_java_for_version(&self, config: &Config, id: &str) -> Result<JavaRuntime> {
         let resolved = crate::version::resolve(&config.root()?, id)?;
-        let major = resolved.meta["javaVersion"]["majorVersion"]
-            .as_u64()
-            .unwrap_or(8);
-        let component = match resolved.meta["javaVersion"]["component"].as_str() {
-            Some(component) => component.to_owned(),
+        let plan = crate::game_java_service::GameJavaResolver::new(
+            &crate::game_java_service::JarClientVersionSource,
+        )
+        .resolve(&config.root()?, &resolved, &self.control)?;
+        let requirement = plan.requirement;
+        let major = requirement.recommended();
+        let component = match plan.component {
+            Some(component) => component,
             None => component_for(major)?.into(),
         };
-        self.install_java(config, &component, major)
+        requirement.check(self.install_java(config, &component, major)?)
     }
+}
+fn parse_runtime_catalog(bytes: &[u8]) -> Result<serde_json::Value> {
+    let value: serde_json::Value = serde_json::from_slice(bytes)?;
+    let platforms = value
+        .as_object()
+        .filter(|platforms| !platforms.is_empty())
+        .context("Java 组件目录格式无效")?;
+    for platform in platforms.values() {
+        for component in platform
+            .as_object()
+            .context("Java 平台目录格式无效")?
+            .values()
+        {
+            for entry in component.as_array().context("Java 组件版本列表格式无效")? {
+                entry["version"]["name"]
+                    .as_str()
+                    .filter(|name| !name.trim().is_empty())
+                    .context("Java 组件没有版本名")?;
+                let descriptor = &entry["manifest"];
+                let hash = descriptor["sha1"].as_str().context("Java 清单缺少 SHA-1")?;
+                if hash.len() != 40 || !hash.bytes().all(|c| c.is_ascii_hexdigit()) {
+                    bail!("Java 清单 SHA-1 无效");
+                }
+                crate::metadata_cache::validate_url(
+                    descriptor["url"].as_str().context("Java 清单缺少 URL")?,
+                )
+                .context("Java 清单 URL 无效")?;
+            }
+        }
+    }
+    Ok(value)
 }
 pub(crate) fn checked_link_target(root: &Path, dest: &Path, target: &str) -> Result<PathBuf> {
     use std::path::Component;
@@ -394,6 +448,19 @@ pub(crate) fn checked_link_target(root: &Path, dest: &Path, target: &str) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn runtime_catalog_cache_validates_descriptors_without_requiring_all_components() {
+        let catalog = serde_json::json!({"windows-x64":{"jre-legacy":[{"version":{"name":"1.8.0_51"},"manifest":{"url":"https://example.invalid/manifest","sha1":"a".repeat(40)}}],"java-runtime-delta":[]}});
+        assert!(parse_runtime_catalog(&serde_json::to_vec(&catalog).unwrap()).is_ok());
+        let mut broken = catalog.clone();
+        broken["windows-x64"]["jre-legacy"][0]["manifest"]["sha1"] = "bad".into();
+        assert!(parse_runtime_catalog(&serde_json::to_vec(&broken).unwrap()).is_err());
+        let mut broken = catalog;
+        broken["windows-x64"]["jre-legacy"][0]["manifest"]["url"] =
+            "http://example.invalid/manifest".into();
+        assert!(parse_runtime_catalog(&serde_json::to_vec(&broken).unwrap()).is_err());
+        assert!(parse_runtime_catalog(b"[]").is_err());
+    }
     #[cfg(unix)]
     #[test]
     fn discovers_linked_jdk_without_following_cycles() {
@@ -427,10 +494,46 @@ mod tests {
                 version: JavaVersion::parse(&major.to_string()).unwrap(),
                 path: format!("java{major}").into(),
                 description: String::new(),
+                architecture: crate::java_architecture::JavaArchitecture::X64,
             })
             .collect();
         assert_eq!(choose(runtimes, 21).unwrap().major(), 21);
         assert!(choose(vec![], 21).is_err());
+    }
+    #[test]
+    fn prefers_native_architecture_within_the_same_major_but_allows_emulated_java() {
+        let native =
+            crate::java_architecture::JavaArchitecture::parse(std::env::consts::ARCH).unwrap();
+        let other = if native == crate::java_architecture::JavaArchitecture::Arm64 {
+            crate::java_architecture::JavaArchitecture::X64
+        } else {
+            crate::java_architecture::JavaArchitecture::Arm64
+        };
+        let runtime = |arch, version| JavaRuntime {
+            path: "test-java".into(),
+            version: JavaVersion::parse(version).unwrap(),
+            architecture: arch,
+            description: String::new(),
+        };
+        assert_eq!(
+            choose(
+                vec![runtime(other, "21.0.8"), runtime(native, "21.0.7")],
+                21
+            )
+            .unwrap()
+            .architecture,
+            native
+        );
+        assert_eq!(
+            choose(vec![runtime(other, "21"), runtime(native, "25")], 21)
+                .unwrap()
+                .architecture,
+            other
+        );
+        assert_eq!(
+            choose(vec![runtime(other, "21")], 21).unwrap().architecture,
+            other
+        );
     }
     #[test]
     fn chooses_newest_stable_update_within_the_closest_major_version() {
@@ -446,6 +549,7 @@ mod tests {
                     path: format!("java-{text}").into(),
                     version: JavaVersion::parse(text).unwrap(),
                     description: String::new(),
+                    architecture: crate::java_architecture::JavaArchitecture::X64,
                 })
                 .collect();
             assert_eq!(
