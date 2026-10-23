@@ -5,7 +5,6 @@ use crate::{
     logs::LogTail,
     metadata::valid_id,
     process_service::{ProcessMonitor, ProcessOutcome},
-    version,
 };
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
@@ -131,6 +130,7 @@ impl Backend {
             self.log(format!("{} 实例已就绪：{id}", kind.name()));
             return Ok(id);
         }
+        let expected_output = plan.output.context("现代安装包缺少输出验证要求")?;
         let resolved = mutation.resolve(game)?;
         let game_plan = crate::game_java_service::GameJavaResolver::new(
             &crate::game_java_service::JarClientVersionSource,
@@ -161,41 +161,91 @@ impl Backend {
                 self.log("等待另一个加载器安装任务释放游戏目录…");
             },
         )?;
-        let log_path = cache.join(format!("{artifact}-{full}.log"));
-        let output = fs::File::create(&log_path)?;
-        let mut tail = LogTail::open(&log_path)?;
-        let _ = self.tx.send(crate::backend::Message::Pauseable(false));
-        let child = Command::new(&runtime.path)
-            .args(["-Djava.awt.headless=true", "-jar"])
-            .arg(&installer)
-            .arg("--installClient")
-            .arg(&root)
-            .current_dir(&cache)
-            .stdout(Stdio::from(output.try_clone()?))
-            .stderr(Stdio::from(output))
-            .spawn()
-            .context("无法运行官方安装器")?;
-        let mut child = GameProcess(child);
-        let status = match ProcessMonitor::new(&self.control).run(
-            &mut child,
-            &mut tail,
-            |line| self.log(format!("安装器 · {line}")),
-            |warning| self.log(warning),
-        )? {
-            ProcessOutcome::Exited(status) => status,
-            ProcessOutcome::Cancelled => bail!("安装器已由用户终止"),
-        };
-        if !status.success() {
-            bail!(
-                "{} 安装器退出失败（{status}），日志：{}",
-                kind.name(),
-                log_path.display()
-            );
+        let mut profile_transaction =
+            crate::loader_profile_service::LoaderProfileTransaction::begin(&root, &id, &mutation)?;
+        let installation = (|| -> Result<()> {
+            let log_path = cache.join(format!("{artifact}-{full}.log"));
+            let output = fs::File::create(&log_path)?;
+            let mut tail = LogTail::open(&log_path)?;
+            let _ = self.tx.send(crate::backend::Message::Pauseable(false));
+            let stdout = Stdio::from(output.try_clone()?);
+            let stderr = Stdio::from(output);
+            profile_transaction.set_installer_active(true)?;
+            let mut command = Command::new(&runtime.path);
+            let environment = crate::java_environment_service::JavaEnvironment;
+            let removed = environment.apply(&mut command);
+            if let Some(notice) = environment.notice(&removed) {
+                self.log(notice);
+            }
+            let mut child = match GameProcess::spawn(
+                command
+                    .args(["-Djava.awt.headless=true", "-jar"])
+                    .arg(&installer)
+                    .arg("--installClient")
+                    .arg(&root)
+                    .current_dir(&cache)
+                    .stdin(Stdio::null())
+                    .stdout(stdout)
+                    .stderr(stderr),
+            ) {
+                Ok(child) => child,
+                Err(error) => {
+                    if !error.is::<crate::process_tree_service::SpawnCleanupUnconfirmed>() {
+                        profile_transaction.set_installer_active(false)?;
+                    }
+                    return Err(error).context("无法运行官方安装器");
+                }
+            };
+            let outcome = ProcessMonitor::new(&self.control).run(
+                &mut child,
+                &mut tail,
+                |line| self.log(format!("安装器 · {line}")),
+                |warning| self.log(warning),
+            )?;
+            profile_transaction.set_installer_active(false)?;
+            let status = match outcome {
+                ProcessOutcome::Exited(status) => status,
+                ProcessOutcome::Cancelled => bail!("安装器已由用户终止"),
+            };
+            if !status.success() {
+                bail!(
+                    "{} 安装器退出失败（{status}），日志：{}",
+                    kind.name(),
+                    log_path.display()
+                );
+            }
+            expected_output
+                .verify(&root, &self.control)
+                .context("安装器退出成功，但加载器实例尚不完整")?;
+            mutation
+                .resolve(&id)
+                .context("安装器没有生成完整版本信息")?;
+            drop(shared_installation);
+            let _ = self.tx.send(crate::backend::Message::Pauseable(true));
+            self.repair_with_session(config, &id, &mut mutation)?;
+            self.control.check()?;
+            Ok(())
+        })();
+        let result = installation.and_then(|()| profile_transaction.commit());
+        match result {
+            Ok(warning) => {
+                if let Some(warning) = warning {
+                    self.log(warning);
+                }
+            }
+            Err(error) => {
+                match profile_transaction.rollback() {
+                    Ok(Some(message)) => self.log(message),
+                    Ok(None) => {}
+                    Err(recovery) => {
+                        return Err(error).context(format!(
+                            "加载器安装失败，原配置恢复也失败；恢复记录已保留：{recovery:#}"
+                        ))
+                    }
+                }
+                return Err(error);
+            }
         }
-        version::resolve(&root, &id).context("安装器没有生成完整版本信息")?;
-        drop(shared_installation);
-        let _ = self.tx.send(crate::backend::Message::Pauseable(true));
-        self.repair_with_session(config, &id, &mut mutation)?;
         self.log(format!("{} 实例已就绪：{id}", kind.name()));
         Ok(id)
     }

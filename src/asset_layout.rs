@@ -1,7 +1,7 @@
 use crate::{
     download::valid_file,
     metadata::{safe_path, valid_id},
-    storage::atomic_copy,
+    storage::atomic_copy_controlled,
     task::TaskControl,
 };
 use anyhow::{bail, Context, Result};
@@ -41,7 +41,10 @@ pub fn reconstruct(
         if hash.len() != 40 || !hash.bytes().all(|c| c.is_ascii_hexdigit()) {
             bail!("无效资源 hash");
         }
-        let source = assets.join("objects").join(&hash[..2]).join(hash);
+        let source = assets
+            .join("objects")
+            .join(hash[..2].to_ascii_lowercase())
+            .join(hash.to_ascii_lowercase());
         let size = object["size"].as_u64();
         if virtual_layout {
             plan.push((source.clone(), safe_path(&game_assets, name)?, hash, size));
@@ -64,7 +67,7 @@ pub fn reconstruct(
         if !source.is_file() || !valid_file(&source, Some(hash), size)? {
             bail!("旧版资源缺失或损坏，请先修复实例：{}", source.display());
         }
-        atomic_copy(&dest, &mut fs::File::open(&source)?)?;
+        atomic_copy_controlled(&dest, &mut fs::File::open(&source)?, control)?;
     }
     if virtual_layout {
         fs::create_dir_all(&game_assets)?;

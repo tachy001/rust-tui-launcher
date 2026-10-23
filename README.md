@@ -13,9 +13,11 @@ Rust 编写的 Minecraft Java 版终端启动器，使用 Ratatui + Crossterm。
 - Java 自动发现与匹配、Mojang 官方 Java 运行时下载；自动模式缺少建议版本时尝试安装。
 - 版本隔离与每实例设置：Java、内存、隔离方式、JVM / 游戏附加参数；全局窗口大小设置。
 - Mod JAR 导入与启用 / 禁用；Modrinth `.mrpack` 与 CurseForge ZIP 导入新隔离实例，校验下载文件并合并 overrides。
-- 多离线账户；可配置微软设备代码登录、Xbox / Minecraft 资格检查、令牌刷新与系统安全凭证存储。
+- 多离线账户；微软浏览器授权登录（PKCE / 本地回调）、备用设备码登录、Xbox / Minecraft 资格检查、令牌刷新与系统安全凭证存储。发布者需内置本启动器的微软应用 ID，普通用户无需申请或填写 ID，见 [微软登录配置](docs/MICROSOFT-LOGIN.md)。
 - 实时游戏日志、历史日志查看、退出状态、明确确认后终止游戏、后台任务错误恢复。
 - TUI、命令行、F1 操作帮助和原子配置保存。
+
+Java 子进程不会继承 `JAVA_TOOL_OPTIONS`、`_JAVA_OPTIONS`、`JDK_JAVA_OPTIONS`，避免外部设置绕过启动器的内存和参数检查。需要的游戏 JVM 选项请写入全局或实例的 JVM 参数；检测到这些环境变量时，游戏 / 官方安装器启动日志会提示变量名称，不输出其值。此规则也用于 Java 探测；系统环境、PATH、语言和图形环境保持原样，官方安装器目前没有独立的自定义 JVM 参数入口。
 - 10 种界面语言即时切换，语言列表显示译文完成数（新增语言尚有英文回退，阿拉伯语排版为实验支持）；游戏语言可跟随启动器或按实例指定，兼容旧版语言代码。
 
 **实现不等于全部实测。** Windows 上已实际安装并启动原版 1.21.1 和 Fabric 0.19.5，完成图形、声音与资源初始化；也已下载并运行 Mojang Java 21。Forge 52.1.20 与 NeoForge 21.1.264 已完成官方安装器、客户端补丁生成和后续资源校验，详见 [Forge 记录](docs/FORGE-VALIDATION.md)与 [NeoForge 记录](docs/NEOFORGE-VALIDATION.md)，尚未启动这两个游戏实例。微软真实登录及跨平台行为仍未验收；整合包已有本地 ZIP 导入与修复证据，真实平台联网导入仍需验证，详见 [ROADMAP.md](ROADMAP.md)。
@@ -70,3 +72,13 @@ Cargo.lock           固定依赖版本，需提交 Git
 
 [MIT](LICENSE)。启动流程参考 HMCL、PCL，Rust 实现独立编写。
 本项目与 Mojang / Microsoft 无隶属关系。
+
+快速进入已有存档（游戏需在当前平台元数据中声明单人 Quick Play 支持）：
+
+```sh
+tui-launcher launch <实例ID> --world "存档目录名"
+```
+
+名称为该实例 `saves/` 下的目录名，支持空格和中文。`--world` 与 `--server` 按最后指定的目标互斥覆盖本次启动设置；`--no-world` 清除存档目标。启动前检查目录与 `level.dat` 是否存在，不自动创建新世界；旧版未声明支持时提示从游戏内打开。此入口尚未进行真实游戏快速进入验收。
+
+界面语言默认使用 `auto`（跟随系统），已有配置中明确保存的语言保持优先。设置的语言选择窗口可随时切回“System / 跟随系统”；CLI 可用 `--ui-language auto`。游戏语言设为 `launcher` 时跟随最终界面语言。无法匹配内置语言时回退英语，阿拉伯语仍可手动选择，自动模式采用英语以避免默认启用实验性 RTL 布局。

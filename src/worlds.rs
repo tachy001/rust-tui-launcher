@@ -1,7 +1,6 @@
 use crate::{
     backend::{Backend, Message},
     config::Config,
-    instances::InstanceLock,
     metadata::{safe_path, valid_id},
     task::TaskControl,
 };
@@ -17,6 +16,46 @@ static SERIAL: AtomicU64 = AtomicU64::new(0);
 const MAX_FILES: usize = 500_000;
 const MAX_BYTES: u64 = 256 * 1024 * 1024 * 1024;
 
+struct WorldMutationSession {
+    saves: PathBuf,
+    _instance: crate::instance_service::InstanceMutation,
+    _game: crate::download_lock::DownloadLease,
+}
+impl WorldMutationSession {
+    fn begin(config: &Config, id: &str) -> Result<Self> {
+        let root = config.root()?;
+        let instance = crate::instance_service::InstanceMutation::begin(&root, id)?;
+        let directory = config.effective(id)?.instance_dir(id)?;
+        let game = crate::download_lock::DownloadLease::try_acquire(&directory.join("options.txt"))
+            .context("游戏目录正在使用，无法安全备份或导入存档，请先关闭使用该目录的游戏或任务")?;
+        Ok(Self {
+            saves: directory.join("saves"),
+            _instance: instance,
+            _game: game,
+        })
+    }
+}
+struct OwnedBackup(Option<PathBuf>);
+impl OwnedBackup {
+    fn create(path: PathBuf) -> Result<(Self, fs::File)> {
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        Ok((Self(Some(path)), file))
+    }
+    fn published(&mut self) {
+        self.0 = None;
+    }
+}
+impl Drop for OwnedBackup {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
 fn reject_link(path: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     let linked = metadata.file_type().is_symlink();
@@ -29,6 +68,35 @@ fn reject_link(path: &Path) -> Result<()> {
         bail!("存档操作不跟随链接：{}", path.display());
     }
     Ok(())
+}
+pub(crate) fn require_world(game_dir: &Path, name: &str) -> Result<()> {
+    valid_id(name)?;
+    let saves = game_dir.join("saves");
+    let directory = saves.join(name);
+    reject_link(&saves).context("无法打开实例存档目录")?;
+    reject_link(&directory).context("所选存档不存在或不是普通目录")?;
+    let level = directory.join("level.dat");
+    reject_link(&level).context("所选存档缺少 level.dat")?;
+    if !directory.is_dir() || !level.is_file() {
+        bail!("所选目录不是有效存档");
+    }
+    Ok(())
+}
+#[cfg(test)]
+mod quick_play_tests {
+    use super::*;
+    #[test]
+    fn existing_named_world_is_required_and_never_created_by_preflight() {
+        let temp = crate::test_support::Workspace::new();
+        assert!(require_world(&temp.path, "missing").is_err());
+        assert!(!temp.path.join("saves").exists());
+        let world = temp.path.join("saves/中文 World");
+        fs::create_dir_all(&world).unwrap();
+        assert!(require_world(&temp.path, "中文 World").is_err());
+        fs::write(world.join("level.dat"), b"fixture, not a real NBT world").unwrap();
+        require_world(&temp.path, "中文 World").unwrap();
+        assert!(require_world(&temp.path, "../escape").is_err());
+    }
 }
 pub fn list(config: &Config, id: &str) -> Result<Vec<String>> {
     let saves = config.effective(id)?.instance_dir(id)?.join("saves");
@@ -100,14 +168,19 @@ fn copy_controlled(
     control: &TaskControl,
 ) -> Result<u64> {
     let mut buffer = [0; 65536];
-    let mut size = 0;
+    let mut size = 0u64;
     loop {
         control.check()?;
-        let n = reader.read(&mut buffer)?;
+        let n = match reader.read(&mut buffer) {
+            Ok(n) => n,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        };
+        control.check()?;
         if n == 0 {
             break;
         }
-        size += n as u64;
+        size = size.checked_add(n as u64).context("存档复制大小溢出")?;
         if size > MAX_BYTES {
             bail!("解压 / 备份文件超过大小上限");
         }
@@ -126,27 +199,16 @@ impl Backend {
         self.control.check()?;
         valid_id(id)?;
         valid_id(world)?;
-        let _lock = InstanceLock::acquire(&config.root()?.join("versions").join(id))?;
-        let saves = config.effective(id)?.instance_dir(id)?.join("saves");
+        let session = WorldMutationSession::begin(config, id)?;
+        let saves = session.saves.clone();
         reject_link(&saves)?;
         let source = safe_path(&saves, world)?;
         reject_link(&source)?;
         if !source.join("level.dat").is_file() {
             bail!("所选目录不是包含 level.dat 的世界");
         }
-        // Also honor the world's own lock where the platform exposes compatible locks.
-        let session_lock = if source.join("session.lock").exists() {
-            reject_link(&source.join("session.lock"))?;
-            let file = fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(source.join("session.lock"))?;
-            file.try_lock()
-                .context("世界可能正在游戏中使用，请先退出该世界")?;
-            Some(file)
-        } else {
-            None
-        };
+        let session_lock =
+            crate::world_lock_service::WorldSessionLock::existing(&source.join("session.lock"))?;
         let mut files = vec![];
         let mut bytes = 0;
         scan(&source, &source, 0, &mut files, &mut bytes, &self.control)?;
@@ -167,11 +229,19 @@ impl Backend {
             std::process::id(),
             SERIAL.fetch_add(1, Ordering::Relaxed)
         ));
+        let same_name = if cfg!(windows) {
+            temporary
+                .file_name()
+                .unwrap()
+                .eq_ignore_ascii_case(output.file_name().context("备份路径缺少文件名")?)
+        } else {
+            temporary.file_name() == output.file_name()
+        };
+        if same_name {
+            bail!("备份文件名与内部暂存名冲突，请选择其他输出名称");
+        }
+        let (mut temporary_owner, file) = OwnedBackup::create(temporary.clone())?;
         let result = (|| -> Result<()> {
-            let file = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temporary)?;
             let mut archive = zip::ZipWriter::new(file);
             let options = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Deflated);
@@ -185,29 +255,12 @@ impl Backend {
             }
             archive.finish()?.sync_all()?;
             self.control.check()?;
-            // Same-directory hard links publish atomically without copying large ZIPs twice.
-            if fs::hard_link(&temporary, output).is_ok() {
-                return Ok(());
-            }
-            // Filesystems without hard links use create_new to preserve an existing target.
-            let mut destination = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(output)?;
-            let commit = copy_controlled(
-                &mut fs::File::open(&temporary)?,
-                &mut destination,
-                &self.control,
-            )
-            .and_then(|_| Ok(destination.sync_all()?));
-            if commit.is_err() {
-                drop(destination);
-                let _ = fs::remove_file(output);
-            }
-            commit?;
+            crate::publication_service::NoReplacePublisher
+                .publish(&temporary, output)
+                .context("无法发布完整备份；目标可能已存在，或文件系统不支持无覆盖移动")?;
+            temporary_owner.published();
             Ok(())
         })();
-        let _ = fs::remove_file(&temporary);
         drop(session_lock);
         result
     }
@@ -215,8 +268,8 @@ impl Backend {
         self.control.check()?;
         valid_id(id)?;
         valid_id(name)?;
-        let _lock = InstanceLock::acquire(&config.root()?.join("versions").join(id))?;
-        let saves = config.effective(id)?.instance_dir(id)?.join("saves");
+        let session = WorldMutationSession::begin(config, id)?;
+        let saves = session.saves.clone();
         fs::create_dir_all(&saves)?;
         reject_link(&saves)?;
         let dest = safe_path(&saves, name)?;
@@ -301,10 +354,13 @@ impl Backend {
                     .tx
                     .send(Message::Progress("存档导入".into(), index + 1, count));
             }
+            self.control.check()?;
             if dest.exists() {
                 bail!("目标世界已出现，取消覆盖");
             }
-            fs::rename(&staging, &dest)?;
+            crate::publication_service::NoReplacePublisher
+                .publish(&staging, &dest)
+                .context("无法发布存档；目标可能已存在，或文件系统不支持无覆盖移动")?;
             Ok(())
         })();
         if result.is_err() {
@@ -330,6 +386,136 @@ mod tests {
     fn backend() -> Backend {
         let (tx, _) = std::sync::mpsc::channel();
         Backend::new(tx).unwrap()
+    }
+    #[test]
+    fn backup_honors_world_session_lock_before_creating_output() {
+        let temp = crate::test_support::Workspace::new();
+        let config = Config {
+            game_dir: temp.path.clone(),
+            isolated: false,
+            ..Default::default()
+        };
+        let world = temp.path.join("saves/world");
+        fs::create_dir_all(&world).unwrap();
+        fs::write(world.join("level.dat"), b"fixture").unwrap();
+        let lock_path = world.join("session.lock");
+        fs::write(&lock_path, b"unchanged lock content").unwrap();
+        let lock = crate::world_lock_service::WorldSessionLock::existing(&lock_path)
+            .unwrap()
+            .unwrap();
+        let output = temp.path.join("backup.zip");
+        assert!(backend()
+            .backup_world(&config, "test", "world", &output)
+            .is_err());
+        assert!(!output.exists());
+        drop(lock);
+        backend()
+            .backup_world(&config, "test", "world", &output)
+            .unwrap();
+        assert!(output.is_file());
+        assert_eq!(fs::read(lock_path).unwrap(), b"unchanged lock content");
+    }
+    #[test]
+    fn shared_game_directory_blocks_world_operations_before_files_are_created() {
+        let temp = crate::test_support::Workspace::new();
+        let config = Config {
+            game_dir: temp.path.clone(),
+            isolated: false,
+            ..Default::default()
+        };
+        let backend = backend();
+        let game = crate::download_lock::DownloadLease::try_acquire(&temp.path.join("options.txt"))
+            .unwrap();
+        let output = temp.path.join("backup.zip");
+        let missing = temp.path.join("missing.zip");
+        let error = backend
+            .import_world(&config, "other", &missing, "world")
+            .unwrap_err();
+        assert!(error.to_string().contains("游戏目录正在使用"));
+        assert!(backend
+            .backup_world(&config, "different", "world", &output)
+            .unwrap_err()
+            .to_string()
+            .contains("游戏目录正在使用"));
+        assert!(!temp.path.join("saves").exists());
+        assert!(!output.exists());
+        drop(game);
+        let session = WorldMutationSession::begin(&config, "other").unwrap();
+        assert!(
+            crate::download_lock::DownloadLease::try_acquire(&temp.path.join("options.txt"))
+                .is_err()
+        );
+        drop(session);
+        crate::download_lock::DownloadLease::try_acquire(&temp.path.join("options.txt")).unwrap();
+    }
+    #[test]
+    fn backup_temporary_cleanup_requires_successful_creation() {
+        let temp = crate::test_support::Workspace::new();
+        let path = temp.path.join("existing.tmp");
+        fs::write(&path, b"foreign data").unwrap();
+        assert!(OwnedBackup::create(path.clone()).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"foreign data");
+        let path = temp.path.join("owned.tmp");
+        let (owned, mut file) = OwnedBackup::create(path.clone()).unwrap();
+        file.write_all(b"private data").unwrap();
+        drop(file);
+        drop(owned);
+        assert!(!path.exists());
+        let (mut owned, file) = OwnedBackup::create(path.clone()).unwrap();
+        drop(file);
+        crate::publication_service::NoReplacePublisher
+            .publish(&path, &temp.path.join("published.zip"))
+            .unwrap();
+        owned.published();
+        fs::write(&path, b"new foreign file").unwrap();
+        drop(owned);
+        assert_eq!(fs::read(&path).unwrap(), b"new foreign file");
+    }
+    #[test]
+    fn controlled_copy_retries_interruption_and_checks_cancellation_after_read_or_eof() {
+        struct Reader<'a> {
+            control: &'a TaskControl,
+            data: std::io::Cursor<Vec<u8>>,
+            interrupt: bool,
+            cancel: bool,
+        }
+        impl Read for Reader<'_> {
+            fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+                if std::mem::take(&mut self.interrupt) {
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                let size = self.data.read(output)?;
+                if self.cancel {
+                    self.control.cancel();
+                }
+                Ok(size)
+            }
+        }
+        let control = TaskControl::default();
+        let mut reader = Reader {
+            control: &control,
+            data: std::io::Cursor::new(b"world data".to_vec()),
+            interrupt: true,
+            cancel: false,
+        };
+        let mut output = vec![];
+        assert_eq!(
+            copy_controlled(&mut reader, &mut output, &control).unwrap(),
+            10
+        );
+        assert_eq!(output, b"world data");
+        for data in [vec![], b"world data".to_vec()] {
+            let control = TaskControl::default();
+            let mut reader = Reader {
+                control: &control,
+                data: std::io::Cursor::new(data),
+                interrupt: false,
+                cancel: true,
+            };
+            let mut output = vec![];
+            assert!(copy_controlled(&mut reader, &mut output, &control).is_err());
+            assert!(output.is_empty());
+        }
     }
     #[test]
     fn backup_and_import_preserve_world_without_overwriting_existing_data() {

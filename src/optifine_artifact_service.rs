@@ -356,19 +356,19 @@ impl OptiFineIo for crate::backend::Backend {
         let _ = self.tx.send(crate::backend::Message::Pauseable(false));
         let result = (|| -> Result<()> {
             self.control.check()?;
-            let child = std::process::Command::new(&runtime.path)
-                .args(["-Djava.awt.headless=true", "-Dfile.encoding=UTF-8", "-cp"])
-                .arg(crate::paths::for_java(raw))
-                .arg("optifine.Patcher")
-                .arg(crate::paths::for_java(client))
-                .arg(crate::paths::for_java(raw))
-                .arg(crate::paths::for_java(output))
-                .current_dir(output.parent().context("OptiFine 工作目录缺失")?)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::from(file.try_clone()?))
-                .stderr(std::process::Stdio::from(file))
-                .spawn()?;
-            let mut child = crate::process_service::ManagedProcess(child);
+            let mut child = crate::process_service::ManagedProcess::spawn(
+                std::process::Command::new(&runtime.path)
+                    .args(["-Djava.awt.headless=true", "-Dfile.encoding=UTF-8", "-cp"])
+                    .arg(crate::paths::for_java(raw))
+                    .arg("optifine.Patcher")
+                    .arg(crate::paths::for_java(client))
+                    .arg(crate::paths::for_java(raw))
+                    .arg(crate::paths::for_java(output))
+                    .current_dir(output.parent().context("OptiFine 工作目录缺失")?)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::from(file.try_clone()?))
+                    .stderr(std::process::Stdio::from(file)),
+            )?;
             match crate::process_service::ProcessMonitor::new(&self.control).run(
                 &mut child,
                 &mut tail,

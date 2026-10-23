@@ -15,6 +15,28 @@ pub(crate) struct DownloadLease {
     _file: fs::File,
 }
 impl DownloadLease {
+    fn open(destination: &Path) -> Result<fs::File> {
+        let path = Self::lock_path(destination)?;
+        if fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            bail!("下载锁文件不能为符号链接");
+        }
+        Ok(fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?)
+    }
+    pub(crate) fn try_acquire(destination: &Path) -> Result<Self> {
+        let file = Self::open(destination)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Self { _file: file }),
+            Err(fs::TryLockError::WouldBlock) => {
+                bail!("共享游戏目录正在使用，请等待游戏或其他修改任务结束")
+            }
+            Err(fs::TryLockError::Error(error)) => Err(error).context("无法获取共享目录锁"),
+        }
+    }
     fn lock_path(destination: &Path) -> Result<PathBuf> {
         let parent = destination
             .parent()
@@ -45,16 +67,7 @@ impl DownloadLease {
         mut on_wait: impl FnMut(),
     ) -> Result<Self> {
         control.check()?;
-        let path = Self::lock_path(destination)?;
-        if fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_symlink()) {
-            bail!("下载锁文件不能为符号链接");
-        }
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)?;
+        let file = Self::open(destination)?;
         let mut reported = false;
         loop {
             control.check()?;
@@ -142,7 +155,7 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .spawn()
             .unwrap();
-        let mut child = crate::backend::GameProcess(child);
+        let mut child = crate::backend::GameProcess::from_child(child);
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while !ready.exists() {
             assert!(child.try_wait().unwrap().is_none(), "子进程意外退出");

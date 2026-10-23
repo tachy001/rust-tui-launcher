@@ -30,8 +30,18 @@ jobs:
           - os: macos-15
             name: macos-universal
     runs-on: ${{ matrix.os }}
+    env:
+      RUST_TUI_LAUNCHER_MICROSOFT_CLIENT_ID: ${{ vars.MICROSOFT_CLIENT_ID }}
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check release tag matches Cargo version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          python -c 'import os,tomllib; v=tomllib.load(open("Cargo.toml","rb"))["package"]["version"]; assert os.environ["GITHUB_REF_NAME"] == "v"+v, "Tag and Cargo version differ"'
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libdbus-1-dev
@@ -46,10 +56,10 @@ jobs:
       - name: Local tests
         run: cargo test --locked
       - name: Build
-        if: runner.os != 'macOS'
+        if: github.event_name != 'pull_request' && runner.os != 'macOS'
         run: cargo build --locked --release
       - name: Build macOS universal executable
-        if: runner.os == 'macOS'
+        if: github.event_name != 'pull_request' && runner.os == 'macOS'
         run: |
           rustup target add aarch64-apple-darwin x86_64-apple-darwin
           cargo build --locked --release --target aarch64-apple-darwin
@@ -57,17 +67,11 @@ jobs:
           mkdir -p target/release
           lipo -create target/aarch64-apple-darwin/release/tui-launcher target/x86_64-apple-darwin/release/tui-launcher -output target/release/tui-launcher
           lipo target/release/tui-launcher -verify_arch arm64 x86_64
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - name: Check release tag matches Cargo version
-        if: startsWith(github.ref, 'refs/tags/v')
-        shell: bash
-        run: |
-          python -c 'import os,tomllib; v=tomllib.load(open("Cargo.toml","rb"))["package"]["version"]; assert os.environ["GITHUB_REF_NAME"] == "v"+v, "Tag and Cargo version differ"'
       - name: Prepare release executable or minimal Unix package
+        if: github.event_name != 'pull_request'
         run: python scripts/package_release.py --platform ${{ matrix.name }}
       - name: Upload package
+        if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.name }}
@@ -78,7 +82,7 @@ jobs:
           if-no-files-found: error
 
   publish-release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-24.04
     permissions:

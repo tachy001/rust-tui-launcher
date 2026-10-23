@@ -80,7 +80,7 @@ const SETTINGS: [&str; 17] = [
     "并发下载数",
     "窗口宽度",
     "窗口高度",
-    "微软 OAuth 客户端 ID",
+    "微软应用 ID（高级覆盖）",
     "下载源（official / bmclapi / HTTPS）",
     "整合包可选文件（true / false）",
     "全屏启动（true / false）",
@@ -423,10 +423,16 @@ impl App {
                             let language =
                                 crate::localization::UiLanguage::parse(&self.config.language).ok();
                             self.language_picker = Some(
-                                crate::localization::UiLanguage::ALL
-                                    .iter()
-                                    .position(|value| Some(*value) == language)
-                                    .unwrap_or(0),
+                                if crate::localization::UiLanguage::is_system(&self.config.language)
+                                {
+                                    0
+                                } else {
+                                    crate::localization::UiLanguage::ALL
+                                        .iter()
+                                        .position(|value| Some(*value) == language)
+                                        .map(|index| index + 1)
+                                        .unwrap_or(0)
+                                },
                             );
                         }
                     } else {
@@ -467,7 +473,14 @@ impl App {
                 if let Some(entry) = self.trash.get(self.selection) {
                     let token = entry.token.clone();
                     let result = crate::instances::restore(&self.config, &token);
-                    self.report(result.map(|id| tformat!("已恢复实例：{id}", id = id)));
+                    self.report(result.map(|restored| {
+                        let mut message = tformat!("已恢复实例：{id}", id = restored.id);
+                        if let Some(warning) = restored.cleanup_warning {
+                            message.push('\n');
+                            message.push_str(&warning);
+                        }
+                        message
+                    }));
                     self.local = backend::installed(&self.config);
                     self.names = crate::instances::names(&self.config);
                     self.refresh_trash();
@@ -797,7 +810,6 @@ impl App {
                 15 => instance.game_language = Some(value.trim().into()),
                 _ => bail!("此项为全局设置，按 G 切换到全局后修改"),
             }
-            candidate.effective(id)?.validate()?;
         } else {
             match self.setting {
                 0 => candidate.username = value.into(),
@@ -819,7 +831,11 @@ impl App {
                 _ => candidate.language = value.trim().into(),
             }
         }
-        candidate.save()?;
+        if let Some(id) = &self.scope {
+            crate::instances::save_settings(&candidate, id)?;
+        } else {
+            candidate.save()?;
+        }
         self.config = candidate;
         crate::localization::set(&self.config.language);
         self.local = backend::installed(&self.config);
@@ -1075,7 +1091,7 @@ impl App {
             return false;
         }
         if let Some(selected) = self.language_picker {
-            let count = crate::localization::UiLanguage::ALL.len();
+            let count = crate::localization::UiLanguage::ALL.len() + 1;
             match key.code {
                 KeyCode::Up => self.language_picker = Some((selected + count - 1) % count),
                 KeyCode::Down => self.language_picker = Some((selected + 1) % count),
@@ -1083,7 +1099,11 @@ impl App {
                 KeyCode::End => self.language_picker = Some(count - 1),
                 KeyCode::Esc => self.language_picker = None,
                 KeyCode::Enter => {
-                    let code = crate::localization::UiLanguage::ALL[selected].game_code();
+                    let code = if selected == 0 {
+                        "auto"
+                    } else {
+                        crate::localization::UiLanguage::ALL[selected - 1].game_code()
+                    };
                     match self.save_setting(code) {
                         Ok(()) => self.language_picker = None,
                         Err(error) => self.log(format!("{error:#}")),
@@ -1664,9 +1684,7 @@ impl App {
             }
             KeyCode::Char('d') if self.tab == 2 && self.task.is_none() => {
                 if let Some(id) = &self.scope {
-                    self.config.instances.remove(id);
-                    let result = crate::instances::clear_settings(&self.config, id)
-                        .and_then(|_| self.config.save());
+                    let result = crate::instances::reset_settings(&mut self.config, id);
                     self.report(result.map(|_| "实例已恢复继承全局设置".into()));
                 }
             }
@@ -1786,7 +1804,7 @@ pub fn run(config: Config) -> Result<()> {
         "欢迎使用 Tui-Launcher。Enter 管理所选实例 · Space 启动 · 1–5 一级导航 · Esc 返回上一级",
     ));
     app.log(tr(
-        "账户 › 微软登录：请先在设置 › 全局游戏与下载设置中配置自己的 OAuth 客户端 ID。",
+        "账户 › 微软登录：按 A 打开浏览器授权，完成后自动返回启动器。",
     ));
     loop {
         app.messages();
@@ -1860,7 +1878,7 @@ fn page_actions(app: &App) -> &'static str {
         3 if app.mod_versions.is_some() => tr("Enter 安装所选版本\nBackspace 返回搜索结果 · L 本地 Mod"),
         3 if app.mod_search.is_some() => tr("Enter 安装 · V 选择版本 · B 搜索\nN 下一页 · P 上一页 · L 本地 Mod"),
         3 => tr("Enter 启停 · A 导入 JAR · B 在线搜索\nU 检查更新 · Del 移出 · Z 恢复 · R 刷新\nEsc 返回实例管理"),
-        4 => tr("Enter 切换账户 · N 添加离线账户\nA 微软登录 · D 移除账户\nShift+K 配置 CurseForge 密钥\n微软登录：先在设置中填写 OAuth 应用 ID"),
+        4 => tr("Enter 切换账户 · N 添加离线账户\nA 微软登录 · D 移除账户\nShift+K 配置 CurseForge 密钥\n微软登录：浏览器授权后自动返回"),
         _ => tr("Enter 恢复实例 · R 刷新\nEsc 返回设置菜单"),
     }
 }
@@ -2299,7 +2317,7 @@ fn draw(f: &mut Frame, app: &App) {
                 })
                 .collect();
             render_list(f, items, tr("账户管理").into(), app.selection, cols[0]);
-            f.render_widget(Paragraph::new(tformat!("\n Enter 选择账户\n N 添加离线账户\n A 微软设备代码登录\n Shift+K 配置 CurseForge 密钥\n D 移除账户与本机凭证\n\n 微软凭证保存在系统安全存储。\n 在设置中填写自己的应用 ID\n 后即可开始登录。\n\n {}",app.logs.back().map(String::as_str).unwrap_or(""))).block(panel(tr("登录"))).wrap(Wrap{trim:false}),cols[1]);
+            f.render_widget(Paragraph::new(tformat!("\n Enter 选择账户\n N 添加离线账户\n A 浏览器登录微软账户\n Shift+K 配置 CurseForge 密钥\n D 移除账户与本机凭证\n\n 浏览器授权后自动返回启动器。\n 微软凭证保存在系统安全存储。\n 无法使用浏览器时可运行\n account login-device。\n\n {}",app.logs.back().map(String::as_str).unwrap_or(""))).block(panel(tr("登录"))).wrap(Wrap{trim:false}),cols[1]);
         }
         _ => {
             let items = app
@@ -2607,16 +2625,15 @@ fn draw(f: &mut Frame, app: &App) {
     if let Some(selected) = app.language_picker {
         let dialog = dialog_rect(area, 78, 16);
         f.render_widget(Clear, dialog);
-        let items: Vec<_> = crate::localization::UiLanguage::ALL
-            .iter()
-            .map(|language| {
+        let items: Vec<_> = std::iter::once(ListItem::new("System / 跟随系统 [auto]"))
+            .chain(crate::localization::UiLanguage::ALL.iter().map(|language| {
                 let (translated, total) = language.coverage();
                 ListItem::new(format!(
                     "{}  [{}]  {translated}/{total}",
                     language.name(),
                     language.game_code()
                 ))
-            })
+            }))
             .collect();
         let mut state = ListState::default().with_selected(Some(selected));
         f.render_stateful_widget(
@@ -2649,12 +2666,13 @@ mod tests {
     #[test]
     fn multilingual_picker_navigation_and_all_language_frames() {
         let mut app = app();
+        app.config.language = "auto".into();
         app.tab = 2;
         app.setting = 16;
         app.action();
         assert_eq!(app.language_picker, Some(0));
         app.key(event::KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
-        assert_eq!(app.language_picker, Some(9));
+        assert_eq!(app.language_picker, Some(10));
         app.key(event::KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(app.language_picker, Some(0));
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
@@ -3107,7 +3125,14 @@ mod tests {
     }
     fn app() -> App {
         let (tx, rx) = mpsc::channel();
-        let mut app = App::new(Config::default(), tx, rx);
+        let mut app = App::new(
+            Config {
+                language: "zh_cn".into(),
+                ..Config::default()
+            },
+            tx,
+            rx,
+        );
         app.nav_focused = false;
         app.local = vec!["1.21.1".into(), "fabric-loader-1.20.1".into()];
         app

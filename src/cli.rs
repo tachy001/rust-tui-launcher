@@ -41,6 +41,7 @@ const HELP: &str = "Rust TUI Launcher — Minecraft Java 终端启动器
   instance remove <ID>         移至回收站，保留全部实例数据
   instance trash               列出回收站
   instance restore <回收站ID>  恢复实例
+  instance recover-loader <ID> --installer-stopped  确认安装器已停止后恢复中断的实例配置
   doctor / --doctor            诊断配置、Java 和本地版本
   mods <实例> list             列出 Mod
   mods <实例> add <JAR路径>    导入 Mod（不覆盖）
@@ -57,7 +58,8 @@ const HELP: &str = "Rust TUI Launcher — Minecraft Java 终端启动器
   account offline <用户名>     添加并选择离线账户
   account select <账户ID>      切换账户
   account remove <账户ID>      移除账户及安全凭证
-  account login                微软设备代码登录
+  account login                打开浏览器登录微软账户
+  account login-device         备用微软设备码登录
   account client-id <GUID>      配置自己的 OAuth 应用 ID
   curseforge key --stdin        从标准输入保存自己的 API 密钥
   curseforge clear-key          移除已保存 API 密钥
@@ -67,9 +69,10 @@ const HELP: &str = "Rust TUI Launcher — Minecraft Java 终端启动器
   --memory <MB>  --threads <1-16>  --shared  --isolated
   --source <official|bmclapi|HTTPS根地址>  --no-optional
   --fullscreen / --windowed  --server <主机[:端口]>  --no-server
+  --world <存档目录名> / --no-world  快速进入已有本地存档（游戏需支持 Quick Play）
   --native-patches / --no-native-patches（启动时 ARM 原生库兼容替换）
   --language <launcher / zh_cn / zh_tw / en_us / keep>  启动前同步游戏语言
-  --ui-language <代码>  zh_cn / en_us / zh_tw / ja_jp / de_de / es_es / ru_ru / uk_ua / ar_sa / lzh
+  --ui-language <代码>  auto（跟随系统）/ zh_cn / en_us / zh_tw / ja_jp / de_de / es_es / ru_ru / uk_ua / ar_sa / lzh
 ";
 struct Options {
     config: Config,
@@ -81,6 +84,7 @@ fn parse(mut config: Config, raw: Vec<String>) -> Result<Options> {
     let mut snapshots = false;
     let mut fullscreen_override = None;
     let mut server_override = None;
+    let mut world_override = None;
     let mut native_patches_override = None;
     let mut language_override = None;
     let mut iter = raw.into_iter();
@@ -122,6 +126,21 @@ fn parse(mut config: Config, raw: Vec<String>) -> Result<Options> {
             "--server" => {
                 config.server = iter.next().context("--server 缺少地址")?;
                 server_override = Some(config.server.clone());
+                config.quick_play_world.clear();
+                world_override = Some(String::new());
+            }
+            "--world" => {
+                config.quick_play_world = iter.next().context("--world 缺少存档目录名")?;
+                if config.quick_play_world.is_empty() {
+                    bail!("--world 存档目录名不能为空");
+                }
+                world_override = Some(config.quick_play_world.clone());
+                config.server.clear();
+                server_override = Some(String::new());
+            }
+            "--no-world" => {
+                config.quick_play_world.clear();
+                world_override = Some(String::new());
             }
             "--no-server" => {
                 config.server.clear();
@@ -147,6 +166,9 @@ fn parse(mut config: Config, raw: Vec<String>) -> Result<Options> {
             }
             if let Some(server) = server_override {
                 instance.server = Some(server);
+            }
+            if let Some(world) = world_override {
+                instance.quick_play_world = Some(world);
             }
             if let Some(enabled) = native_patches_override {
                 instance.patch_natives = Some(enabled);
@@ -255,13 +277,31 @@ pub fn run(config: Config, raw: Vec<String>) -> Result<()> {
                 }
                 "restore" => {
                     exact(&args, 3)?;
-                    println!("已恢复：{}", crate::instances::restore(&config, &args[2])?);
+                    let restored = crate::instances::restore(&config, &args[2])?;
+                    println!("已恢复：{}", restored.id);
+                    if let Some(warning) = restored.cleanup_warning {
+                        eprintln!("{warning}");
+                    }
                 }
                 "trash" => {
                     exact(&args, 2)?;
                     for entry in crate::instances::trash_list(&config)? {
                         println!("{} · {} · {}", entry.token, entry.id, entry.label);
                     }
+                }
+                "recover-loader" => {
+                    exact(&args, 4)?;
+                    if args[3] != "--installer-stopped" {
+                        bail!("必须确认安装器已停止，再使用 instance recover-loader <ID> --installer-stopped");
+                    }
+                    println!(
+                        "{}",
+                        crate::loader_profile_service::LoaderProfileTransaction::recover_stopped(
+                            &config.root()?,
+                            &args[2]
+                        )?
+                        .unwrap_or_else(|| "没有待恢复的加载器配置".into())
+                    );
                 }
                 "clone" => {}
                 _ => bail!("未知实例管理命令"),
@@ -540,10 +580,12 @@ pub fn run(config: Config, raw: Vec<String>) -> Result<()> {
             }
             "account" => {
                 exact(&args, 2)?;
-                if args[1] != "login" {
-                    bail!("使用 account login 登录");
-                }
-                println!("{}", backend.login_microsoft(&config)?);
+                let result = match args[1].as_str() {
+                    "login" => backend.login_microsoft(&config)?,
+                    "login-device" => backend.login_microsoft_device(&config)?,
+                    _ => bail!("使用 account login 或 account login-device 登录"),
+                };
+                println!("{result}");
             }
             "remote" => {
                 if args.len() > 2 {
@@ -769,5 +811,51 @@ mod tests {
     fn invalid_options_fail() {
         assert!(parse(Config::default(), vec!["--memory".into()]).is_err());
         assert!(parse(Config::default(), vec!["--threads".into(), "0".into()]).is_err());
+    }
+
+    #[test]
+    fn world_and_server_cli_targets_override_saved_options_without_persisting() {
+        let mut saved = Config::default();
+        saved.instances.entry("test".into()).or_default().server = Some("old.example.org".into());
+        let options = parse(
+            saved.clone(),
+            ["launch", "test", "--world", "中文 World"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        )
+        .unwrap();
+        let effective = options.config.effective("test").unwrap();
+        assert_eq!(effective.quick_play_world, "中文 World");
+        assert!(effective.server.is_empty());
+        let options = parse(
+            saved,
+            [
+                "launch",
+                "test",
+                "--world",
+                "world",
+                "--server",
+                "new.example.org",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        )
+        .unwrap();
+        let effective = options.config.effective("test").unwrap();
+        assert!(effective.quick_play_world.is_empty());
+        assert_eq!(effective.server, "new.example.org");
+        for args in [
+            vec!["--world"],
+            vec!["--world", "../escape"],
+            vec!["--world", ""],
+        ] {
+            assert!(parse(
+                Config::default(),
+                args.into_iter().map(str::to_owned).collect()
+            )
+            .is_err());
+        }
     }
 }

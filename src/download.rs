@@ -2,7 +2,7 @@ use crate::{backend::Message, task::TaskControl};
 use anyhow::{anyhow, bail, Context, Result};
 use reqwest::{
     blocking::Client,
-    header::{CONTENT_RANGE, RANGE},
+    header::{CONTENT_RANGE, DATE, ETAG, IF_RANGE, RANGE, RETRY_AFTER},
     StatusCode,
 };
 use sha1::{Digest, Sha1};
@@ -79,6 +79,7 @@ impl DownloadPlan {
     }
 }
 pub struct Downloader {
+    pub(crate) retry: std::sync::Arc<crate::download_retry_service::DownloadRetryCoordinator>,
     pub client: Client,
     pub control: TaskControl,
     pub tx: Sender<Message>,
@@ -136,7 +137,10 @@ impl Downloader {
             }
             let mut used = std::collections::HashSet::new();
             candidates.retain(|url| used.insert(url.clone()));
-            for url in candidates {
+            while let Some(next) =
+                (0..candidates.len()).min_by_key(|index| self.retry.remaining(&candidates[*index]))
+            {
+                let url = candidates.remove(next);
                 let parsed = reqwest::Url::parse(&url)?;
                 if parsed.scheme() != "https"
                     && !(cfg!(test)
@@ -165,6 +169,10 @@ impl Downloader {
                         entry.dest.file_name().unwrap_or_default().to_string_lossy()
                     )));
                     last = Some(error);
+                    if attempt < 2 {
+                        self.control
+                            .wait(std::time::Duration::from_millis(250 * (attempt + 1)))?;
+                    }
                 }
             }
         }
@@ -178,29 +186,96 @@ impl Downloader {
         meter: &crate::download_progress::Meter<'_>,
         job: usize,
     ) -> Result<()> {
-        let offset = fs::metadata(partial).map(|m| m.len()).unwrap_or(0);
+        self.retry
+            .wait(&entry.url, &self.control, |origin, seconds| {
+                let _ = self.tx.send(Message::Log(format!(
+                    "下载源暂时限流或不可用，等待约 {seconds} 秒：{origin}；可取消任务"
+                )));
+            })?;
+        let binding = crate::download_resume_service::ResumeBinding::new(partial);
+        let validator = entry
+            .sha1
+            .is_none()
+            .then(|| binding.validator(&entry.url))
+            .flatten();
+        let offset = if entry.sha1.is_some() || validator.is_some() {
+            fs::metadata(partial).map(|m| m.len()).unwrap_or(0)
+        } else {
+            0
+        };
         let mut request = self.client.get(&entry.url);
         if offset > 0 {
             request = request.header(RANGE, format!("bytes={offset}-"));
+            if entry.sha1.is_none() {
+                request = request.header(IF_RANGE, validator.as_deref().unwrap());
+            }
         }
         let mut response = request.send()?;
+        self.retry.response(
+            &entry.url,
+            response.status().as_u16(),
+            response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            response
+                .headers()
+                .get(DATE)
+                .and_then(|value| value.to_str().ok()),
+        )?;
+        if response.url().as_str() != entry.url {
+            self.retry.response(
+                response.url().as_str(),
+                response.status().as_u16(),
+                response
+                    .headers()
+                    .get(RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok()),
+                response
+                    .headers()
+                    .get(DATE)
+                    .and_then(|value| value.to_str().ok()),
+            )?;
+        }
         if response.status() == StatusCode::RANGE_NOT_SATISFIABLE {
             // A complete .part can remain after a crash just before rename.
             if offset > 0
-                && (entry.sha1.is_some() || entry.size.is_some())
+                && entry.sha1.is_some()
                 && valid_file(partial, entry.sha1.as_deref(), entry.size)?
                 && valid_archive(partial, &entry.dest)?
             {
                 meter.update(job, offset, Some(offset), 0);
                 self.control.check()?;
-                return commit(partial, &entry.dest);
+                commit(partial, &entry.dest)?;
+                binding.clear();
+                return Ok(());
             }
             let _ = fs::remove_file(partial);
+            binding.clear();
             bail!("服务器拒绝断点，下一次从头下载");
         }
         response.error_for_status_ref()?;
+        if !matches!(
+            response.status(),
+            StatusCode::OK | StatusCode::PARTIAL_CONTENT
+        ) {
+            bail!(
+                "下载响应没有提供完整或部分文件（HTTP {}）",
+                response.status().as_u16()
+            );
+        }
         let resume = offset > 0 && response.status() == StatusCode::PARTIAL_CONTENT;
+        let response_etag = response
+            .headers()
+            .get(ETAG)
+            .and_then(|value| value.to_str().ok());
+        if resume && entry.sha1.is_none() && response_etag != validator.as_deref() {
+            binding.clear();
+            fs::remove_file(partial)?;
+            bail!("断点响应的文件标识不一致，下一次从头下载");
+        }
         let mut range_total = None;
+        let mut body_length = response.content_length();
         if response.status() == StatusCode::PARTIAL_CONTENT {
             let range = response
                 .headers()
@@ -211,44 +286,50 @@ impl Downloader {
             if total.is_none() && entry.size.is_none() && entry.sha1.is_none() {
                 bail!("断点响应未提供总大小，且没有文件校验信息，无法确认下载完整");
             }
-            if entry
-                .size
-                .is_some_and(|size| total.is_some_and(|total| total != size))
-            {
-                bail!("断点响应的总大小与下载元数据不符");
-            }
             if response
                 .content_length()
                 .is_some_and(|length| length != end - if resume { offset } else { 0 } + 1)
             {
                 bail!("断点响应的长度与 Content-Range 不符");
             }
+            body_length = Some(end - if resume { offset } else { 0 } + 1);
             range_total = total;
         }
-        let expected_len = range_total.or_else(|| {
-            response
-                .content_length()
-                .map(|len| len + if resume { offset } else { 0 })
-        });
+        let mut extent = crate::transfer_extent_service::TransferExtent::new(
+            if resume { offset } else { 0 },
+            body_length,
+            range_total,
+            entry.size,
+            response.status() == StatusCode::PARTIAL_CONTENT,
+        )?;
+        let expected_len = extent.total();
         let mut file = fs::OpenOptions::new()
             .create(true)
             .write(true)
             .append(resume)
             .truncate(!resume)
             .open(partial)?;
+        if entry.sha1.is_none() {
+            // Truncate old bytes before publishing new validator metadata.
+            binding.record(&entry.url, response_etag)?;
+        } else {
+            binding.invalidate()?;
+        }
         let mut buffer = [0u8; 65536];
         let mut position = if resume { offset } else { 0 };
         meter.update(job, position, entry.size.or(expected_len), 0);
         loop {
             self.control.check()?;
             let n = response.read(&mut buffer)?;
+            self.control.check()?;
             if n == 0 {
                 break;
             }
+            position = extent.accept(n)?;
             file.write_all(&buffer[..n])?;
-            position += n as u64;
             meter.update(job, position, entry.size.or(expected_len), n as u64);
         }
+        extent.finish()?;
         file.sync_all()?;
         drop(file);
         if expected_len.is_some_and(|size| {
@@ -260,15 +341,19 @@ impl Downloader {
         }
         if !valid_file(partial, entry.sha1.as_deref(), entry.size)? {
             fs::remove_file(partial)?;
+            binding.clear();
             bail!("文件大小或 SHA-1 校验失败");
         }
         if !valid_archive(partial, &entry.dest)? {
             fs::remove_file(partial)?;
+            binding.clear();
             bail!("下载结果不是有效 JAR / ZIP 文件");
         }
         self.control.check()?;
         meter.update(job, position, Some(position), 0);
-        commit(partial, &entry.dest)
+        commit(partial, &entry.dest)?;
+        binding.clear();
+        Ok(())
     }
     pub fn many(&self, entries: Vec<Download>, workers: usize, label: &str) -> Result<()> {
         let plan = DownloadPlan::new(entries)?;
@@ -428,6 +513,7 @@ mod tests {
         };
         let handle = thread::spawn(move || {
             let downloader = Downloader {
+                retry: Default::default(),
                 client: Client::builder()
                     .timeout(std::time::Duration::from_millis(100))
                     .build()
@@ -531,6 +617,7 @@ mod tests {
         });
         let (tx, rx) = std::sync::mpsc::channel();
         let downloader = Downloader {
+            retry: Default::default(),
             client: Client::new(),
             control: TaskControl::default(),
             tx,
@@ -565,6 +652,169 @@ mod tests {
         request_test("resume", b"a", "HTTP/1.1 206 Partial Content\r\nContent-Length: 2\r\nContent-Range: bytes 1-2/3\r\nConnection: close\r\n\r\nbc", "range: bytes=1-");
     }
     #[test]
+    fn rate_limited_origin_does_not_delay_an_available_mirror() {
+        fn serve(response: impl Into<String>) -> (String, thread::JoinHandle<()>) {
+            let response = response.into();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let handle = thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                && std::time::Instant::now() < deadline =>
+                        {
+                            thread::sleep(std::time::Duration::from_millis(10))
+                        }
+                        Err(error) => panic!("local retry fixture: {error}"),
+                    }
+                };
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = vec![];
+                let mut byte = [0];
+                while socket.read(&mut byte).unwrap() > 0 {
+                    request.push(byte[0]);
+                    if request.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                socket.write_all(response.as_bytes()).unwrap();
+            });
+            (base, handle)
+        }
+        let workspace = crate::test_support::Workspace::new();
+        let (limited, first) = serve("HTTP/1.1 429 Too Many Requests\r\nRetry-After: 60\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let (redirect, redirected) = serve(format!("HTTP/1.1 302 Found\r\nLocation: {limited}/redirected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"));
+        let (available, second) =
+            serve("HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc");
+        let control = TaskControl::default();
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completed = done.clone();
+        let signal = control.clone();
+        let timer = thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while !completed.load(Ordering::Relaxed) && std::time::Instant::now() < deadline {
+                thread::sleep(std::time::Duration::from_millis(10));
+            }
+            if !completed.load(Ordering::Relaxed) {
+                signal.cancel();
+            }
+        });
+        let (tx, _) = std::sync::mpsc::channel();
+        let downloader = Downloader {
+            retry: Default::default(),
+            client: Client::builder()
+                .no_proxy()
+                .timeout(std::time::Duration::from_secs(3))
+                .build()
+                .unwrap(),
+            control,
+            tx,
+            source: "official".into(),
+        };
+        let destination = workspace.path.join("file");
+        let result = downloader.fetch(&Download {
+            url: format!("{redirect}/first"),
+            dest: destination.clone(),
+            sha1: Some("a9993e364706816aba3e25717850c26c9cd0d89d".into()),
+            size: Some(3),
+            alternatives: vec![format!("{limited}/other"), format!("{available}/file")],
+        });
+        done.store(true, Ordering::Relaxed);
+        timer.join().unwrap();
+        first.join().unwrap();
+        redirected.join().unwrap();
+        second.join().unwrap();
+        result.unwrap();
+        assert_eq!(fs::read(destination).unwrap(), b"abc");
+        assert!(!downloader
+            .retry
+            .remaining(&format!("{limited}/another"))
+            .is_zero());
+        assert!(!downloader
+            .retry
+            .remaining(&format!("{redirect}/another"))
+            .is_zero());
+    }
+    #[test]
+    fn unhashed_resume_uses_if_range_and_restarts_or_rejects_changed_content() {
+        enum Remaining {
+            Missing,
+            Exact(&'static [u8]),
+            AtMost(usize),
+        }
+        for (tag, response, expected, remaining) in [
+            (Some("\"v1\""), "HTTP/1.1 206 Partial Content\r\nETag: \"v1\"\r\nContent-Length: 2\r\nContent-Range: bytes 1-2/3\r\nConnection: close\r\n\r\nbc", Some(&b"abc"[..]), Remaining::Missing),
+            (Some("\"v1\""), "HTTP/1.1 200 OK\r\nETag: \"v2\"\r\nContent-Length: 3\r\nConnection: close\r\n\r\nxyz", Some(&b"xyz"[..]), Remaining::Missing),
+            (None, "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nxyz", Some(&b"xyz"[..]), Remaining::Missing),
+            (Some("\"v1\""), "HTTP/1.1 206 Partial Content\r\nETag: \"v2\"\r\nContent-Length: 2\r\nContent-Range: bytes 1-2/3\r\nConnection: close\r\n\r\nyz", None, Remaining::Missing),
+            (None, "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nwxyz", None, Remaining::Exact(b"a")),
+            (None, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n4\r\nwxyz\r\n0\r\n\r\n", None, Remaining::AtMost(3)),
+            (Some("\"v1\""), "HTTP/1.1 206 Partial Content\r\nETag: \"v1\"\r\nContent-Range: bytes 1-1/3\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n2\r\nbc\r\n0\r\n\r\n", None, Remaining::AtMost(2)),
+            (None, "HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n", None, Remaining::Exact(b"a")),
+        ] {
+            let workspace = crate::test_support::Workspace::new();
+            let dest = workspace.path.join("file");
+            let partial = workspace.path.join("file.part");
+            fs::write(&partial, b"a").unwrap();
+            let server = TcpListener::bind("127.0.0.1:0").unwrap();
+            server.set_nonblocking(true).unwrap();
+            let url = format!("http://{}/file", server.local_addr().unwrap());
+            let binding = crate::download_resume_service::ResumeBinding::new(&partial);
+            binding.record(&url, tag).unwrap();
+            let handle = thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let mut socket = loop {
+                    match server.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock && std::time::Instant::now() < deadline => thread::sleep(std::time::Duration::from_millis(10)),
+                        Err(error) => panic!("local HTTP fixture: {error}"),
+                    }
+                };
+                socket.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                let mut request = vec![];
+                let mut byte = [0];
+                while socket.read(&mut byte).unwrap() > 0 {
+                    request.push(byte[0]);
+                    if request.ends_with(b"\r\n\r\n") { break; }
+                }
+                let request = String::from_utf8(request).unwrap().to_lowercase();
+                if tag.is_some() {
+                    assert!(request.contains("range: bytes=1-"));
+                    assert!(request.contains("if-range: \"v1\""));
+                } else {
+                    assert!(!request.contains("range:"));
+                }
+                socket.write_all(response.as_bytes()).unwrap();
+            });
+            let (tx, _) = std::sync::mpsc::channel();
+            let downloader = Downloader { retry: Default::default(), client: Client::builder().no_proxy().timeout(std::time::Duration::from_secs(5)).build().unwrap(), control: TaskControl::default(), tx, source:"official".into() };
+            let meter = crate::download_progress::Meter::new("file", [Some(3)], &downloader.tx);
+            let result = downloader.attempt(&Download { url: url.clone(), dest: dest.clone(), sha1:None, size:Some(3), alternatives:vec![] }, &partial, &meter, 0);
+            handle.join().unwrap();
+            if let Some(bytes) = expected {
+                result.unwrap();
+                assert_eq!(fs::read(&dest).unwrap(), bytes);
+            } else {
+                assert!(result.is_err());
+                assert!(!dest.exists());
+            }
+            match remaining {
+                Remaining::Missing => assert!(!partial.exists()),
+                Remaining::Exact(bytes) => assert_eq!(fs::read(&partial).unwrap(), bytes),
+                Remaining::AtMost(limit) => assert!(fs::metadata(&partial).unwrap().len() <= limit as u64),
+            }
+            if matches!(remaining, Remaining::Missing) || tag.is_none() {
+                assert!(binding.validator(&url).is_none());
+            }
+        }
+    }
+    #[test]
     fn complete_partial_is_committed_after_range_rejection() {
         request_test(
             "complete",
@@ -590,6 +840,7 @@ mod tests {
         let downloader = Downloader {
             client: Client::new(),
             control,
+            retry: Default::default(),
             tx,
             source: "official".into(),
         };

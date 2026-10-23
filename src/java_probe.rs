@@ -20,6 +20,7 @@ static SERIAL: AtomicU64 = AtomicU64::new(0);
 struct CaptureDirectory {
     path: PathBuf,
     parent: PathBuf,
+    cleanup: bool,
 }
 impl CaptureDirectory {
     fn create(root: &Path) -> Result<Self> {
@@ -39,7 +40,11 @@ impl CaptureDirectory {
             builder
         };
         builder.create(&path)?;
-        Ok(Self { path, parent })
+        Ok(Self {
+            path,
+            parent,
+            cleanup: true,
+        })
     }
     fn file(&self, name: &str) -> Result<fs::File> {
         let mut options = fs::OpenOptions::new();
@@ -54,6 +59,9 @@ impl CaptureDirectory {
 }
 impl Drop for CaptureDirectory {
     fn drop(&mut self) {
+        if !self.cleanup {
+            return;
+        }
         if fs::canonicalize(&self.parent).ok().as_ref() != Some(&self.parent) {
             return;
         }
@@ -95,70 +103,100 @@ impl<'a> JavaProbe<'a> {
     }
     fn run(&self, command: &mut Command) -> Result<(JavaVersion, JavaArchitecture, String)> {
         self.control.check()?;
-        let directory = CaptureDirectory::create(&self.root)?;
+        crate::java_environment_service::JavaEnvironment.apply(command);
+        let mut directory = CaptureDirectory::create(&self.root)?;
         let mut stdout = directory.file("stdout")?;
         let mut stderr = directory.file("stderr")?;
         self.control.check()?;
-        let mut child = ManagedProcess(
+        let mut child = match ManagedProcess::spawn(
             command
                 .stdin(Stdio::null())
                 .stdout(Stdio::from(stdout.try_clone()?))
-                .stderr(Stdio::from(stderr.try_clone()?))
-                .spawn()
-                .context("找不到或无法执行 Java，请检查可执行文件路径")?,
-        );
-        let started = Instant::now();
-        let status = loop {
-            if self.control.cancelled() {
-                bail!("Java 检测已取消");
+                .stderr(Stdio::from(stderr.try_clone()?)),
+        ) {
+            Ok(child) => child,
+            Err(error) => {
+                if error.is::<crate::process_tree_service::SpawnCleanupUnconfirmed>() {
+                    directory.cleanup = false;
+                    return Err(error).context(format!(
+                        "Java 启动未完成，保留检测输出：{}",
+                        directory.path.display()
+                    ));
+                }
+                return Err(error).context("找不到或无法执行 Java，请检查可执行文件路径");
             }
-            let status = child.poll()?;
-            let bytes = stdout
-                .metadata()?
-                .len()
-                .checked_add(stderr.metadata()?.len())
-                .context("Java 检测输出长度溢出")?;
-            if bytes > self.output_limit {
-                bail!(
-                    "Java 检测输出超过限制（{} 字节），已停止检测",
-                    self.output_limit
-                );
-            }
-            if let Some(status) = status {
-                break status;
-            }
-            if started.elapsed() >= self.timeout {
-                bail!(
-                    "Java 检测超时（{} 秒），已停止检测",
-                    self.timeout.as_secs_f64()
-                );
-            }
-            thread::sleep(Duration::from_millis(25));
         };
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        stdout.seek(SeekFrom::Start(0))?;
-        stderr.seek(SeekFrom::Start(0))?;
-        (&mut stdout)
-            .take(self.output_limit + 1)
-            .read_to_end(&mut out)?;
-        (&mut stderr)
-            .take(self.output_limit + 1)
-            .read_to_end(&mut err)?;
-        if out.len().saturating_add(err.len()) as u64 > self.output_limit {
-            bail!("Java 检测输出超过限制，已停止检测");
+        let result = (|| -> Result<(JavaVersion, JavaArchitecture, String)> {
+            let started = Instant::now();
+            let status = loop {
+                if self.control.cancelled() {
+                    bail!("Java 检测已取消");
+                }
+                let status = child.poll()?;
+                let bytes = stdout
+                    .metadata()?
+                    .len()
+                    .checked_add(stderr.metadata()?.len())
+                    .context("Java 检测输出长度溢出")?;
+                if bytes > self.output_limit {
+                    bail!(
+                        "Java 检测输出超过限制（{} 字节），已停止检测",
+                        self.output_limit
+                    );
+                }
+                if let Some(status) = status {
+                    break status;
+                }
+                if started.elapsed() >= self.timeout {
+                    bail!(
+                        "Java 检测超时（{} 秒），已停止检测",
+                        self.timeout.as_secs_f64()
+                    );
+                }
+                thread::sleep(Duration::from_millis(25));
+            };
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            stdout.seek(SeekFrom::Start(0))?;
+            stderr.seek(SeekFrom::Start(0))?;
+            (&mut stdout)
+                .take(self.output_limit + 1)
+                .read_to_end(&mut out)?;
+            (&mut stderr)
+                .take(self.output_limit + 1)
+                .read_to_end(&mut err)?;
+            if out.len().saturating_add(err.len()) as u64 > self.output_limit {
+                bail!("Java 检测输出超过限制，已停止检测");
+            }
+            let info = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&err),
+                String::from_utf8_lossy(&out)
+            );
+            if !status.success() {
+                bail!("Java 检测失败（{status}）：{info}");
+            }
+            let (version, description) = JavaVersion::from_output(&info)?;
+            let architecture = JavaArchitecture::from_output(&info)?;
+            Ok((version, architecture, description))
+        })();
+        // Capture files cannot be removed while a failed / cancelled probe's
+        // descendants may still be writing. Unlike Drop, this reports failure.
+        let cleanup = child.terminate();
+        if cleanup.is_err() {
+            directory.cleanup = false;
         }
-        let info = format!(
-            "{}\n{}",
-            String::from_utf8_lossy(&err),
-            String::from_utf8_lossy(&out)
-        );
-        if !status.success() {
-            bail!("Java 检测失败（{status}）：{info}");
+        match (result, cleanup) {
+            (result, Ok(())) => result,
+            (Ok(_), Err(cleanup)) => Err(cleanup).context(format!(
+                "Java 检测进程清理失败，输出已保留：{}",
+                directory.path.display()
+            )),
+            (Err(error), Err(cleanup)) => Err(error).context(format!(
+                "Java 检测失败且进程清理未确认，输出已保留于 {}：{cleanup:#}",
+                directory.path.display()
+            )),
         }
-        let (version, description) = JavaVersion::from_output(&info)?;
-        let architecture = JavaArchitecture::from_output(&info)?;
-        Ok((version, architecture, description))
     }
 }
 
@@ -203,7 +241,13 @@ mod tests {
         let control = TaskControl::default();
         let (version, architecture, description) =
             probe(&workspace, &control, Duration::from_secs(5), 65536)
-                .run(&mut command("version"))
+                .run(
+                    command("version")
+                        .env("JAVA_TOOL_OPTIONS", "invalid-fixture-option")
+                        .env("_JAVA_OPTIONS", "invalid-fixture-option")
+                        .env("JDK_JAVA_OPTIONS", "invalid-fixture-option")
+                        .env("TUI_EXPECT_CLEAN_JAVA_ENV", "yes"),
+                )
                 .unwrap();
         assert_eq!(version.to_string(), "21.0.7+6-LTS");
         assert_eq!(architecture, JavaArchitecture::Arm64);
@@ -274,6 +318,11 @@ mod tests {
         let Ok(mode) = std::env::var("TUI_JAVA_PROBE_MODE") else {
             return;
         };
+        if std::env::var("TUI_EXPECT_CLEAN_JAVA_ENV").as_deref() == Ok("yes") {
+            for key in ["JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS"] {
+                assert!(std::env::var_os(key).is_none());
+            }
+        }
         match mode.as_str() {
             "version" => eprintln!("Property settings:\n    os.arch = aarch64\n    sun.arch.data.model = 64\nopenjdk version \"21.0.7+6-LTS\" 2025-04-15"),
             "flood" => std::io::stderr().write_all(&vec![b'x'; 8192]).unwrap(),

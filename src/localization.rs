@@ -28,6 +28,12 @@ impl UiLanguage {
         Self::ClassicalChinese,
     ];
     pub(crate) fn parse(value: &str) -> Result<Self> {
+        if Self::is_system(value) {
+            return Ok(crate::system_locale_service::SystemLocaleResolver::new(
+                &crate::system_locale_service::NativeLocales,
+            )
+            .resolve());
+        }
         match value.trim().to_lowercase().replace('-', "_").as_str() {
             "zh" | "zh_cn" | "zh_hans" | "简体中文" => Ok(Self::Chinese),
             "en" | "en_us" | "en_gb" | "english" => Ok(Self::English),
@@ -39,8 +45,14 @@ impl UiLanguage {
             "uk" | "uk_ua" => Ok(Self::Ukrainian),
             "ar" | "ar_sa" => Ok(Self::Arabic),
             "lzh" => Ok(Self::ClassicalChinese),
-            _ => bail!("Unknown UI language. Supported: zh_cn, en_us, zh_tw, ja_jp, de_de, es_es, ru_ru, uk_ua, ar_sa, lzh"),
+            _ => bail!("Unknown UI language. Supported: auto, zh_cn, en_us, zh_tw, ja_jp, de_de, es_es, ru_ru, uk_ua, ar_sa, lzh"),
         }
+    }
+    pub(crate) fn is_system(value: &str) -> bool {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "" | "auto" | "system" | "default" | "def"
+        )
     }
     pub(crate) fn game_code(self) -> &'static str {
         match self {

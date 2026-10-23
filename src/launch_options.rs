@@ -7,6 +7,76 @@ pub struct ServerAddress {
     pub host: String,
     pub port: u16,
 }
+pub(crate) enum QuickPlayTarget {
+    None,
+    Multiplayer(ServerAddress),
+    Singleplayer(String),
+}
+fn has_option(arguments: &[String], option: &str) -> bool {
+    arguments.iter().any(|argument| {
+        argument == option
+            || argument
+                .strip_prefix(option)
+                .is_some_and(|suffix| suffix.starts_with('='))
+    })
+}
+impl QuickPlayTarget {
+    pub(crate) fn from_config(config: &Config) -> Result<Self> {
+        let server = server_address(&config.server)?;
+        if !config.quick_play_world.is_empty() {
+            crate::metadata::valid_id(&config.quick_play_world)?;
+            if server.is_some() {
+                bail!("不能同时快速进入服务器和本地存档，请只选择一个目标");
+            }
+            Ok(Self::Singleplayer(config.quick_play_world.clone()))
+        } else {
+            Ok(server.map(Self::Multiplayer).unwrap_or(Self::None))
+        }
+    }
+    pub(crate) fn validate_world(&self, game_dir: &std::path::Path) -> Result<()> {
+        if let Self::Singleplayer(name) = self {
+            crate::worlds::require_world(game_dir, name)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn features(
+        &self,
+        meta: &Value,
+        platform: &crate::platform_rule_service::PlatformRuleEvaluator<'_>,
+    ) -> Result<HashMap<&'static str, bool>> {
+        let mut features = HashMap::from([
+            ("has_custom_resolution", true),
+            ("has_quick_plays_support", !matches!(self, Self::None)),
+            (
+                "is_quick_play_multiplayer",
+                matches!(self, Self::Multiplayer(_)),
+            ),
+            (
+                "is_quick_play_singleplayer",
+                matches!(self, Self::Singleplayer(_)),
+            ),
+            ("is_quick_play_realms", false),
+        ]);
+        let candidate =
+            crate::metadata::arguments_for(&meta["arguments"]["game"], &features, platform);
+        let option = match self {
+            Self::Multiplayer(_) => Some("--quickPlayMultiplayer"),
+            Self::Singleplayer(_) => Some("--quickPlaySingleplayer"),
+            Self::None => None,
+        };
+        let supported = meta["minecraftArguments"].as_str().is_none()
+            && option.is_some_and(|option| has_option(&candidate, option));
+        if matches!(self, Self::Singleplayer(_)) && !supported {
+            bail!("此版本未声明可用的单人 Quick Play 参数，请从游戏内打开存档");
+        }
+        if !supported {
+            features.insert("has_quick_plays_support", false);
+            features.insert("is_quick_play_multiplayer", false);
+            features.insert("is_quick_play_singleplayer", false);
+        }
+        Ok(features)
+    }
+}
 /// Expand only the original template; substituted paths and tokens are literal data.
 pub fn expand_argument(template: &str, values: &HashMap<&str, String>) -> Result<String> {
     let mut output = String::new();
@@ -93,39 +163,25 @@ pub(crate) fn game_arguments_for(
     meta: &Value,
     platform: &crate::platform_rule_service::PlatformRuleEvaluator<'_>,
 ) -> Result<Vec<String>> {
-    let server = server_address(&config.server)?;
-    let modern = meta["arguments"]["game"].as_array().is_some_and(|items| {
-        items.iter().any(|item| {
-            item["rules"].as_array().is_some_and(|rules| {
-                rules.iter().any(|rule| {
-                    rule["features"].get("is_quick_play_multiplayer").is_some()
-                        || rule["features"].get("has_quick_plays_support").is_some()
-                })
-            })
-        })
-    });
-    let features = HashMap::from([
-        ("has_custom_resolution", true),
-        ("has_quick_plays_support", modern && server.is_some()),
-        ("is_quick_play_multiplayer", modern && server.is_some()),
-    ]);
+    let target = QuickPlayTarget::from_config(config)?;
+    let features = target.features(meta, platform)?;
     let mut args = if let Some(legacy) = meta["minecraftArguments"].as_str() {
         shlex::split(legacy).context("无法解析旧版启动参数")?
     } else {
         crate::metadata::arguments_for(&meta["arguments"]["game"], &features, platform)
     };
-    if !args.iter().any(|arg| arg == "--width") {
+    if !has_option(&args, "--width") {
         args.extend(["--width".into(), config.width.to_string()]);
     }
-    if !args.iter().any(|arg| arg == "--height") {
+    if !has_option(&args, "--height") {
         args.extend(["--height".into(), config.height.to_string()]);
     }
-    if config.fullscreen && !args.iter().any(|arg| arg == "--fullscreen") {
+    if config.fullscreen && !has_option(&args, "--fullscreen") {
         args.push("--fullscreen".into());
     }
-    if let Some(server) = server {
-        if modern {
-            if !args.iter().any(|arg| arg == "--quickPlayMultiplayer") {
+    if let QuickPlayTarget::Multiplayer(server) = target {
+        if features["is_quick_play_multiplayer"] {
+            if !has_option(&args, "--quickPlayMultiplayer") {
                 args.extend([
                     "--quickPlayMultiplayer".into(),
                     quickplay_address(&config.server)?,
@@ -209,5 +265,71 @@ mod tests {
             .any(|args| args == ["--server", "example.org", "--port", "25566"]));
         let plain = game_arguments(&Config::default(), &meta).unwrap();
         assert!(!plain.iter().any(|arg| arg.starts_with("--quickPlay")));
+    }
+
+    #[test]
+    fn singleplayer_quickplay_selects_only_world_and_expands_folder_as_literal_data() {
+        let config = Config {
+            quick_play_world: "中文 World ${slot}".into(),
+            ..Config::default()
+        };
+        let meta = serde_json::json!({"arguments":{"game":[
+            {"rules":[{"action":"allow","features":{"has_quick_plays_support":true}}],"value":["--quickPlayPath","${quickPlayPath}"]},
+            {"rules":[{"action":"allow","features":{"is_quick_play_singleplayer":true}}],"value":["--quickPlaySingleplayer","${quickPlaySingleplayer}"]},
+            {"rules":[{"action":"allow","features":{"is_quick_play_multiplayer":true}}],"value":["--quickPlayMultiplayer","${quickPlayMultiplayer}"]}
+        ]}});
+        let args = game_arguments(&config, &meta).unwrap();
+        assert!(args.contains(&"--quickPlaySingleplayer".into()));
+        assert!(!args.contains(&"--quickPlayMultiplayer".into()));
+        let values = HashMap::from([("quickPlaySingleplayer", config.quick_play_world.clone())]);
+        assert_eq!(
+            expand_argument("${quickPlaySingleplayer}", &values).unwrap(),
+            config.quick_play_world
+        );
+        assert!(game_arguments(
+            &config,
+            &serde_json::json!({"minecraftArguments":"--username Player"})
+        )
+        .is_err());
+        let conflict = Config {
+            server: "example.org".into(),
+            ..config
+        };
+        assert!(QuickPlayTarget::from_config(&conflict).is_err());
+    }
+
+    #[test]
+    fn disallowed_or_inapplicable_quickplay_does_not_enable_modern_server_flags() {
+        let config = Config {
+            server: "example.org".into(),
+            ..Config::default()
+        };
+        for rules in [
+            serde_json::json!([{"action":"disallow","features":{"is_quick_play_multiplayer":true}}]),
+            serde_json::json!([{"action":"allow","os":{"name":"unknown-nonexistent"},"features":{"is_quick_play_multiplayer":true}}]),
+        ] {
+            let meta = serde_json::json!({"arguments":{"game":[{"rules":rules,"value":["--quickPlayMultiplayer","${quickPlayMultiplayer}"]}]}});
+            let args = game_arguments(&config, &meta).unwrap();
+            assert!(!args.contains(&"--quickPlayMultiplayer".into()));
+            assert!(args.contains(&"--server".into()));
+        }
+        let path_only = serde_json::json!({"arguments":{"game":[{"rules":[{"action":"allow","features":{"has_quick_plays_support":true}}],"value":["--quickPlayPath","${quickPlayPath}"]}]}});
+        let args = game_arguments(&config, &path_only).unwrap();
+        assert!(args.contains(&"--server".into()));
+        assert!(!args.contains(&"--quickPlayPath".into()));
+    }
+
+    #[test]
+    fn equals_form_window_arguments_are_not_duplicated() {
+        let meta = serde_json::json!({"arguments":{"game":["--width=1280","--height=720","--fullscreen=true"]}});
+        let args = game_arguments(
+            &Config {
+                fullscreen: true,
+                ..Config::default()
+            },
+            &meta,
+        )
+        .unwrap();
+        assert_eq!(args, ["--width=1280", "--height=720", "--fullscreen=true"]);
     }
 }

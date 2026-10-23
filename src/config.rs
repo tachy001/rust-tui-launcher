@@ -12,6 +12,7 @@ pub struct InstanceSettings {
     pub game_args: Option<String>,
     pub fullscreen: Option<bool>,
     pub server: Option<String>,
+    pub quick_play_world: Option<String>,
     pub game_language: Option<String>,
     pub patch_natives: Option<bool>,
 }
@@ -40,7 +41,7 @@ mod tests {
         assert!(config.microsoft_client_id.is_empty());
         assert!(!config.fullscreen);
         assert!(config.server.is_empty());
-        assert_eq!(config.language, "zh_cn");
+        assert_eq!(config.language, "auto");
         assert_eq!(config.game_language, "launcher");
         assert!(config.patch_natives);
     }
@@ -165,6 +166,7 @@ pub struct Config {
     pub optional_pack_files: bool,
     pub fullscreen: bool,
     pub server: String,
+    pub quick_play_world: String,
     pub game_language: String,
     pub patch_natives: bool,
     pub language: String,
@@ -191,9 +193,10 @@ impl Default for Config {
             optional_pack_files: true,
             fullscreen: false,
             server: String::new(),
+            quick_play_world: String::new(),
             game_language: "launcher".into(),
             patch_natives: true,
-            language: "zh_cn".into(),
+            language: "auto".into(),
             active_profile: None,
         }
     }
@@ -235,6 +238,9 @@ impl Config {
         crate::localization::UiLanguage::parse(&self.language)?;
         crate::language_service::GameLanguage::parse(&self.game_language)?;
         crate::launch_options::server_address(&self.server)?;
+        if !self.quick_play_world.is_empty() {
+            crate::metadata::valid_id(&self.quick_play_world)?;
+        }
         crate::sources::validate(&self.download_source)?;
         if self.username.is_empty()
             || self.username.len() > 16

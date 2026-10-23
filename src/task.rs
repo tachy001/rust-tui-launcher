@@ -11,6 +11,19 @@ pub struct TaskControl {
     paused: Arc<AtomicBool>,
 }
 impl TaskControl {
+    pub(crate) fn wait(&self, duration: Duration) -> Result<()> {
+        let until = std::time::Instant::now()
+            .checked_add(duration)
+            .ok_or_else(|| anyhow::anyhow!("等待时间过长"))?;
+        loop {
+            self.check()?;
+            let remaining = until.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(());
+            }
+            thread::sleep(remaining.min(Duration::from_millis(50)));
+        }
+    }
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Relaxed);
     }

@@ -37,54 +37,16 @@ pub fn list(config: &Config, id: &str) -> Result<Vec<ModEntry>> {
     Ok(entries)
 }
 pub fn toggle(config: &Config, id: &str, filename: &str) -> Result<()> {
-    if filename.contains(['/', '\\']) {
-        bail!("Mod 文件名不能含路径");
-    }
-    let dir = directory(config, id)?;
-    let source = safe_path(&dir, filename)?;
-    let lower = filename.to_lowercase();
-    let target_name = if lower.ends_with(".jar.disabled") {
-        filename[..filename.len() - ".disabled".len()].to_owned()
-    } else if lower.ends_with(".jar") {
-        format!("{filename}.disabled")
-    } else {
-        bail!("请选择 JAR Mod 文件");
-    };
-    let target = safe_path(&dir, &target_name)?;
-    if target.exists() {
-        bail!("目标文件已存在，不会覆盖：{target_name}");
-    }
-    fs::rename(source, target)?;
-    Ok(())
+    crate::local_mod_service::ModMutationSession::begin(config, id)?.toggle(filename)
 }
 pub fn import(config: &Config, id: &str, source: &Path) -> Result<()> {
-    if source
-        .extension()
-        .is_none_or(|ext| !ext.eq_ignore_ascii_case("jar"))
-    {
-        bail!("只能导入 .jar 文件");
-    }
-    zip::ZipArchive::new(fs::File::open(source)?).context("文件不是有效的 JAR 归档")?;
-    let filename = source
-        .file_name()
-        .context("源文件没有文件名")?
-        .to_string_lossy();
-    let target = safe_path(&directory(config, id)?, &filename)?;
-    // create_new preserves existing mods even when the incoming file has the same name.
-    let mut dest = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(target)
-        .context("无法导入，可能已有同名 Mod")?;
-    std::io::copy(&mut fs::File::open(source)?, &mut dest)?;
-    dest.sync_all()?;
-    Ok(())
+    crate::local_mod_service::ModMutationSession::begin(config, id)?
+        .import(source, &crate::task::TaskControl::default())
 }
 
 /// Removal is reversible: keep the file and original management records together.
 pub fn remove(config: &Config, id: &str, filename: &str) -> Result<PathBuf> {
-    let root = config.root()?;
-    let _lock = crate::instances::InstanceLock::acquire(&root.join("versions").join(id))?;
+    let _session = crate::local_mod_service::ModMutationSession::begin(config, id)?;
     let mods = directory(config, id)?;
     let source = safe_path(&mods, filename)?;
     if !list(config, id)?
@@ -229,7 +191,7 @@ pub fn removed(config: &Config, id: &str) -> Result<Vec<RemovedMod>> {
 }
 
 pub fn restore(config: &Config, id: &str, token: &str) -> Result<String> {
-    let _lock = crate::instances::InstanceLock::acquire(&config.root()?.join("versions").join(id))?;
+    let _session = crate::local_mod_service::ModMutationSession::begin(config, id)?;
     crate::metadata::valid_id(token)?;
     let choices: Vec<_> = removed(config, id)?
         .into_iter()
@@ -405,7 +367,8 @@ mod tests {
     }
     #[test]
     fn toggle_roundtrip_preserves_content() {
-        let root = std::env::temp_dir().join(format!("tui-mods-{}", std::process::id()));
+        let workspace = crate::test_support::Workspace::new();
+        let root = workspace.path.clone();
         let config = Config {
             game_dir: root.clone(),
             isolated: false,
@@ -423,6 +386,5 @@ mod tests {
         fs::remove_file(dir.join("a.jar")).unwrap();
         fs::remove_file(dir.join("a.jar.disabled")).unwrap();
         fs::remove_dir(dir).unwrap();
-        fs::remove_dir(root).unwrap();
     }
 }

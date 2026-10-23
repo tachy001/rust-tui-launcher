@@ -46,9 +46,7 @@ fn resolve_inner(
             &fs::read(&path).with_context(|| format!("缺少版本 {id} 的元数据，请先安装父版本"))?,
         )?
     };
-    if !child.is_object() {
-        bail!("版本元数据必须为 JSON 对象：{id}");
-    }
+    let child = crate::version_profile_service::VersionProfileDecoder.decode(child, id)?;
     let mut resolved = if let Some(parent) = child["inheritsFrom"].as_str() {
         let mut base = resolve_inner(root, parent, seen, candidate, guard)?;
         base.meta = merge(&base.meta, &child);
@@ -159,6 +157,31 @@ pub fn maven_path(name: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn nullable_child_metadata_keeps_parent_client_and_arguments() {
+        let temp = crate::test_support::Workspace::new();
+        let root = &temp.path;
+        let base = root.join("versions/base");
+        fs::create_dir_all(&base).unwrap();
+        fs::write(base.join("base.json"), json!({"id":"base","mainClass":"example.Main","libraries":[],"arguments":{"jvm":["-cp","${classpath}"],"game":["--base"]},"downloads":{"client":{"url":"https://example.invalid/base.jar"}}}).to_string()).unwrap();
+        let child = json!({"inheritsFrom":"base","mainClass":null,"libraries":null,"arguments":{"jvm":null,"game":null},"downloads":{"client":null},"jar":null});
+        let result = resolve_guarded(root, "child", Some(&child), |_| Ok(())).unwrap();
+        assert_eq!(result.jar_id, "base");
+        assert_eq!(result.chain, ["base", "child"]);
+        assert_eq!(result.meta["mainClass"], "example.Main");
+        assert_eq!(result.meta["arguments"]["game"], json!(["--base"]));
+        assert_eq!(
+            result.meta["arguments"]["jvm"],
+            json!(["-cp", "${classpath}"])
+        );
+        assert_eq!(
+            result.meta["downloads"]["client"]["url"],
+            "https://example.invalid/base.jar"
+        );
+        let bad = json!({"inheritsFrom":"base","arguments":"broken"});
+        let error = resolve_guarded(root, "child", Some(&bad), |_| Ok(())).unwrap_err();
+        assert!(format!("{error:#}").contains("arguments"));
+    }
     #[test]
     fn inheritance_preserves_child_platform_variants_and_argument_format() {
         let parent = json!({

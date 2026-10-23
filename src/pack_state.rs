@@ -73,7 +73,7 @@ pub fn cache_archive(
     if dest.is_file() && valid_file(&dest, Some(hash), None)? {
         return Ok(());
     }
-    atomic_copy(&dest, &mut fs::File::open(source)?)?;
+    crate::storage::atomic_copy_controlled(&dest, &mut fs::File::open(source)?, control)?;
     if !valid_file(&dest, Some(hash), None)? {
         bail!("整合包归档在导入期间发生改变，请重新导入");
     }
@@ -161,6 +161,7 @@ impl Backend {
         }
         validate_hash(&receipt.archive_sha1)?;
         let game_dir = config.effective(id)?.instance_dir(id)?;
+        let _game = crate::local_mod_service::ModMutationSession::lock_game_directory(config, id)?;
         let mut downloads = vec![];
         let mut restore = vec![];
         let mut seen = BTreeMap::new();
@@ -192,7 +193,11 @@ impl Backend {
                 if !local.is_file() || !valid_file(&local, Some(&file.sha1), Some(file.size))? {
                     bail!("手动文件缓存缺失：{}，请重新导入原文件", file.path);
                 }
-                atomic_copy(&dest, &mut fs::File::open(local)?)?;
+                crate::storage::atomic_copy_controlled(
+                    &dest,
+                    &mut fs::File::open(local)?,
+                    &self.control,
+                )?;
             }
         }
         self.downloader()
@@ -209,7 +214,7 @@ impl Backend {
                 if entry.is_dir() || entry.size() != file.size {
                     bail!("整合包缓存条目与记录不匹配");
                 }
-                atomic_copy(&dest, &mut entry)?;
+                crate::storage::atomic_copy_controlled(&dest, &mut entry, &self.control)?;
                 if !valid_file(&dest, Some(&file.sha1), Some(file.size))? {
                     bail!("恢复后的整合包内嵌文件校验失败");
                 }

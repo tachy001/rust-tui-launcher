@@ -903,7 +903,7 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .spawn()
             .unwrap();
-        let mut child = crate::process_service::ManagedProcess(child);
+        let mut child = crate::process_service::ManagedProcess::from_child(child);
         let deadline = Instant::now() + Duration::from_secs(5);
         while !ready.exists() {
             assert!(

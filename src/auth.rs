@@ -44,11 +44,6 @@ struct OAuthToken {
     #[serde(default)]
     refresh_token: String,
 }
-fn read_secret(account: &Account, kind: &str) -> Result<Zeroizing<String>> {
-    crate::account_service::SystemCredentials
-        .read(account, kind)?
-        .context("读取账户凭证失败，请重新登录")
-}
 
 fn now() -> u64 {
     SystemTime::now()
@@ -56,7 +51,7 @@ fn now() -> u64 {
         .unwrap_or_default()
         .as_secs()
 }
-fn validate_client_id(value: &str) -> Result<()> {
+pub(crate) fn validate_client_id(value: &str) -> Result<()> {
     let compact = value.replace('-', "");
     if value.len() != 36
         || compact.len() != 32
@@ -66,7 +61,7 @@ fn validate_client_id(value: &str) -> Result<()> {
         || value.as_bytes().get(18) != Some(&b'-')
         || value.as_bytes().get(23) != Some(&b'-')
     {
-        bail!("请先在设置中填写启动器自己的微软 OAuth 客户端 ID（GUID），并为应用启用个人账户与公共客户端设备代码流程");
+        bail!("微软应用 ID 格式无效：发布者内置或高级覆盖的客户端 ID 必须为 GUID");
     }
     Ok(())
 }
@@ -96,7 +91,7 @@ fn field<'a>(value: &'a Value, name: &str) -> Result<&'a str> {
         .filter(|s| !s.is_empty())
         .with_context(|| format!("认证响应缺少 {name}"))
 }
-fn profile(value: &Value) -> Result<(String, String)> {
+pub(crate) fn profile(value: &Value) -> Result<(String, String)> {
     let uuid = field(value, "id")?;
     if uuid.len() != 32 || !uuid.bytes().all(|c| c.is_ascii_hexdigit()) {
         bail!("Minecraft 返回了无效 UUID");
@@ -108,6 +103,44 @@ fn profile(value: &Value) -> Result<(String, String)> {
     };
     config.validate()?;
     Ok((uuid.into(), name.into()))
+}
+struct HttpMinecraftProfile<'a> {
+    backend: &'a Backend,
+    access: &'a str,
+}
+impl crate::minecraft_profile_service::MinecraftProfileProvider for HttpMinecraftProfile<'_> {
+    fn activate_entitlements(&self) -> Result<()> {
+        send_json(
+            self.backend
+                .client
+                .get("https://api.minecraftservices.com/entitlements/mcstore")
+                .bearer_auth(self.access),
+            "Minecraft 授权检查",
+        )?;
+        Ok(())
+    }
+    fn profile(&self) -> Result<Option<Value>> {
+        let response = self
+            .backend
+            .client
+            .get("https://api.minecraftservices.com/minecraft/profile")
+            .bearer_auth(self.access)
+            .send()
+            .context("获取 Minecraft 档案网络请求失败")?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        checked_response(response, "获取 Minecraft 档案").map(Some)
+    }
+    fn license(&self) -> Result<Value> {
+        send_json(
+            self.backend
+                .client
+                .get("https://api.minecraftservices.com/entitlements/license")
+                .bearer_auth(self.access),
+            "Minecraft Java 许可证检查",
+        )
+    }
 }
 fn device_error(error: &str) -> Result<bool> {
     match error {
@@ -140,13 +173,44 @@ impl Backend {
         self.control.check()
     }
     pub fn login_microsoft(&self, config: &Config) -> Result<String> {
-        validate_client_id(&config.microsoft_client_id)?;
+        use crate::browser_login_service::{BrowserLogin, BrowserOpener, SystemBrowser};
+        let client_id = crate::browser_login_service::client_id(&config.microsoft_client_id)?;
         self.control.check()?;
-        let device: DeviceCode = serde_json::from_value(send_json(
-            self.client.post(DEVICE_URL).form(&[
-                ("client_id", config.microsoft_client_id.as_str()),
+        let callback = BrowserLogin::bind()?;
+        let url = callback.authorization_url(&client_id, SCOPE)?;
+        self.log(format!(
+            "请在浏览器完成微软登录；若浏览器未打开，可复制此链接：{url}"
+        ));
+        self.control.check()?;
+        match SystemBrowser.open(url.as_str()) {
+            Ok(()) => self.log("已请求打开系统浏览器，等待微软网页授权…"),
+            Err(error) => self.log(format!(
+                "{error:#}；请手动打开上面的链接，启动器将自动接收授权"
+            )),
+        }
+        let code = callback.wait(&self.control, Duration::from_secs(600))?;
+        self.control.check()?;
+        let token: OAuthToken = serde_json::from_value(send_json(
+            self.client.post(TOKEN_URL).form(&[
+                ("grant_type", "authorization_code"),
+                ("client_id", client_id.as_str()),
+                ("code", code.as_str()),
+                ("code_verifier", callback.verifier()),
+                ("redirect_uri", callback.redirect_uri()),
                 ("scope", SCOPE),
             ]),
+            "交换微软浏览器授权",
+        )?)?;
+        self.finish_auth(&client_id, &token, None)
+    }
+    pub fn login_microsoft_device(&self, config: &Config) -> Result<String> {
+        use crate::browser_login_service::{BrowserOpener, SystemBrowser};
+        let client_id = crate::browser_login_service::client_id(&config.microsoft_client_id)?;
+        self.control.check()?;
+        let device: DeviceCode = serde_json::from_value(send_json(
+            self.client
+                .post(DEVICE_URL)
+                .form(&[("client_id", client_id.as_str()), ("scope", SCOPE)]),
             "获取设备登录码",
         )?)?;
         let uri = reqwest::Url::parse(&device.verification_uri)?;
@@ -159,6 +223,9 @@ impl Backend {
             device.user_code,
             device.expires_in / 60
         ));
+        if let Err(error) = SystemBrowser.open(&device.verification_uri) {
+            self.log(format!("{error:#}；请手动打开上面的微软登录地址"));
+        }
         let deadline = Instant::now() + Duration::from_secs(device.expires_in);
         let mut interval = device.interval.max(1);
         let token = loop {
@@ -171,7 +238,7 @@ impl Backend {
                 .post(TOKEN_URL)
                 .form(&[
                     ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-                    ("client_id", config.microsoft_client_id.as_str()),
+                    ("client_id", client_id.as_str()),
                     ("device_code", device.device_code.as_str()),
                 ])
                 .send()
@@ -186,7 +253,7 @@ impl Backend {
                 interval = interval.saturating_add(5);
             }
         };
-        self.finish_auth(&config.microsoft_client_id, &token, None)
+        self.finish_auth(&client_id, &token, None)
     }
     fn finish_auth(
         &self,
@@ -223,23 +290,12 @@ impl Backend {
             "Minecraft 登录",
         )?;
         let access = field(&minecraft, "access_token")?;
-        let entitlements = send_json(
-            self.client
-                .get("https://api.minecraftservices.com/entitlements/mcstore")
-                .bearer_auth(access),
-            "Minecraft 授权检查",
-        )?;
-        if entitlements["items"]
-            .as_array()
-            .is_none_or(|items| items.is_empty())
-        {
-            bail!("该账户没有有效的 Minecraft Java 版授权");
-        }
-        let user = send_json(
-            self.client
-                .get("https://api.minecraftservices.com/minecraft/profile")
-                .bearer_auth(access),
-            "获取 Minecraft 档案",
+        let user = crate::minecraft_profile_service::MinecraftProfileService.fetch(
+            &HttpMinecraftProfile {
+                backend: self,
+                access,
+            },
+            &self.control,
         )?;
         let (uuid, name) = profile(&user)?;
         let account = Account {
@@ -299,37 +355,25 @@ impl Backend {
         Ok(())
     }
     pub fn account_session(&self, config: &Config) -> Result<Session> {
-        let mut accounts = Accounts::load()?;
-        let Some(account) = accounts.active().cloned() else {
-            return Ok(offline(&config.username));
-        };
-        if account.kind == AccountKind::Offline {
-            return Ok(offline(&account.name));
-        }
-        if account.expires_at <= now().saturating_add(120) {
-            self.refresh_account(&account)?;
-            accounts = Accounts::load()?;
-        }
-        let account = accounts
-            .entries
-            .iter()
-            .find(|a| a.id == account.id)
-            .context("刷新后账户信息丢失")?;
-        Ok(Session {
-            name: account.name.clone(),
-            uuid: account
-                .id
-                .strip_prefix("microsoft:")
-                .context("账户 ID 无效")?
-                .into(),
-            access_token: read_secret(account, "minecraft")?,
-            xuid: account.xuid.clone(),
-            client_id: account.client_id.clone(),
-            user_type: "msa",
-        })
+        crate::account_session_service::AccountSessionService::new(self, &self.control)
+            .resolve(&config.username)
     }
 }
-fn offline(name: &str) -> Session {
+impl crate::account_session_service::SessionAccountSource for Backend {
+    fn load(&self) -> Result<Accounts> {
+        Accounts::load()
+    }
+    fn minecraft_token(&self, account: &Account) -> Result<Option<Zeroizing<String>>> {
+        crate::account_service::SystemCredentials.read(account, "minecraft")
+    }
+    fn refresh(&self, account: &Account) -> Result<()> {
+        self.refresh_account(account)
+    }
+    fn now(&self) -> u64 {
+        now()
+    }
+}
+pub(crate) fn offline(name: &str) -> Session {
     Session {
         name: name.into(),
         uuid: crate::backend::offline_uuid(name),

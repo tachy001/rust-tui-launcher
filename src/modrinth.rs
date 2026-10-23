@@ -297,6 +297,8 @@ impl Backend {
         requested: Option<&str>,
     ) -> Result<String> {
         identifier(project)?;
+        let _session = crate::local_mod_service::ModMutationSession::begin(config, id)?;
+        let root = config.root()?;
         let target = target(config, id)?;
         let root_project = if requested.is_some() {
             let value = self.get_json(&format!("{API}/project/{project}"))?;
@@ -309,9 +311,6 @@ impl Backend {
             version: requested.map(str::to_owned),
             expected_project: root_project,
         };
-        let root = config.root()?;
-        let version_dir = root.join("versions").join(id);
-        let _lock = crate::instances::InstanceLock::acquire(&version_dir)?;
         let game_dir = config.effective(id)?.instance_dir(id)?;
         let current = inventory(&game_dir)?;
         let activation = crate::mod_install_service::ModInstallState::new(&game_dir, &current);
@@ -503,6 +502,7 @@ impl Backend {
         mutation: &crate::instance_service::InstanceMutation,
     ) -> Result<()> {
         mutation.require(&config.root()?, id)?;
+        let _game = crate::local_mod_service::ModMutationSession::lock_game_directory(config, id)?;
         let dir = config.effective(id)?.instance_dir(id)?;
         let inventory = inventory(&dir)?;
         if inventory.entries.is_empty() {

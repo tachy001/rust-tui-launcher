@@ -127,6 +127,7 @@ struct EmbeddedComponent {
 pub(crate) struct ForgeInstallerPlan {
     pub(crate) id: String,
     pub(crate) direct: Option<DirectForgePlan>,
+    pub(crate) output: Option<crate::loader_output_service::LoaderOutputRequirement>,
 }
 impl ForgeInstallerPlan {
     pub(crate) fn inspect(
@@ -203,6 +204,7 @@ impl ForgeInstallerPlan {
             profile["jar"] = game.into();
             return Ok(Self {
                 id,
+                output: None,
                 direct: Some(DirectForgePlan {
                     profile,
                     components: vec![EmbeddedComponent {
@@ -295,6 +297,7 @@ impl ForgeInstallerPlan {
                 profile["jar"] = game.into();
                 return Ok(Self {
                     id,
+                    output: None,
                     direct: Some(DirectForgePlan {
                         profile,
                         components,
@@ -302,7 +305,12 @@ impl ForgeInstallerPlan {
                 });
             }
         }
-        Ok(Self { id, direct: None })
+        let output = crate::loader_output_service::LoaderOutputRequirement::new(&profile, game)?;
+        Ok(Self {
+            id,
+            direct: None,
+            output: Some(output),
+        })
     }
 }
 impl DirectForgePlan {
@@ -543,7 +551,7 @@ mod tests {
                 ),
                 (
                     "data/client.json",
-                    br#"{"id":"modern-forge","inheritsFrom":"1.12.2"}"#,
+                    br#"{"id":"modern-forge","inheritsFrom":"1.12.2","mainClass":"example.ForgeMain","libraries":[]}"#,
                 ),
             ],
         );
@@ -818,6 +826,10 @@ mod tests {
                     .unwrap()
                     .iter()
                     .any(|lib| lib.get("tuiMcEmbedded").is_some()));
+            } else if let Some(output) = plan.output {
+                output
+                    .verify(&root.join(".tools/smoke-game"), &TaskControl::default())
+                    .unwrap();
             }
         }
     }

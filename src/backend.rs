@@ -56,6 +56,7 @@ fn download_entry(entry: &Value, dest: &Path) -> Result<Download> {
     })
 }
 pub struct Backend {
+    retry: std::sync::Arc<crate::download_retry_service::DownloadRetryCoordinator>,
     pub(crate) client: Client,
     pub tx: Sender<Message>,
     pub control: TaskControl,
@@ -64,6 +65,7 @@ pub struct Backend {
 impl Backend {
     pub fn new(tx: Sender<Message>) -> Result<Self> {
         Ok(Self {
+            retry: Default::default(),
             client: Client::builder()
                 .connect_timeout(Duration::from_secs(20))
                 .timeout(Duration::from_secs(90))
@@ -114,6 +116,7 @@ impl Backend {
     }
     pub(crate) fn downloader(&self) -> Downloader {
         Downloader {
+            retry: self.retry.clone(),
             client: self.client.clone(),
             control: self.control.clone(),
             tx: self.tx.clone(),
@@ -268,39 +271,21 @@ impl Backend {
         }
         self.downloader()
             .many(downloads, config.download_threads, "依赖库")?;
-        let index = &meta["assetIndex"];
-        let index_id = index["id"].as_str().context("缺少资源索引 ID")?;
-        valid_id(index_id)?;
-        let index_path = root.join("assets/indexes").join(format!("{index_id}.json"));
-        self.download_entry(index, &index_path)?;
-        let assets: Value = serde_json::from_slice(&fs::read(index_path)?)?;
-        let objects = assets["objects"]
-            .as_object()
-            .context("资源索引无 objects")?;
-        let mut downloads = vec![];
-        for object in objects.values() {
-            let hash = object["hash"].as_str().context("资源缺少 hash")?;
-            if hash.len() != 40 || !hash.bytes().all(|c| c.is_ascii_hexdigit()) {
-                bail!("无效资源 hash");
-            }
-            let relative = format!("{}/{hash}", &hash[..2]);
-            let dest = root.join("assets/objects").join(&relative);
-            downloads.push(Download {
-                url: format!("https://resources.download.minecraft.net/{relative}"),
-                dest,
-                sha1: Some(hash.into()),
-                size: object["size"].as_u64(),
-                alternatives: vec![],
-            });
-        }
-        self.downloader()
-            .many(downloads, config.download_threads, "游戏资源")?;
+        let repository = crate::asset_service::AssetRepository::new(&root);
+        let downloader = self.downloader();
+        let (index_id, assets) = repository.version_index(meta, id, &downloader)?;
+        repository.prepare(
+            &assets,
+            crate::asset_service::AssetCheck::Full,
+            &downloader,
+            config.download_threads,
+        )?;
         let game_dir = config.instance_dir(id)?;
-        crate::asset_layout::reconstruct(&root, &game_dir, index_id, &assets, &self.control)?;
-        if let Some(logging) = meta.pointer("/logging/client") {
-            let file = &logging["file"];
-            let name = file["id"].as_str().context("日志配置缺少 ID")?;
-            self.download_entry(file, &safe_path(&root.join("assets/log_configs"), name)?)?;
+        crate::asset_layout::reconstruct(&root, &game_dir, &index_id, &assets, &self.control)?;
+        if let Some(logging) =
+            crate::logging_service::LoggingConfiguration::from_metadata(&root, meta)?
+        {
+            logging.prepare(&self.downloader())?;
         }
         self.repair_pack_files_with_session(&config, id, mutation)?;
         self.repair_mod_inventory_with_session(&config, id, mutation)?;
@@ -359,6 +344,7 @@ impl Backend {
         let config = config.effective(id)?;
         config.validate()?;
         let version_dir = root.join("versions").join(id);
+        let quick_play = crate::launch_options::QuickPlayTarget::from_config(&config)?;
         let meta = &resolved.meta;
         self.log(format!("版本链：{}", resolved.chain.join(" → ")));
         let jar = root
@@ -404,6 +390,14 @@ impl Backend {
             ));
         }
         let platform = crate::launch_platform::LaunchPlatform::new(runtime.architecture);
+        quick_play.features(meta, &platform.rules())?;
+        // Protect the shared directory before any resource mapping or Mod audit.
+        let _game_options = crate::download_lock::DownloadLease::acquire(
+            &game_dir.join("options.txt"),
+            &self.control,
+            || self.log("等待使用同一游戏目录的进程退出…"),
+        )?;
+        quick_play.validate_world(&game_dir)?;
         let launch_meta = platform.profile(meta);
         let native_plan = crate::native_patch_service::current_service(runtime.architecture)
             .patch(
@@ -442,22 +436,23 @@ impl Backend {
         let separator = if cfg!(windows) { ";" } else { ":" };
         let classpath = cp.render(&jar, separator)?;
         let uuid = session.uuid.clone();
-        let asset_id = meta["assetIndex"]["id"].as_str().unwrap_or(id);
-        valid_id(asset_id)?;
-        let index_path = root.join("assets/indexes").join(format!("{asset_id}.json"));
-        if !index_path.is_file() {
-            bail!("资源索引缺失，请先安装/修复此版本");
-        }
-        if let Some(hash) = meta["assetIndex"]["sha1"].as_str() {
-            if !verify(&index_path, hash)? {
-                bail!("资源索引校验失败，请先修复此版本");
-            }
-        }
-        let index: Value = serde_json::from_slice(&fs::read(&index_path)?)?;
+        let repository = crate::asset_service::AssetRepository::new(&root);
+        let downloader = self.downloader();
+        let (asset_id, index) = repository.version_index(meta, id, &downloader)?;
+        repository.prepare(
+            &index,
+            crate::asset_service::AssetCheck::Launch,
+            &downloader,
+            config.download_threads,
+        )?;
         let game_assets =
-            crate::asset_layout::reconstruct(&root, &game_dir, asset_id, &index, &self.control)?;
+            crate::asset_layout::reconstruct(&root, &game_dir, &asset_id, &index, &self.control)?;
         let assets = root.join("assets");
-        let values: HashMap<&str, String> = [
+        let logging = crate::logging_service::LoggingConfiguration::from_metadata(&root, meta)?;
+        if let Some(logging) = &logging {
+            logging.prepare(&self.downloader())?;
+        }
+        let mut values: HashMap<&str, String> = [
             ("auth_player_name", session.name.clone()),
             ("auth_uuid", uuid),
             ("auth_access_token", session.access_token.to_string()),
@@ -479,7 +474,7 @@ impl Backend {
             ("game_directory", game_dir.display().to_string()),
             ("assets_root", assets.display().to_string()),
             ("game_assets", game_assets.display().to_string()),
-            ("assets_index_name", asset_id.into()),
+            ("assets_index_name", asset_id.clone()),
             ("natives_directory", natives.display().to_string()),
             ("classpath", classpath.clone()),
             ("classpath_separator", separator.into()),
@@ -506,6 +501,7 @@ impl Backend {
                 "quickPlayMultiplayer",
                 crate::launch_options::quickplay_address(&config.server)?,
             ),
+            ("quickPlaySingleplayer", config.quick_play_world.clone()),
             (
                 "quickPlayPath",
                 game_dir.join("tui-mc-quickplay.json").display().to_string(),
@@ -513,6 +509,9 @@ impl Backend {
         ]
         .into_iter()
         .collect();
+        if let Some(logging) = &logging {
+            values.insert("logging_config_path", logging.path().display().to_string());
+        }
         let mut args = vec![format!("-Xmx{}M", config.memory_mb)];
         if native_plan.lwjgl_changed {
             // This property is read only by Sodium; keep it before user arguments
@@ -529,19 +528,16 @@ impl Backend {
                 "${classpath}".into(),
             ]);
         }
-        if let Some(logging) = meta.pointer("/logging/client") {
-            let name = logging["file"]["id"].as_str().context("日志配置缺少 ID")?;
-            let path = safe_path(&root.join("assets/log_configs"), name)?;
-            if !path.is_file() {
-                bail!("日志配置缺失，请先修复此版本");
-            }
-            if let Some(argument) = logging["argument"].as_str() {
-                args.push(argument.replace("${path}", &path.display().to_string()));
-            }
+        if let Some(logging) = &logging {
+            args.push(logging.argument().into());
         }
         let parser = crate::argument_service::ArgumentParser::current();
         args.extend(parser.parse(&config.jvm_args).context("JVM 参数格式错误")?);
-        apply_platform_jvm_args(&mut args, meta, std::env::consts::OS);
+        crate::jvm_argument_service::JvmArgumentDefaults::new(
+            runtime.major(),
+            std::env::consts::OS,
+        )
+        .apply(&mut args, meta);
         let jvm_arg_count = args.len();
         args.push(meta["mainClass"].as_str().context("缺少 mainClass")?.into());
         args.extend(crate::launch_options::game_arguments_for(
@@ -562,6 +558,26 @@ impl Backend {
             cp.libraries(),
             &jar,
         )?;
+        let compatible =
+            crate::jvm_argument_service::JvmArgumentCompatibility::new(runtime.major())
+                .normalize(&args[..jvm_arg_count])?;
+        for warning in &compatible.warnings {
+            self.log(warning);
+        }
+        let memory = crate::memory_service::JvmMemory::from_arguments(&compatible.arguments)?;
+        if let Some(warning) = memory.warning(runtime.architecture) {
+            self.log(warning);
+        }
+        let normalized_jvm_count = compatible.arguments.len();
+        args.splice(..jvm_arg_count, compatible.arguments);
+        let command_plan = crate::java_command_service::JavaCommandPlan::prepare(
+            &runtime.path,
+            args,
+            normalized_jvm_count,
+            runtime.major(),
+            &classpath,
+            &game_dir,
+        )?;
         self.control.check()?;
         let log_path = game_dir.join("tui-mc-game.log");
         let builtin_versions = crate::fabric_check::builtins(
@@ -576,13 +592,6 @@ impl Backend {
             )?;
         }
         self.control.check()?;
-        // Hold the directory lease until exit: shared game directories must not
-        // have their options changed by another launcher process during a game.
-        let _game_options = crate::download_lock::DownloadLease::acquire(
-            &game_dir.join("options.txt"),
-            &self.control,
-            || self.log("等待使用同一游戏目录的进程退出…"),
-        )?;
         let language = crate::language_service::GameLanguage::parse(&config.game_language)?
             .resolve(&config.language)?;
         if language.enabled() {
@@ -608,14 +617,21 @@ impl Backend {
         let launch_started = std::time::SystemTime::now();
         let output = fs::File::create(&log_path)?;
         let mut tail = crate::logs::LogTail::open(&log_path)?;
-        let mut child = Command::new(&runtime.path)
-            .args(args)
-            .current_dir(&game_dir)
-            .stdout(Stdio::from(output.try_clone()?))
-            .stderr(Stdio::from(output))
-            .spawn()
-            .map(GameProcess)
-            .context("Java 启动失败")?;
+        let mut command = Command::new(&runtime.path);
+        let environment = crate::java_environment_service::JavaEnvironment;
+        let removed = environment.apply(&mut command);
+        if let Some(notice) = environment.notice(&removed) {
+            self.log(notice);
+        }
+        let mut child = GameProcess::spawn(
+            command
+                .args(command_plan.arguments())
+                .current_dir(&game_dir)
+                .stdin(Stdio::null())
+                .stdout(Stdio::from(output.try_clone()?))
+                .stderr(Stdio::from(output)),
+        )
+        .context("Java 启动失败")?;
         self.log(format!(
             "游戏进程 {} 已启动，日志：{}",
             child.id(),
@@ -670,19 +686,6 @@ fn verify(path: &Path, expected: &str) -> Result<bool> {
     }
     Ok(format!("{:x}", hash.finalize()).eq_ignore_ascii_case(expected))
 }
-fn apply_platform_jvm_args(args: &mut Vec<String>, meta: &Value, os: &str) {
-    let lwjgl3 = meta["libraries"].as_array().is_some_and(|libraries| {
-        libraries.iter().any(|lib| {
-            lib["name"].as_str().is_some_and(|name| {
-                name.starts_with("org.lwjgl:lwjgl:3.") || name.starts_with("org.lwjgl:lwjgl-glfw:")
-            })
-        })
-    });
-    if os == "macos" && lwjgl3 && !args.iter().any(|arg| arg == "-XstartOnFirstThread") {
-        args.push("-XstartOnFirstThread".into());
-    }
-}
-
 fn artifacts(lib: &Value) -> Result<Vec<(Value, bool)>> {
     crate::library_service::LibraryResolver::current().resolve(lib)
 }
@@ -883,13 +886,21 @@ mod tests {
     fn macos_glfw_requires_first_thread_without_duplicate_or_legacy_flag() {
         let meta = serde_json::json!({"libraries":[{"name":"org.lwjgl:lwjgl-glfw:3.3.3"}]});
         let mut args = vec![];
-        apply_platform_jvm_args(&mut args, &meta, "linux");
-        assert!(args.is_empty());
-        apply_platform_jvm_args(&mut args, &serde_json::json!({}), "macos");
-        assert!(args.is_empty());
-        apply_platform_jvm_args(&mut args, &meta, "macos");
-        apply_platform_jvm_args(&mut args, &meta, "macos");
-        assert_eq!(args, ["-XstartOnFirstThread"]);
+        crate::jvm_argument_service::JvmArgumentDefaults::new(21, "linux").apply(&mut args, &meta);
+        assert!(!args.iter().any(|arg| arg == "-XstartOnFirstThread"));
+        let defaults = crate::jvm_argument_service::JvmArgumentDefaults::new(21, "macos");
+        defaults.apply(&mut args, &serde_json::json!({}));
+        assert!(!args.iter().any(|arg| arg == "-XstartOnFirstThread"));
+        defaults.apply(&mut args, &meta);
+        let once = args.clone();
+        defaults.apply(&mut args, &meta);
+        assert_eq!(args, once);
+        assert_eq!(
+            args.iter()
+                .filter(|arg| *arg == "-XstartOnFirstThread")
+                .count(),
+            1
+        );
     }
     #[test]
     fn java_offline_uuid() {
@@ -910,7 +921,11 @@ mod tests {
         let dir = root.join("versions/fixture");
         fs::create_dir_all(&dir).unwrap();
         fs::create_dir_all(root.join("assets/indexes")).unwrap();
-        fs::write(root.join("assets/indexes/fixture.json"), b"{}").unwrap();
+        fs::write(
+            root.join("assets/indexes/fixture.json"),
+            br#"{"objects":{}}"#,
+        )
+        .unwrap();
         let source = dir.join("LaunchFixture.java");
         fs::write(&source, "public class LaunchFixture { public static void main(String[] args) { for (String arg : args) System.out.println(arg); } }").unwrap();
         assert!(Command::new("javac")

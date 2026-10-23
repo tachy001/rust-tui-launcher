@@ -77,6 +77,15 @@ pub(crate) struct LoaderInstallSession {
     _lease: DownloadLease,
 }
 impl LoaderInstallSession {
+    /// Recovery must exclude live installers without creating / editing their
+    /// launcher_profiles.json. Fail fast so an explicit assertion cannot bypass
+    /// an installer that this launcher can authoritatively observe as active.
+    pub(crate) fn for_recovery(root: &Path) -> Result<Self> {
+        let lease = DownloadLease::try_acquire(&root.join(INSTALLER_SESSION))
+            .context("游戏目录仍有安装任务占用，暂不能恢复加载器配置")?;
+        Ok(Self { _lease: lease })
+    }
+
     pub(crate) fn acquire(
         root: &Path,
         control: &TaskControl,

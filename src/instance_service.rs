@@ -35,6 +35,11 @@ impl InstanceMutation {
         if !self.protected.contains(id) {
             let lock = InstanceLock::acquire(&self.root.join("versions").join(id))?;
             if let Some(message) =
+                crate::loader_profile_service::LoaderProfileTransaction::recover(&self.root, id)?
+            {
+                self.recovery_messages.push(message);
+            }
+            if let Some(message) =
                 crate::instance_recovery::InstanceRecovery::recover(&self.root, id)?
             {
                 self.recovery_messages.push(message);
@@ -116,6 +121,11 @@ impl InstanceLaunchSession {
         let lock = if id == self.target {
             let lock = InstanceLock::acquire(&directory)?;
             if let Some(message) =
+                crate::loader_profile_service::LoaderProfileTransaction::recover(&self.root, id)?
+            {
+                self.messages.push(message);
+            }
+            if let Some(message) =
                 crate::instance_recovery::InstanceRecovery::recover(&self.root, id)?
             {
                 self.messages.push(message);
@@ -123,9 +133,18 @@ impl InstanceLaunchSession {
             lock
         } else {
             let mut lock = InstanceLock::shared(&directory)?;
-            if !crate::instance_recovery::InstanceRecovery::ready(&self.root, id)? {
+            if crate::loader_profile_service::LoaderProfileTransaction::pending(&self.root, id)?
+                || !crate::instance_recovery::InstanceRecovery::ready(&self.root, id)?
+            {
                 drop(lock);
                 let exclusive = InstanceLock::acquire(&directory)?;
+                if let Some(message) =
+                    crate::loader_profile_service::LoaderProfileTransaction::recover(
+                        &self.root, id,
+                    )?
+                {
+                    self.messages.push(message);
+                }
                 if let Some(message) =
                     crate::instance_recovery::InstanceRecovery::recover(&self.root, id)?
                 {
@@ -133,7 +152,9 @@ impl InstanceLaunchSession {
                 }
                 drop(exclusive);
                 lock = InstanceLock::shared(&directory)?;
-                if !crate::instance_recovery::InstanceRecovery::ready(&self.root, id)? {
+                if crate::loader_profile_service::LoaderProfileTransaction::pending(&self.root, id)?
+                    || !crate::instance_recovery::InstanceRecovery::ready(&self.root, id)?
+                {
                     bail!("父版本在恢复后再次发生变化，请重试");
                 }
             }

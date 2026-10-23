@@ -220,3 +220,157 @@ HMCL 的 HTTP 条件缓存仅作为缓存接入与失效处理参考，未宣称
 本项目在该行为之上新增自己的持久恢复协议，不宣称 HMCL 使用相同日志格式：固定实例目录内的 .tui-mc-install-journal.json 保存 schema、实例 ID、暂存指纹与文件指纹，旧配置放在所属暂存目录备份。按实际文件状态判断提交已完成或应回滚，恢复可重复执行，遇到未知编辑则保留现场。没有借用 HMCL / PCL 的发行标识、凭证或代码实现。
 
 版本解析改为每个节点上锁后再读。启动对父版本共享读取，对需恢复的父版本先取得独占锁恢复并重新取得共享锁；显式 jar 引用的归属也受保护。验证包含辅助 Rust 子进程退出和锁释放，不包含真实断电或 Minecraft 运行，不能将进程退出恢复等同于所有存储故障均可恢复。
+
+## 2026-10-23 JVM 内存参数预检
+
+实际阅读本地 HMCL LauncherHelper.java 的 32 位 Java / 1.5 GiB 建议，以及 PCL ModLaunch.vb 的内存参数生成段。HMCL 明确此阈值不准确、实际限制依赖系统和 JVM，因此本项目只提示，不用阈值拒绝或自动改小内存。
+
+新增 JvmMemory：在元数据、用户 JVM 参数和占位符展开后，按参数顺序读取 -Xmx / -Xms 与 MaxHeapSize / InitialHeapSize 别名，后项覆盖前项；拒绝无效大小、溢出、零最大堆及初始堆超过最大堆。仅检查 JVM 参数切片，游戏参数不参与。未移植 PCL 的自动 GC / 自动内存策略；百分比堆设置、其他 JVM 厂商选项和真实 JVM 内存保留能力仍不在本项证明范围内。
+
+## 2026-10-23 微软浏览器授权
+
+实际阅读本地 HMCLCore/auth/OAuth.java 的 authenticateAuthorizationCode、HMCL/game/OAuthServer.java 的 Factory.getClientId、startServer、serve：发布者通过构建属性内置应用 ID，桌面端用安全随机 state / verifier、PKCE S256、系统浏览器和回环回调完成登录；设备代码是另一条显式可选流程。另核对微软官方桌面应用配置、授权码流程和 localhost 回调端口规则（链接见 MICROSOFT-LOGIN.md）。未复制 HMCL 应用标识或服务端凭证。
+
+Rust 新增 BrowserLogin / BrowserOpener / SystemBrowser，默认 account login 与账户页 A 进入浏览器授权，后续复用现有 Xbox / Minecraft 资格验证、账户事务及凭证存储。监听 127.0.0.1 随机端口，回调使用注册路径 http://localhost/auth-response，按本次 state、Host、路径、唯一 code 参数处理；限定请求大小和单连接读取期限，不让未授权请求结束会话；等待可取消、超时关闭监听。回调网页只确认收到微软授权，不提前宣告 Minecraft 登录完成。不同于 HMCL 固定端口段，本项目用随机端口；需要应用注册接受 localhost 动态端口。
+
+应用 ID 优先使用保留的高级覆盖，其次读取构建时 RUST_TUI_LAUNCHER_MICROSOFT_CLIENT_ID。工作流由仓库变量 MICROSOFT_CLIENT_ID 注入公开应用标识。两项缺失明确报告发布配置未完成，普通用户无需注册应用。备用 account login-device 保留设备码并请求系统浏览器；不自动重开另一授权流程。正式微软应用尚未注册 / 提供，不能宣称真实 Microsoft / Xbox / Minecraft 登录已验收。
+
+## 2026-10-23 日志配置准备
+
+实际阅读 HMCLCore/launch/DefaultLauncher.java 的默认安全属性与 getLog4jConfigurationFile，PCL ModLaunch.vb 的 -Dlog4j2.formatMsgNoLookups=true。本项目目前仍遵循版本元数据的 logging/client 文件，不声称已移植 HMCL 自有安全 XML。本轮 LoggingConfiguration 统一元数据解析、下载描述及参数模板，安装和启动复用 Downloader 校验 / 补下载，修复仅检查文件存在与特殊路径重复占位符展开的问题。验证范围和剩余历史兼容边界见 ROADMAP 对应章节。
+
+## 2026-10-23 JVM 默认参数职责
+
+实际阅读本地 HMCLCore/launch/DefaultLauncher.java 的 generateCommands（addDefault、标准输出编码、RMI / JNDI / Log4j 属性、minecraft.client.jar）及 PCL ModLaunch.vb 的内存管理之后的 Log4j 与编码段。新增 JvmArgumentDefaults：默认属性在所有已有 JVM 参数之后按精确属性名补缺，显式空属性也属于覆盖，不改 file.encoding；Java 19 切换 stdout / stderr 属性名称。与上游本地编码策略不同，本项目默认标准输出 UTF-8 以匹配现有 LogTail；未声称能解码用户自定的非 UTF-8 或 Mod 自行写入的字节。macOS 首线程规则从 Backend 移入该服务，生产入口与测试共用实现。实际 JVM / 三端与完整安全兼容边界见 ROADMAP。
+
+## 2026-10-23 资源预检与完整性策略
+
+实际阅读本地 HMCLCore/download/game/GameAssetDownloadTask.java 的 integrityCheck、GameAssetIndexDownloadTask 依赖，以及 game/DefaultGameInstance.reconstructAssets；PCL ModMinecraft.vb 的 McAssetsFixList(CheckHash)。HMCL 可只看文件存在，PCL 快速模式还核对大小；本项目采用后者作为启动预检，安装 / 修复保留全量哈希校验并通过 Downloader 并行执行。AssetRepository 先完整验证对象描述、哈希去重及冲突，再筛选快速模式缺失项；索引有独立校验 / 缺失补下载和读取上限。没有把快速扫描通过当作对象内容全量验证，具体证据和剩余真实运行边界见 ROADMAP。
+
+## 2026-10-23 官方安装输出验证
+
+实际阅读本地 HMCLCore/download/forge/ForgeNewInstallTask.java 的 processorsTask.thenComposeAsync(checkComponentCompletionAsync(..., true))；PCL Pages/PageDownload/ModDownloadLib.vb 的 ForgelikeInjector 在进程退出后检查最后数行注入器成功标记。共同点是进程结束与业务完成应分开。本项目仍运行官方现代安装器，不把其输出日志中的任意 true 当作协议；改以已校验安装包中的客户端版本描述为 LoaderOutputRequirement，退出后核对正式配置，再执行既有依赖修复。保留原版父配置可解析但缺少加载器时不能成功这一关键约束。真实包 / 已有配置只读验证、允许的增量字段及完整 processor / 官方输出事务边界见 ROADMAP 对应章节。
+
+## 2026-10-23 官方加载器配置恢复
+
+继续阅读本地 HMCL DefaultGameRepositoryDraft.java 的 AppliedFile、backup / rollback 与 cleanupRollbackDirectoryAfterCommit。本项目官方现代安装器仍由外部程序直接写目录，不能照搬 HMCL 内部 draft 当作全目录事务；新增 LoaderProfileTransaction 只对目标 JSON 保存持久原始备份、完整性字段与已确认停止状态，并接入普通错误回滚及实例写 / 启动的恢复边界。PCL ForgelikeInjector 的取消 / 退出观测与此前 ProcessMonitor 直接子进程回收一并作为 quiescent 标记依据；未知外部写入者不自动覆盖。共享库 / 安装器 profiles 不整体回滚，完整限制和辅助子进程证据记录于 ROADMAP。
+
+## 2026-10-23 手动 Mod 文件操作
+
+实际阅读本地 HMCLCore/addon/mod/ModManager.java 的本地导入、disableMod / enableMod，以及 LocalModFile.java 的 activeProperty / 文件身份更新。其启停采用 Files.move(..., REPLACE_EXISTING)；本项目当前明确保留冲突副本，通过 LocalModSession 统一实例恢复 / 写锁和非阻塞共享目录租约，导入先暂存并检查归档，再以不覆盖目标的硬链接发布。检查之后目标被其他程序创建的情况也不覆盖。未移植完整 Mod 元信息读取和图形属性系统；硬链接平台支持、双链接窗口强杀、全部在线 Mod 写入口协调和 CRC / 加载兼容边界记录于 ROADMAP。
+
+## 2026-10-23 Mod 写入口协调
+
+实际阅读 PCL Pages/PageInstance/PageInstanceMod.xaml.vb 的 EDMods：启停前识别两个名称并比较内容，不同内容保留冲突要求用户整理；结合 HMCL ModManager 的管理器锁 / 文件操作，本项目继续采用不覆盖冲突文件的策略。ModMutationSession 统一手动导入 / 启停、移除 / 恢复和在线安装；在线文件 / 整合包修复在已有实例写会话内取得同一共享游戏目录租约。Backend.launch 的目录保护提前至 Mod 预检和资源映射前。跨进程租约为本项目额外系统协调，不能归因于上游单进程 UI 锁；实际作用范围与剩余外部写入 / 三端验证见 ROADMAP。
+
+## 2026-10-23 Quick Play 目标
+
+实际阅读本地 HMCL DefaultLauncher.generateCommands 的 QuickPlayOption.MultiPlayer / SinglePlayer / Realm 及 getFeatures；PCL ModLaunch.vb 的自动进入服务器段（2023-04-04 之后使用 --quickPlayMultiplayer，否则拆分 --server / --port）。本项目 QuickPlayTarget 明确分开单人 / 多人；按当前平台 + 目标 features 实际启用的参数判断支持，避免仅由规则字段存在或可编辑实例名猜测。单人新增 --world / --no-world、实例覆盖与已存在存档预检；没有移植完整版本日期时间线、Realms 或新 UI。参数和配置测试证据、普通文件 / NBT 界限及实际游戏验证范围见 ROADMAP。
+
+## 2026-10-23 JVM 参数历史边界
+
+实际阅读 HMCL DefaultLauncher.getForbiddens（Java >=9 时 -Xincgc），PCL ModLaunch 的 GC 选项清理与 Java 7 及以下 PermGen 参数分支。公开依据：[Oracle JDK 9 Migration Guide](https://docs.oracle.com/javase/9/migrate/)、[JDK 9 Release Notes](https://www.oracle.com/java/technologies/javase/9-relnotes.html)、[JDK-8173669](https://bugs.openjdk.org/browse/JDK-8173669)（PermSize / MaxPermSize 在 8 obsolete、10 expiration）。本项目 JvmArgumentCompatibility 只处理已核对的移除项，按版本执行，并对显式常见 GC 最后布尔状态检测冲突；参数范围限制于 JVM 切片，游戏参数和持久配置保留。完整厂商支持和真实 JVM 验证不在本项证明范围，详见 ROADMAP。
+
+## 2026-10-23 系统语言
+
+实际阅读 HMCL/src/main/java/org/jackhuang/hmcl/util/i18n/SupportedLocale.java 的默认系统语言、getLocaleByName、DEFAULT 和实验性阿拉伯语显示回退。本项目 SystemLocaleResolver 解析 POSIX / BCP-47 并匹配十目录；NativeLocales 只读取平台偏好。Windows API 对照 [GetUserPreferredUILanguages](https://learn.microsoft.com/en-us/windows/win32/api/winnls/nf-winnls-getuserpreferreduilanguages)，macOS 对照 [CFLocaleCopyPreferredLanguages](https://developer.apple.com/documentation/corefoundation/cflocalecopypreferredlanguages())（Create Rule 管理返回数组）。手动代码覆盖 auto，不将检测结果写成固定设置；没有照搬 HMCL 的 Java Locale 缓存或修改全局系统语言。真实平台与终端边界记录于 ROADMAP。
+
+## 2026-10-23 实例管理占用与复制快照
+
+实际阅读 HMCL DefaultGameRepository.removeInstance 的 checkNoActiveDraft / 目录移交，DefaultGameRepositoryDraft 的 baseSnapshot / AppliedFile 复制语义；PCL PageInstanceExport.xaml.vb 的版本递归和 assets / versions / libraries 等排除策略。保留本项目的数据白名单和依赖式复制，新增 CloneSnapshot 绑定当前设置 / 配置 / 文件元信息，及源读取会话、目标写会话和源共享目录租约；移除依赖检查移入锁内，恢复遵守目标锁。快照元信息指纹不等于逐文件内容校验，未声称移植 HMCL 完整 draft 或 PCL 完整导出器。实际证据与目录原子性 / 外部写入边界见 ROADMAP。
+
+## 2026-10-23 可取消原子文件复制
+
+实际阅读 HMCLCore/util/io/FileUtils.java 的 copyFile、saveSafely（含 OutputStream 回调）与 tmpSaveFile；PCL PageInstanceExport.xaml.vb 的任务取消等待 / CancellationToken 传递。Rust AtomicFile 继续临时写入后替换，额外确认 create_new 归属并在析构前关闭句柄，避免失败路径清理不属于本次操作的文件。atomic_copy_controlled 对实例 / 资源 / 整合包复制增加分块取消，恢复临界区保留非取消 API。没有声称上游具有同样的 Rust 所有权机制，也未将局部取消检查当作可中断内核 IO；具体调用范围与验证见 ROADMAP。
+
+## 2026-10-23 日志消费与近期输出
+
+实际阅读 HMCL game/Log.java 的 DEFAULT_LOG_LINES / getLogLines，以及 ui/LogWindow.java 的 checkLogCount；PCL Modules/Minecraft/ModWatcher.vb 的异步输出读取和 GameLog 中 LatestLog 超过500项时移除旧项。本项目保留文件日志读取架构，在 LogTail 中限制读取预算、近期行数和未完成单行，消费落后 / 进程退出时采样末尾，检测截短后重置读取位置。借鉴的是近期输出保留策略，没有移植 JavaFX 控件或宣称实现完整轮转检测；数据省略提示、测试和边界见 ROADMAP。
+
+## 2026-10-23 实例恢复的提交与清理
+
+实际阅读 HMCLCore/game/DefaultGameRepository.removeInstanceFromDisk：实例移交与后续清理分开，清理失败记录警告并刷新仓库；PCL PageDownload/ModDownloadLib.vb 的更新文件计划和回收站处理。Rust 恢复以目录成功移回 versions 为提交点，RestoreOutcome 显式区分已恢复 ID 与可选清理警告，CLI / TUI 只呈现结果。仅清理已知 entry.json 和空目录，不递归删除意外文件。没有把 PCL 文件更新流程当作实例恢复事务；断电与外部改写边界见 ROADMAP。
+
+## 2026-10-23 Minecraft 许可证与玩家档案
+
+实际阅读 HMCLCore/auth/microsoft/MicrosoftService.java 的 mcstore 激活请求与 getMinecraftProfile（404时请求 entitlements/license，按 game_minecraft 区分许可证缺失 / 档案未创建），以及 PCL Modules/Minecraft/ModLaunch.vb 的 MsLoginStep5 / MsLoginStep6。PCL 空 items 提前拒绝与 HMCL 当前流程不同，采用后者并保留成功授权请求和严格玩家数据校验。MinecraftProfileService 负责请求顺序、失败分流与阶段间取消；HttpMinecraftProfile 负责 HTTP 状态，不把网络 / 401错误转成不存在。没有用其他启动器的客户端 ID；本地提供者验证和真实账号边界见 ROADMAP。
+
+## 2026-10-23 长命令与 Java 类路径参数文件
+
+实际阅读 HMCLCore/launch/DefaultLauncher.java 的 makeLaunchScript 中 Windows command.length >32767检查，以及 PCL ModLaunch.vb 的 Cps.Select(ToShortPath) 类路径构造。本项目直接启动进程，采用独立 JavaCommandPlan 和 Java >=9 的类路径参数文件，未新增脚本入口，也不依赖磁盘8.3短文件名。语法和编码依据 [Oracle java 命令参数文件说明](https://docs.oracle.com/en/java/javase/17/docs/specs/man/java.html#java-command-line-argument-files)。仅把生成的类路径写入文件，保留其他参数顺序与令牌所在位置；实际 JDK26探针、本地测试和Java8 / Unix / 强杀边界见 ROADMAP。
+
+## 2026-10-23 Java 子进程环境
+
+实际阅读 HMCL DefaultLauncher.getEnvVars 和 PCL ModLaunch.McLaunchRun，确认实例 / PATH / 工作目录 / 图形环境属于后端进程准备。本项目 JavaEnvironment 的三变量排除是独立策略，不声称 HMCL / PCL已采用同样方式。依据 [Oracle JDK_JAVA_OPTIONS](https://docs.oracle.com/en/java/javase/25/docs/specs/man/java.html#using-the-jdk_java_options-launcher-environment-variable) 和 [JAVA_TOOL_OPTIONS说明](https://docs.oracle.com/java/technologies/javase/envvars.html)，这些环境可在显式 argv之外注入选项。仅排除JAVA_TOOL_OPTIONS / _JAVA_OPTIONS / JDK_JAVA_OPTIONS，不清空整个环境；探测、游戏和官方安装器共用服务，提示只包含键。测试、兼容性取舍与厂商变量边界见ROADMAP。
+
+## 2026-10-23 实例配置编辑与重置
+
+实际阅读 HMCL DefaultGameRepository.checkNoActiveDraft 和 PCL PageInstanceOverall.BtnDisplayRename_Click 的 McInstanceLock.IsLocked。Rust InstanceMetadataEditor 复用 InstanceMutation，把读取、改名、清除设置和配置提交置于同一目标会话；reset_settings 在主配置失败时恢复原字节，内存仅成功后更新。与 PCL 的版本目录重命名不同，本项目 set_name 仅修改显示名，不移动版本目录。未知字段保留、占用 / 保存 / 回滚故障验证与断电边界见 ROADMAP；未宣称移植完整上游配置系统。
+
+## 2026-10-23 存档操作占用和临时文件
+
+实际阅读 HMCL ui/instances/WorldManageUIUtils.java 的世界锁获取 / 关闭，以及 WorldBackupTask.java 的 CREATE_NEW备份文件与session.lock排除；PCL PageInstanceMod.xaml.vb 的更新前备份提示只作为存档保护需求背景，未声称其实现相同的备份事务。本项目新增 WorldMutationSession 复用实例写会话与游戏目录租约，OwnedBackup限定临时清理归属，并完善复制取消检查。原始世界锁互操作、无硬链接文件系统和强杀边界及本地验证见ROADMAP。
+
+## 2026-10-23 无覆盖发布的系统原语
+
+实际复查 HMCL WorldBackupTask 的 CREATE_NEW、PCL PageInstanceOverall 的实例修改锁，目标是保留同名玩家数据。新增 NoReplacePublisher 的系统实现独立编写，依据 [Linux renameat2手册](https://man7.org/linux/man-pages/man2/renameat2.2.html)、[Apple官方XNU声明](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/stdio.h)（RENAME_EXCL与renamex_np）、[Microsoft MoveFileExW](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-movefileexw)。只接入备份 / 世界导入 / 实例恢复；不把upstream的创建文件策略描述成已移植相同的原生目录发布机制。Windows实际验证及Linux / macOS / 特殊文件系统边界见ROADMAP。
+
+## 2026-10-23 账户会话选择与缓存恢复
+
+实际阅读 HMCL auth/microsoft/MicrosoftAccount.logIn 的有效期 / 刷新 / 身份一致性检查，PCL ModLaunch.McLoginMsStart 的缓存UUID、AccessToken、ExpiresAt条件。AccountSessionService把本项目会话策略与索引 / 系统凭证 / 网络刷新 / 时钟依赖分开；缓存缺失时允许一次原账户刷新，成功后严格检查身份和令牌。不是每次启动都在线validate，也不在认证错误时偷偷改用离线账户。与原AccountService持久化职责分开，证据和真实账户边界见ROADMAP。
+
+## 2026-10-23 崩溃诊断逐来源容错
+
+实际阅读 PCL Modules/Minecraft/ModCrash.vb 的Collect（各目录独立异常处理、latest.log / debug.log、时间筛选）和HMCLCore/game/CrashReportAnalyzer.java 的特征规则。DiagnosticAnalyzer保留本项目有界采样 / since过滤，新增debug.log及逐文件容错，DiagnosticReader允许本地注入读取失败；只生成静态建议与受控警告，不回显日志正文。没有移植完整上游正则规则、自动修复或上传日志；验证范围和时间 / 枚举边界见ROADMAP。
+
+## 2026-10-23 版本配置容器与参数别名
+
+实际阅读HMCLCore/game/GameInstanceManifest.java的解码 / merge，game/Argument.java和RuledArgument.java的规则参数解析（values优先、缺省规则可用），及PCL ModMinecraft.vb的继承 / RequiredJar选择。VersionProfileDecoder将可选null视为未声明，在合并前检查消费字段容器；不把null客户端误判为子实例JAR，并将values别名标准化。保留未知字段，未移植HMCL全部manifest / patch机制，现有Maven与平台规则仍各自负责验证。测试范围和历史配置边界见ROADMAP。
+
+## 2026-10-23 世界锁与 Java 的互操作
+
+实际阅读HMCLCore/game/World.java的lock / isLocked及HMCL WorldManageUIUtils。实现区别依据 [Rust File::try_lock](https://doc.rust-lang.org/std/fs/struct.File.html#method.try_lock)（Unix flock、Windows LockFileEx）与 [OpenJDK UnixFileDispatcherImpl.lock0](https://github.com/openjdk/jdk/blob/master/src/java.base/unix/native/libnio/ch/UnixFileDispatcherImpl.c)（fcntl F_SETLK；Long.MAX_VALUE映射长度0）。WorldSessionLock在Unix采用对应记录锁并提供进程内inode预留，在Windows保留原系统锁；与HMCL不同，不创建 / 写入缺失session.lock，旧版世界仍要求用户退出游戏。当前Windows测试与Unix未实测边界见ROADMAP。
+
+## 2026-10-23 Java8与Windows短类路径
+
+实际复查PCL Modules/Minecraft/ModLaunch.vb的Cps.Select(PathUtils.ToShortPath)，未声称读取其外部PathUtils依赖实现。Rust WindowsShortPaths独立调用 [Microsoft GetShortPathNameW](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getshortpathnamew)，遵守动态缓冲区和短名可能不存在 / 比原名更长的约定；LegacyClasspath只替换已生成classpath槽并保留加载顺序。现有HMCL脚本长度检查是需求背景，不是声称其采用相同回退。真实API与策略测试、文件系统和加载器边界见ROADMAP。
+
+## 2026-10-23 断点表示一致性
+
+实际阅读HMCL task/FileDownloadTask.java的完整性与ETag缓存选择、PCL Modules/Base/ModNet.vb的Range / ContentLength核对；来源 / 强ETag绑定是本项目独立实现，不声称上游使用相同sidecar格式。HTTP依据 [RFC9110 If-Range](https://www.rfc-editor.org/rfc/rfc9110.html#name-if-range)：使用强验证器限制部分表示拼接。ResumeBinding仅记录URL指纹和受限强ETag，Downloader的无哈希续传必须匹配来源和响应标识，哈希任务继续最终校验。回环HTTP证据、沙箱复查和弱 / 缺失标识的回退边界见ROADMAP。
+
+## 2026-10-23 下载数据的写入边界
+
+实际复查PCL Modules/Base/ModNet.vb的ContentLength / Range剩余大小核对，以及HMCL FileDownloadTask的读取和完整性完成路径。本项目TransferExtent独立计算响应 / 文件边界，打开部分文件前拒绝矛盾头部，每块写入之前检查长度，EOF检查短读；最终归档 / SHA-1逻辑保留。不是移植PCL多线程分段调度，也不以任意统一大小上限拒绝未知长度文件。新增策略与回环HTTP证据、阻塞IO / 分段边界见ROADMAP。
+
+## 2026-10-23 旧版资源索引选择
+
+实际阅读HMCLCore/game/GameInstanceManifest.getAssetIndex和util/Constants.DEFAULT_INDEX_URL，PCL ModMinecraft的McAssetsGetIndex / McAssetsGetIndexName。采用HMCL给出的8个固定包映射，并实际从Mojang官方逐个读取校验SHA-1；PCL的legacy回退包不同，未混用其哈希和布局。AssetRepository统一现代描述 / assets / 缺省legacy的选择，固定历史包增加大小与哈希约束，未知自定义索引保留对应离线缓存。官方包和布局标记的本地证据、对象下载 / 实际游戏边界见ROADMAP。
+
+## 2026-10-23 下载限流与重试等待
+
+实际阅读HMCL task/FetchTask.downloadHttp（候选重试间200ms）、GetTask候选构造，以及PCL Modules/Base/ModNet.vb（429等待10秒、500ms乘重试次数）。共享origin协调和镜像动态排序是本项目独立策略，未声称两者采用同一实现。时间格式依据 [RFC9110 Retry-After](https://www.rfc-editor.org/rfc/rfc9110.html#name-retry-after) 和 [httpdate解析接口](https://docs.rs/httpdate/1.0.3/httpdate/fn.parse_http_date.html)。DownloadRetryCoordinator协调同任务下载器，长等待不提前重发；响应重定向同时关联原 / 目标来源。取消、来源共享和回环镜像证据及跨任务边界见ROADMAP。
+
+### 2026-10-23 进程状态失败与清理
+
+参考本地 HMCLCore/src/main/java/org/jackhuang/hmcl/util/platform/ManagedProcess.java 的 stop，以及 PCL Plain Craft Launcher 2/Modules/Minecraft/ModWatcher.vb 的 Kill。独立实现状态观察失败后的显式终止和双错误反馈；未将 Java destroy 或 .NET Kill 视为完整进程树回收。
+
+核对 Rust 官方 CommandExt::spawn_with_attributes 文档：https://doc.rust-lang.org/std/os/windows/process/trait.CommandExt.html#tymethod.spawn_with_attributes ，该接口仍为 nightly，暂不引入不稳定编译选项。进程树所有权仍是待完成边界。
+
+### 2026-10-23 显式加载器恢复的共享目录锁
+
+补读本地 PCL ModMinecraft.vb 的 McFolderLauncherProfilesJsonCreate，确认 launcher_profiles.json 使用游戏根目录。恢复流程复用本项目 LoaderInstallSession 的目录锁，但不运行该共享配置的创建或格式验证；这项互斥属于本项目独立设计。并未声称 HMCL / PCL 提供同样的 journal 恢复或进程树停止保证。
+
+### 2026-10-23 进程归属与后代停止
+
+基于此前实际阅读的 HMCL ManagedProcess.stop / PCL ModWatcher.Kill，独立增加归属服务；上述参考方法本身不证明跨平台后代停止。采用系统原生 Job / 进程组，不扫描父 PID 树或调用 shell 杀进程。与参考实现的区别、真实辅助进程检查及未验收边界见 ROADMAP 同日“执行前建立进程归属与后代清理”。
+
+核对官方平台接口：
+- Windows Job Objects：https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects
+- TerminateJobObject：https://learn.microsoft.com/en-us/windows/win32/api/jobapi2/nf-jobapi2-terminatejobobject
+- Job 活动进程计数：https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_basic_accounting_information
+- THREADENTRY32：https://learn.microsoft.com/en-us/windows/win32/api/tlhelp32/ns-tlhelp32-threadentry32
+- ResumeThread：https://learn.microsoft.com/en-us/windows/desktop/api/processthreadsapi/nf-processthreadsapi-resumethread
+- Rust CommandExt::process_group：https://doc.rust-lang.org/std/os/unix/process/trait.CommandExt.html#method.process_group
+
+windows-sys 0.61.2 由现有缓存提供，本轮加入 Windows 直接依赖及对应功能，未引入 nightly。挂起再分配与原子创建 Job 不同；Unix 组也不等于无法逃逸的树隔离，均明确记录限制。

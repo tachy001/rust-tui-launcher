@@ -53,22 +53,22 @@ Windows 直接提供独立 EXE；Unix 包内仅包含可执行文件，解压后
 ## 发布草稿
 
 1. 更新 `Cargo.toml` 版本和 `Cargo.lock`，补充 `CHANGELOG.md`。
-2. 提交并推送，等待各平台普通构建通过。
-3. 创建与 Cargo 版本完全一致的标签，例如当前 `v0.14.0`：
+2. 按 [微软登录配置](MICROSOFT-LOGIN.md) 设置仓库变量 `MICROSOFT_CLIENT_ID`（发布者的一次性应用配置）；提交并推送。普通分支推送不触发工作流；PR 在三端检查格式、Clippy 和本地测试，手动触发还会生成三个平台的打包附件。
+3. 创建与 Cargo 版本完全一致的新标签；将下面的 `vX.Y.Z` 换成实际版本：
 
    ```sh
-   git tag -a v0.14.0 -m "v0.14.0"
-   git push origin v0.14.0
+   git tag -a vX.Y.Z -m "vX.Y.Z"
+   git push origin vX.Y.Z
    ```
 
 4. 标签构建通过后，工作流自动创建并发布名为 **Rust TUI Launcher v版本** 的 Release，只上传三个包：
    Windows x64 `.exe`、Linux x64 `.tar.gz`、macOS Universal `.tar.gz`。
    macOS 包包含通过 `lipo` 合并并检查的 Intel / Apple Silicon 双架构程序。
-   任一平台失败，不会进入草稿创建阶段。
+   任一平台失败，不会进入发布阶段。标签与 Cargo 版本不匹配会在编译前失败。
 5. 在 GitHub Releases 检查附件、说明和实测范围。
 
-普通 push / PR 只生成 Actions 构建附件，不创建 Release。
-失败重跑会先上传这三个包，成功后清除草稿中的其他附件；同一标签的 Release 可被工作流更新。
+PR 只做检查，不重复编译 Release 或上传包；手动运行会生成 Actions 构建附件，不创建 Release。
+失败重跑可继续更新尚未发布的草稿：先上传这三个包，成功后清除草稿中的其他附件并发布。工作流不会覆盖已经公开发布的同标签 Release；新版本使用新的 Cargo 版本和标签。
 
 GitHub 自动提供的 Source code 下载入口由平台生成，不属于工作流上传的附件。
 Linux ARM64 仍可自行源码构建，暂不提供单独的 Release 包。
