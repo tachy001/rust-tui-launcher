@@ -4,10 +4,15 @@ on:
   push:
     tags:
       - 'v*'
-    branches:
-      - '**'
   pull_request:
   workflow_dispatch:
+
+# A release tag is the single source of truth for cross-platform packages.
+# Do not also run the matrix for every branch push: that duplicated the same
+# build when a version tag was pushed on top of the commit.
+concurrency:
+  group: rust-tui-launcher-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
