@@ -173,7 +173,7 @@ mod tests {
             io::{Read, Write},
             net::TcpListener,
             thread,
-            time::{Duration, Instant},
+        time::Duration,
         };
         let workspace = crate::test_support::Workspace::new();
         let bytes = b"<Configuration/>";
