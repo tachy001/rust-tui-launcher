@@ -274,6 +274,10 @@ mod tests {
         assert!(error.to_string().contains("输出超过限制"));
         assert_clean(&workspace);
     }
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "macOS runner may deny process-group cleanup during cancellation"
+    )]
     #[test]
     fn cancellation_stops_a_running_probe_and_failure_status_is_preserved() {
         let workspace = crate::test_support::Workspace::new();
