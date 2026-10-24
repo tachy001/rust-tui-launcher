@@ -235,8 +235,7 @@ mod native {
                 if result != 0 {
                     let error = io::Error::last_os_error();
                     if error.raw_os_error() != Some(libc::ESRCH)
-                        && !(cfg!(target_os = "macos")
-                            && error.raw_os_error() == Some(libc::EPERM))
+                        && !(cfg!(target_os = "macos") && error.raw_os_error() == Some(libc::EPERM))
                     {
                         return Err(error).context("终止进程组失败");
                     }
