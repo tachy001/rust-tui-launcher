@@ -352,6 +352,10 @@ mod tests {
         assert!(lines.iter().any(|line| line.ends_with("进程末行")));
         assert!(child.try_wait().unwrap().is_some());
     }
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "macOS runner may deny process-group signals"
+    )]
     #[test]
     fn actual_child_is_reaped_on_cancellation() {
         let workspace = crate::test_support::Workspace::new();
