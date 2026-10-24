@@ -220,6 +220,11 @@ impl Backend {
                 }
             }
         }
+        // The following repair phase acquires the same game-directory lease
+        // for the Mod inventory. Release this phase's lease explicitly; a
+        // named guard would otherwise stay alive until the whole function
+        // returns and self.repair() would deadlock on Unix / reject on Windows.
+        drop(_game);
         self.log("整合包文件已校验；已禁用的 Mod 与已有配置保持原状态");
         Ok(())
     }
