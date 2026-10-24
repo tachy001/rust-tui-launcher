@@ -154,13 +154,14 @@ impl Backend {
             requirement.game_minimum
         ));
         self.control.check()?;
-        let shared_installation = crate::installation_service::LoaderInstallSession::acquire(
-            &root,
-            &self.control,
-            || {
-                self.log("等待另一个加载器安装任务释放游戏目录…");
-            },
-        )?;
+        let shared_installation =
+            std::sync::Arc::new(crate::installation_service::LoaderInstallSession::acquire(
+                &root,
+                &self.control,
+                || {
+                    self.log("等待另一个加载器安装任务释放游戏目录…");
+                },
+            )?);
         let mut profile_transaction =
             crate::loader_profile_service::LoaderProfileTransaction::begin(&root, &id, &mutation)?;
         let installation = (|| -> Result<()> {
@@ -177,7 +178,7 @@ impl Backend {
             if let Some(notice) = environment.notice(&removed) {
                 self.log(notice);
             }
-            let mut child = match GameProcess::spawn(
+            let mut child = match GameProcess::spawn_guarded(
                 command
                     .args(["-Djava.awt.headless=true", "-jar"])
                     .arg(&installer)
@@ -187,6 +188,7 @@ impl Backend {
                     .stdin(Stdio::null())
                     .stdout(stdout)
                     .stderr(stderr),
+                std::sync::Arc::clone(&shared_installation),
             ) {
                 Ok(child) => child,
                 Err(error) => {
@@ -202,6 +204,9 @@ impl Backend {
                 |line| self.log(format!("安装器 · {line}")),
                 |warning| self.log(warning),
             )?;
+            // Monitoring returned only after containment cleanup was confirmed.
+            // Release the child's copy; the outer lease still guards verification.
+            drop(child);
             profile_transaction.set_installer_active(false)?;
             let status = match outcome {
                 ProcessOutcome::Exited(status) => status,

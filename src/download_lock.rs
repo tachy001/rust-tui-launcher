@@ -14,6 +14,13 @@ pub(crate) const LOCK_DIR: &str = ".tui-mc-download-locks";
 pub(crate) struct DownloadLease {
     _file: fs::File,
 }
+impl Drop for DownloadLease {
+    fn drop(&mut self) {
+        // Release the open-file-description lock even if a concurrent Unix
+        // spawn temporarily inherited the descriptor before exec.
+        let _ = self._file.unlock();
+    }
+}
 impl DownloadLease {
     fn open(destination: &Path) -> Result<fs::File> {
         let path = Self::lock_path(destination)?;
@@ -92,6 +99,17 @@ impl DownloadLease {
 mod tests {
     use super::*;
     use std::sync::mpsc;
+    #[test]
+    fn dropping_lease_unlocks_even_with_a_duplicate_descriptor() {
+        let workspace = crate::test_support::Workspace::new();
+        let dest = workspace.path.join("file.bin");
+        let lease = DownloadLease::try_acquire(&dest).unwrap();
+        let duplicate = lease._file.try_clone().unwrap();
+        assert!(DownloadLease::try_acquire(&dest).is_err());
+        drop(lease);
+        let _next = DownloadLease::try_acquire(&dest).unwrap();
+        drop(duplicate);
+    }
     #[test]
     fn wait_can_be_cancelled_without_releasing_the_other_tasks_lease() {
         let workspace = crate::test_support::Workspace::new();

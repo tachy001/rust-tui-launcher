@@ -28,6 +28,7 @@ impl ProcessOutput for LogTail {
 pub(crate) struct ManagedProcess {
     child: Child,
     tree: Option<crate::process_tree_service::ProcessTree>,
+    resources: Option<Box<dyn Send>>,
 }
 impl ManagedProcess {
     pub(crate) fn spawn(command: &mut Command) -> Result<Self> {
@@ -35,11 +36,35 @@ impl ManagedProcess {
         Ok(Self {
             child,
             tree: Some(tree),
+            resources: None,
         })
+    }
+    /// Transfer leases before spawn so even unconfirmed spawn cleanup retains them.
+    pub(crate) fn spawn_guarded(
+        command: &mut Command,
+        resources: impl Send + 'static,
+    ) -> Result<Self> {
+        match Self::spawn(command) {
+            Ok(mut process) => {
+                process.resources = Some(Box::new(resources));
+                Ok(process)
+            }
+            Err(error) => {
+                if error.is::<crate::process_tree_service::SpawnCleanupUnconfirmed>() {
+                    std::mem::forget(resources);
+                    return Err(error).context("进程停止未确认，目录锁将保留至启动器退出");
+                }
+                Err(error)
+            }
+        }
     }
     #[cfg(test)]
     pub(crate) fn from_child(child: Child) -> Self {
-        Self { child, tree: None }
+        Self {
+            child,
+            tree: None,
+            resources: None,
+        }
     }
 }
 impl std::ops::Deref for ManagedProcess {
@@ -86,8 +111,15 @@ impl ProcessHandle for ManagedProcess {
 }
 impl Drop for ManagedProcess {
     fn drop(&mut self) {
-        if self.tree.is_some() || !matches!(self.child.try_wait(), Ok(Some(_))) {
-            let _ = self.terminate();
+        if (self.tree.is_some() || !matches!(self.child.try_wait(), Ok(Some(_))))
+            && self.terminate().is_err()
+        {
+            // Without proof of termination, releasing file leases could let
+            // a second task overwrite files still used by descendants.
+            // Deliberately retain them until launcher exit, not a guessed timeout.
+            if let Some(resources) = self.resources.take() {
+                std::mem::forget(resources);
+            }
         }
     }
 }
@@ -133,7 +165,9 @@ impl<'a> ProcessMonitor<'a> {
             };
             let cancelled = status.is_none() && self.control.cancelled();
             if cancelled {
-                process.terminate()?;
+                process
+                    .terminate()
+                    .context("取消请求未完成：进程清理失败，进程可能仍在运行")?;
             }
             if output_available {
                 match output.read(status.is_some() || cancelled) {
@@ -286,9 +320,13 @@ mod tests {
         control.cancel();
         let mut child = process(vec![Ok(None)]);
         child.fail_terminate = true;
-        assert!(monitor(&control)
+        let error = monitor(&control)
             .run(&mut child, &mut output, |_| {}, |_| {})
-            .is_err());
+            .err()
+            .expect("cancellation cleanup failure must propagate");
+        let message = format!("{error:#}");
+        assert!(message.contains("取消请求未完成"));
+        assert!(message.contains("stop failed"));
         assert_eq!(child.terminated, 1);
         assert!(output.calls.is_empty());
     }
@@ -335,6 +373,58 @@ mod tests {
         (child, tail)
     }
     #[test]
+    fn guarded_process_releases_leases_on_spawn_failure_and_confirmed_exit() {
+        let workspace = crate::test_support::Workspace::new();
+        let destination = workspace.path.join("options.txt");
+        let control = TaskControl::default();
+        let natives = crate::native_service::NativeDirectory::create(
+            &workspace.path.join("natives"),
+            &control,
+        )
+        .unwrap();
+        let failed_path = natives.path().unwrap().to_path_buf();
+        let lease = crate::download_lock::DownloadLease::try_acquire(&destination).unwrap();
+        assert!(ManagedProcess::spawn_guarded(
+            &mut Command::new(workspace.path.join("nonexistent-executable")),
+            (lease, natives),
+        )
+        .is_err());
+        assert!(!failed_path.exists());
+        let natives = crate::native_service::NativeDirectory::create(
+            &workspace.path.join("natives"),
+            &control,
+        )
+        .unwrap();
+        let native_path = natives.path().unwrap().to_path_buf();
+        let lease = crate::download_lock::DownloadLease::try_acquire(&destination).unwrap();
+        let (mut child, mut output) = spawn_probe(&workspace, "exit");
+        child.resources = Some(Box::new((lease, natives)));
+        assert!(native_path.is_dir());
+        assert!(crate::download_lock::DownloadLease::try_acquire(&destination).is_err());
+        ProcessMonitor::new(&TaskControl::default())
+            .run(&mut child, &mut output, |_| {}, |_| {})
+            .unwrap();
+        drop(child);
+        assert!(!native_path.exists());
+        let _available = crate::download_lock::DownloadLease::try_acquire(&destination).unwrap();
+    }
+    #[test]
+    fn installer_process_keeps_shared_lease_after_caller_releases_its_copy() {
+        use crate::installation_service::LoaderInstallSession;
+        use std::sync::Arc;
+        let workspace = crate::test_support::Workspace::new();
+        let lease = Arc::new(LoaderInstallSession::for_recovery(&workspace.path).unwrap());
+        let (mut child, mut output) = spawn_probe(&workspace, "exit");
+        child.resources = Some(Box::new(Arc::clone(&lease)));
+        drop(lease);
+        assert!(LoaderInstallSession::for_recovery(&workspace.path).is_err());
+        ProcessMonitor::new(&TaskControl::default())
+            .run(&mut child, &mut output, |_| {}, |_| {})
+            .unwrap();
+        drop(child);
+        let _recovery = LoaderInstallSession::for_recovery(&workspace.path).unwrap();
+    }
+    #[test]
     fn actual_child_failed_exit_preserves_unterminated_output() {
         let workspace = crate::test_support::Workspace::new();
         let (mut child, mut tail) = spawn_probe(&workspace, "exit");
@@ -352,10 +442,6 @@ mod tests {
         assert!(lines.iter().any(|line| line.ends_with("进程末行")));
         assert!(child.try_wait().unwrap().is_some());
     }
-    #[cfg_attr(
-        target_os = "macos",
-        ignore = "macOS runner may deny process-group signals"
-    )]
     #[test]
     fn actual_child_is_reaped_on_cancellation() {
         let workspace = crate::test_support::Workspace::new();
@@ -387,10 +473,6 @@ mod tests {
         assert!(child.try_wait().unwrap().is_some());
         assert!(lines.iter().any(|line| line.ends_with("进程末行")));
     }
-    #[cfg_attr(
-        target_os = "macos",
-        ignore = "macOS runner may deny process-group signals"
-    )]
     #[test]
     fn descendants_stop_on_cancellation_parent_exit_and_owner_drop() {
         for mode in ["tree-wait", "tree-exit", "tree-drop"] {

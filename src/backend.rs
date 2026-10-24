@@ -623,13 +623,14 @@ impl Backend {
         if let Some(notice) = environment.notice(&removed) {
             self.log(notice);
         }
-        let mut child = GameProcess::spawn(
+        let mut child = GameProcess::spawn_guarded(
             command
                 .args(command_plan.arguments())
                 .current_dir(&game_dir)
                 .stdin(Stdio::null())
                 .stdout(Stdio::from(output.try_clone()?))
                 .stderr(Stdio::from(output)),
+            (running, _game_options, native_directory),
         )
         .context("Java 启动失败")?;
         self.log(format!(
@@ -648,7 +649,7 @@ impl Backend {
                 ));
             },
             |warning| self.log(redact_token(&warning, &session.access_token)),
-        )? {
+        ).context("游戏监控未完成；若清理仍失败，目录锁将保留至启动器退出，请先确认游戏及其子进程已停止")? {
             ProcessOutcome::Exited(status) => status,
             ProcessOutcome::Cancelled => bail!("游戏已由用户终止"),
         };

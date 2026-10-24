@@ -602,7 +602,7 @@ mod tests {
         let server = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = server.local_addr().unwrap();
         let handle = thread::spawn(move || {
-            let (mut socket, _) = server.accept().unwrap();
+            let mut socket = crate::test_support::accept_http(&server).unwrap();
             let mut bytes = vec![];
             let mut byte = [0];
             while socket.read(&mut byte).unwrap() > 0 {
@@ -659,19 +659,7 @@ mod tests {
             listener.set_nonblocking(true).unwrap();
             let base = format!("http://{}", listener.local_addr().unwrap());
             let handle = thread::spawn(move || {
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-                let mut socket = loop {
-                    match listener.accept() {
-                        Ok((socket, _)) => break socket,
-                        Err(error)
-                            if error.kind() == std::io::ErrorKind::WouldBlock
-                                && std::time::Instant::now() < deadline =>
-                        {
-                            thread::sleep(std::time::Duration::from_millis(10))
-                        }
-                        Err(error) => panic!("local retry fixture: {error}"),
-                    }
-                };
+                let mut socket = crate::test_support::accept_http(&listener).unwrap();
                 socket
                     .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                     .unwrap();
@@ -767,7 +755,7 @@ mod tests {
             let binding = crate::download_resume_service::ResumeBinding::new(&partial);
             binding.record(&url, tag).unwrap();
             let handle = thread::spawn(move || {
-                let (mut socket, _) = server.accept().expect("local HTTP fixture");
+                let mut socket = crate::test_support::accept_http(&server).expect("local HTTP fixture");
                 socket.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
                 let mut request = vec![];
                 let mut byte = [0];

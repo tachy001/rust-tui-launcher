@@ -12,15 +12,15 @@ use std::{
 static SERIAL: AtomicU64 = AtomicU64::new(0);
 
 /// A launch owns fresh native files until its child process has been reaped.
-pub(crate) struct NativeDirectory<'a> {
+pub(crate) struct NativeDirectory {
     canonical: PathBuf,
     parent: PathBuf,
     java_path: PathBuf,
-    control: &'a TaskControl,
+    control: TaskControl,
     failed: bool,
 }
-impl<'a> NativeDirectory<'a> {
-    pub(crate) fn create(parent: &Path, control: &'a TaskControl) -> Result<Self> {
+impl NativeDirectory {
+    pub(crate) fn create(parent: &Path, control: &TaskControl) -> Result<Self> {
         control.check()?;
         fs::create_dir_all(parent)?;
         let parent = fs::canonicalize(parent)?;
@@ -35,7 +35,7 @@ impl<'a> NativeDirectory<'a> {
             java_path: crate::paths::for_java(&directory),
             canonical: directory,
             parent,
-            control,
+            control: control.clone(),
             failed: false,
         })
     }
@@ -107,7 +107,7 @@ impl<'a> NativeDirectory<'a> {
         Ok(())
     }
 }
-impl Drop for NativeDirectory<'_> {
+impl Drop for NativeDirectory {
     fn drop(&mut self) {
         // Delete only the directory created by this guard, with both resolved paths rechecked.
         if fs::canonicalize(&self.parent).ok().as_ref() != Some(&self.parent) {

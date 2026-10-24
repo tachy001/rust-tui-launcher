@@ -193,6 +193,13 @@ fn reset_settings_with(
 pub(crate) struct InstanceLock {
     _file: fs::File,
 }
+impl Drop for InstanceLock {
+    fn drop(&mut self) {
+        // Closing only our descriptor may leave a Unix lock alive until a
+        // concurrently spawned child execs. End ownership explicitly.
+        let _ = self._file.unlock();
+    }
+}
 impl InstanceLock {
     pub(crate) fn acquire(dir: &Path) -> Result<Self> {
         Self::open(dir, false)
@@ -565,6 +572,19 @@ impl CloneSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn dropping_instance_lock_unlocks_with_duplicate_descriptor() {
+        let workspace = crate::test_support::Workspace::new();
+        let dir = workspace.path.join("versions/test");
+        for shared in [false, true] {
+            let lock = InstanceLock::open(&dir, shared).unwrap();
+            let duplicate = lock._file.try_clone().unwrap();
+            assert!(InstanceLock::acquire(&dir).is_err());
+            drop(lock);
+            let _next = InstanceLock::acquire(&dir).unwrap();
+            drop(duplicate);
+        }
+    }
 
     fn fixture(root: &Path) -> Config {
         let config = Config {

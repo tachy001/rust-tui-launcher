@@ -4,6 +4,42 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 static SERIAL: AtomicU64 = AtomicU64::new(0);
+
+/// Bound connection waits and normalize accepted sockets on every platform.
+pub fn accept_http(listener: &std::net::TcpListener) -> std::io::Result<std::net::TcpStream> {
+    use std::{
+        io,
+        time::{Duration, Instant},
+    };
+    listener.set_nonblocking(true)?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                // Windows can inherit the listener's nonblocking mode.
+                stream.set_nonblocking(false)?;
+                stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+                stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+                return Ok(stream);
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) =>
+            {
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "HTTP fixture received no connection",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
 pub struct Workspace {
     pub path: PathBuf,
 }

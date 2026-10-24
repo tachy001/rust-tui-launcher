@@ -182,7 +182,7 @@ mod tests {
         let server = thread::spawn(move || {
             let mut count = 0;
             while count < 2 {
-                let (mut stream, _) = listener.accept().unwrap();
+                let mut stream = crate::test_support::accept_http(&listener).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(1)))
                     .unwrap();

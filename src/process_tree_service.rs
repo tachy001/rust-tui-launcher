@@ -234,9 +234,10 @@ mod native {
                 let result = unsafe { libc::kill(-self.group, libc::SIGKILL) };
                 if result != 0 {
                     let error = io::Error::last_os_error();
-                    if error.raw_os_error() != Some(libc::ESRCH)
-                        && !(cfg!(target_os = "macos") && error.raw_os_error() == Some(libc::EPERM))
-                    {
+                    // Darwin killpg skips zombies and can report EPERM when
+                    // only the unreaped leader remains. Reap and verify ESRCH
+                    // below; EPERM itself never proves cleanup succeeded.
+                    if error.raw_os_error() != Some(libc::ESRCH) && !darwin_group_pending(&error) {
                         return Err(error).context("终止进程组失败");
                     }
                 }
@@ -250,14 +251,11 @@ mod native {
                     if error.raw_os_error() == Some(libc::ESRCH) && reaped {
                         return Ok(());
                     }
-                    if cfg!(target_os = "macos")
-                        && error.raw_os_error() == Some(libc::EPERM)
-                        && reaped
-                    {
-                        return Ok(());
-                    }
-                    if error.raw_os_error() != Some(libc::ESRCH) {
+                    if error.raw_os_error() != Some(libc::ESRCH) && !darwin_group_pending(&error) {
                         return Err(error).context("确认进程组退出失败");
+                    }
+                    if Instant::now() >= deadline {
+                        return Err(error).context("进程组退出未确认，可能仍有活动或未回收进程");
                     }
                 }
                 if Instant::now() >= deadline {
@@ -266,6 +264,10 @@ mod native {
                 thread::sleep(Duration::from_millis(10));
             }
         }
+    }
+
+    fn darwin_group_pending(error: &io::Error) -> bool {
+        cfg!(target_os = "macos") && error.raw_os_error() == Some(libc::EPERM)
     }
 }
 

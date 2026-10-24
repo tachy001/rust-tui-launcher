@@ -38,6 +38,37 @@ struct DeviceCode {
 fn poll_default() -> u64 {
     5
 }
+struct DevicePolling {
+    deadline: Instant,
+    interval: Duration,
+}
+impl DevicePolling {
+    fn new(now: Instant, expires_in: u64, interval: u64) -> Result<Self> {
+        if expires_in == 0 {
+            bail!("设备登录码已过期");
+        }
+        Ok(Self {
+            deadline: now
+                .checked_add(Duration::from_secs(expires_in))
+                .context("设备登录码有效期超出支持范围")?,
+            interval: Duration::from_secs(interval.max(1)),
+        })
+    }
+    fn wait_duration(&self, now: Instant) -> Result<Duration> {
+        let remaining = self.deadline.saturating_duration_since(now);
+        if remaining.is_zero() {
+            bail!("设备登录码已过期");
+        }
+        Ok(self.interval.min(remaining))
+    }
+    fn slow_down(&mut self) {
+        self.interval = self.interval.saturating_add(Duration::from_secs(5));
+    }
+    fn connection_timeout(&mut self) {
+        // RFC 8628 §3.5: reduce polling frequency after a timeout.
+        self.interval = self.interval.saturating_mul(2);
+    }
+}
 #[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
 struct OAuthToken {
     access_token: String,
@@ -50,6 +81,15 @@ fn now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+fn minecraft_expiration(response: &Value, requested_at: u64) -> Result<u64> {
+    let lifetime = response["expires_in"]
+        .as_u64()
+        .filter(|value| *value > 0)
+        .context("Minecraft 登录响应缺少有效的令牌有效期")?;
+    requested_at
+        .checked_add(lifetime)
+        .context("Minecraft 令牌有效期超出支持范围")
 }
 pub(crate) fn validate_client_id(value: &str) -> Result<()> {
     let compact = value.replace('-', "");
@@ -163,7 +203,9 @@ fn xsts_error(code: u64) -> &'static str {
 }
 impl Backend {
     fn auth_wait(&self, duration: Duration) -> Result<()> {
-        let until = Instant::now() + duration;
+        let until = Instant::now()
+            .checked_add(duration)
+            .context("认证等待时间超出支持范围")?;
         while Instant::now() < until {
             self.control.check()?;
             thread::sleep(
@@ -214,6 +256,7 @@ impl Backend {
             "获取设备登录码",
         )?)?;
         let uri = reqwest::Url::parse(&device.verification_uri)?;
+        let mut polling = DevicePolling::new(Instant::now(), device.expires_in, device.interval)?;
         if uri.scheme() != "https" {
             bail!("登录地址不是 HTTPS");
         }
@@ -226,13 +269,9 @@ impl Backend {
         if let Err(error) = SystemBrowser.open(&device.verification_uri) {
             self.log(format!("{error:#}；请手动打开上面的微软登录地址"));
         }
-        let deadline = Instant::now() + Duration::from_secs(device.expires_in);
-        let mut interval = device.interval.max(1);
         let token = loop {
-            self.auth_wait(Duration::from_secs(interval))?;
-            if Instant::now() >= deadline {
-                bail!("设备登录码已过期");
-            }
+            self.auth_wait(polling.wait_duration(Instant::now())?)?;
+            polling.wait_duration(Instant::now())?;
             let response = self
                 .client
                 .post(TOKEN_URL)
@@ -241,8 +280,17 @@ impl Backend {
                     ("client_id", client_id.as_str()),
                     ("device_code", device.device_code.as_str()),
                 ])
-                .send()
-                .context("轮询微软登录失败")?;
+                .send();
+            self.control.check()?;
+            let response = match response {
+                Ok(response) => response,
+                Err(error) if error.is_timeout() => {
+                    polling.connection_timeout();
+                    self.log("微软登录轮询超时，将延长间隔后重试；仍可取消登录");
+                    continue;
+                }
+                Err(error) => return Err(error).context("轮询微软登录失败"),
+            };
             let status = response.status();
             let value: Value = response.json().context("微软登录响应格式错误")?;
             if status.is_success() {
@@ -250,7 +298,7 @@ impl Backend {
             }
             let error = value["error"].as_str().unwrap_or("unknown_error");
             if device_error(error)? {
-                interval = interval.saturating_add(5);
+                polling.slow_down();
             }
         };
         self.finish_auth(&client_id, &token, None)
@@ -283,6 +331,7 @@ impl Backend {
             bail!("Xbox 用户哈希不一致，拒绝继续认证");
         }
         self.control.check()?;
+        let requested_at = now();
         let minecraft = send_json(
             self.client
                 .post("https://api.minecraftservices.com/authentication/login_with_xbox")
@@ -290,6 +339,7 @@ impl Backend {
             "Minecraft 登录",
         )?;
         let access = field(&minecraft, "access_token")?;
+        let expires_at = minecraft_expiration(&minecraft, requested_at)?;
         let user = crate::minecraft_profile_service::MinecraftProfileService.fetch(
             &HttpMinecraftProfile {
                 backend: self,
@@ -303,7 +353,7 @@ impl Backend {
             name: name.clone(),
             kind: AccountKind::Microsoft,
             client_id: client_id.into(),
-            expires_at: now().saturating_add(minecraft["expires_in"].as_u64().unwrap_or(3600)),
+            expires_at,
             xuid: xsts
                 .pointer("/DisplayClaims/xui/0/xid")
                 .and_then(Value::as_str)
@@ -318,6 +368,9 @@ impl Backend {
             bail!("刷新后的 Minecraft 账户身份不一致，请重新登录");
         }
         self.control.check()?;
+        if expires_at <= now() {
+            bail!("Minecraft 令牌在验证账户期间已过期，请重新登录");
+        }
         if let Some(session) = refresh_session {
             session.commit(account, access)?;
         } else {
@@ -385,6 +438,72 @@ pub(crate) fn offline(name: &str) -> Session {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn device_timeouts_back_off_without_extending_expiration() {
+        let now = std::time::Instant::now();
+        let mut polling = super::DevicePolling::new(now, 60, 5).unwrap();
+        polling.connection_timeout();
+        assert_eq!(polling.wait_duration(now).unwrap().as_secs(), 10);
+        polling.connection_timeout();
+        assert_eq!(polling.wait_duration(now).unwrap().as_secs(), 20);
+        polling.slow_down();
+        assert_eq!(polling.wait_duration(now).unwrap().as_secs(), 25);
+        for _ in 0..100 {
+            polling.connection_timeout();
+        }
+        assert_eq!(polling.wait_duration(now).unwrap().as_secs(), 60);
+        assert_eq!(
+            polling
+                .wait_duration(now + std::time::Duration::from_secs(59))
+                .unwrap()
+                .as_secs(),
+            1
+        );
+        assert!(polling
+            .wait_duration(now + std::time::Duration::from_secs(60))
+            .is_err());
+    }
+    #[test]
+    fn minecraft_expiry_is_anchored_to_request_and_rejects_invalid_lifetimes() {
+        assert_eq!(
+            super::minecraft_expiration(&serde_json::json!({"expires_in": 60}), 100).unwrap(),
+            160
+        );
+        for response in [
+            serde_json::json!({}),
+            serde_json::json!({"expires_in": 0}),
+            serde_json::json!({"expires_in": -1}),
+            serde_json::json!({"expires_in": "3600"}),
+        ] {
+            assert!(super::minecraft_expiration(&response, 100).is_err());
+        }
+        assert!(
+            super::minecraft_expiration(&serde_json::json!({"expires_in": u64::MAX}), 100).is_err()
+        );
+    }
+    #[test]
+    fn device_polling_bounds_waits_by_expiration_and_preserves_backoff() {
+        let now = std::time::Instant::now();
+        let mut polling = super::DevicePolling::new(now, 30, 5).unwrap();
+        assert_eq!(polling.wait_duration(now).unwrap().as_secs(), 5);
+        polling.slow_down();
+        assert_eq!(polling.wait_duration(now).unwrap().as_secs(), 10);
+        polling.slow_down();
+        assert_eq!(polling.wait_duration(now).unwrap().as_secs(), 15);
+        assert_eq!(
+            polling
+                .wait_duration(now + std::time::Duration::from_secs(29))
+                .unwrap()
+                .as_secs(),
+            1
+        );
+        assert!(polling
+            .wait_duration(now + std::time::Duration::from_secs(30))
+            .is_err());
+        assert!(super::DevicePolling::new(now, 0, 5).is_err());
+        let huge = super::DevicePolling::new(now, 10, u64::MAX).unwrap();
+        assert_eq!(huge.wait_duration(now).unwrap().as_secs(), 10);
+    }
     use super::*;
     #[test]
     fn oauth_codes_have_correct_flow() {
