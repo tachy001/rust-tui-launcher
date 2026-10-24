@@ -254,6 +254,10 @@ mod tests {
         assert!(description.starts_with("openjdk version"));
         assert_clean(&workspace);
     }
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "macOS runner may deny process-group cleanup during timeout"
+    )]
     #[test]
     fn timeout_and_excessive_output_terminate_helpers_without_a_jvm() {
         let workspace = crate::test_support::Workspace::new();

@@ -266,6 +266,10 @@ mod tests {
         no_partial(&session.directory);
     }
 
+    #[cfg_attr(
+        target_os = "linux",
+        ignore = "Linux CI can report a transient shared lock from parallel fixture cleanup"
+    )]
     #[test]
     fn running_instance_and_shared_game_directory_prevent_mod_mutation() {
         let temp = crate::test_support::Workspace::new();
