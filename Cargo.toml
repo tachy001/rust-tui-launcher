@@ -1,6 +1,6 @@
 [package]
 name = "tui-launcher"
-version = "0.21.4"
+version = "0.21.5"
 edition = "2021"
 description = "A keyboard-first Minecraft Java launcher"
 license = "MIT"

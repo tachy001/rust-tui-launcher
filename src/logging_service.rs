@@ -178,20 +178,11 @@ mod tests {
         let workspace = crate::test_support::Workspace::new();
         let bytes = b"<Configuration/>";
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}/client.xml", listener.local_addr().unwrap());
         let server = thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(5);
             let mut count = 0;
-            while count < 2 && Instant::now() < deadline {
-                let (mut stream, _) = match listener.accept() {
-                    Ok(value) => value,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(10));
-                        continue;
-                    }
-                    Err(error) => panic!("{error}"),
-                };
+            while count < 2 {
+                let (mut stream, _) = listener.accept().unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(1)))
                     .unwrap();

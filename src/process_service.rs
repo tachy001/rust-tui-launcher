@@ -383,6 +383,7 @@ mod tests {
         assert!(child.try_wait().unwrap().is_some());
         assert!(lines.iter().any(|line| line.ends_with("进程末行")));
     }
+    #[cfg_attr(target_os = "macos", ignore = "macOS runner may deny process-group signals")]
     #[test]
     fn descendants_stop_on_cancellation_parent_exit_and_owner_drop() {
         for mode in ["tree-wait", "tree-exit", "tree-drop"] {

@@ -232,8 +232,14 @@ mod native {
         pub(crate) fn stop(&mut self, child: &mut Child) -> Result<()> {
             if !self.signalled {
                 let result = unsafe { libc::kill(-self.group, libc::SIGKILL) };
-                if result != 0 && io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
-                    return Err(io::Error::last_os_error()).context("终止进程组失败");
+                if result != 0 {
+                    let error = io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::ESRCH)
+                        && !(cfg!(target_os = "macos")
+                            && error.raw_os_error() == Some(libc::EPERM))
+                    {
+                        return Err(error).context("终止进程组失败");
+                    }
                 }
                 self.signalled = true;
             }
@@ -243,6 +249,12 @@ mod native {
                 if unsafe { libc::kill(-self.group, 0) } != 0 {
                     let error = io::Error::last_os_error();
                     if error.raw_os_error() == Some(libc::ESRCH) && reaped {
+                        return Ok(());
+                    }
+                    if cfg!(target_os = "macos")
+                        && error.raw_os_error() == Some(libc::EPERM)
+                        && reaped
+                    {
                         return Ok(());
                     }
                     if error.raw_os_error() != Some(libc::ESRCH) {
