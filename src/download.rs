@@ -763,19 +763,11 @@ mod tests {
             let partial = workspace.path.join("file.part");
             fs::write(&partial, b"a").unwrap();
             let server = TcpListener::bind("127.0.0.1:0").unwrap();
-            server.set_nonblocking(true).unwrap();
             let url = format!("http://{}/file", server.local_addr().unwrap());
             let binding = crate::download_resume_service::ResumeBinding::new(&partial);
             binding.record(&url, tag).unwrap();
             let handle = thread::spawn(move || {
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-                let mut socket = loop {
-                    match server.accept() {
-                        Ok((socket, _)) => break socket,
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock && std::time::Instant::now() < deadline => thread::sleep(std::time::Duration::from_millis(10)),
-                        Err(error) => panic!("local HTTP fixture: {error}"),
-                    }
-                };
+                let (mut socket, _) = server.accept().expect("local HTTP fixture");
                 socket.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
                 let mut request = vec![];
                 let mut byte = [0];
