@@ -19,24 +19,20 @@ impl<'a> LegacyClasspath<'a> {
     pub(crate) fn rewrite(&self, arguments: &mut [String], classpath: &str) {
         let mut slots = vec![];
         let mut index = 0;
-        while index < arguments.len() {
-            if matches!(
-                arguments[index].as_str(),
-                "-cp" | "-classpath" | "--class-path"
-            ) && arguments
-                .get(index + 1)
-                .is_some_and(|value| value == classpath)
+        for group in crate::jvm_argument_service::argument_groups(arguments) {
+            if matches!(group[0].as_str(), "-cp" | "-classpath" | "--class-path")
+                && group.get(1).is_some_and(|value| value == classpath)
             {
                 slots.push((index + 1, ""));
-                index += 2;
+                index += group.len();
                 continue;
             }
             for prefix in ["--class-path=", "-DlegacyClassPath="] {
-                if arguments[index].strip_prefix(prefix) == Some(classpath) {
+                if group[0].strip_prefix(prefix) == Some(classpath) {
                     slots.push((index, prefix));
                 }
             }
-            index += 1;
+            index += group.len();
         }
         if slots.is_empty() {
             return;
@@ -145,6 +141,19 @@ mod tests {
                 "user-choice.jar"
             ]
         );
+    }
+    #[test]
+    fn preserves_classpath_property_inside_another_options_operand() {
+        let cp = "C:\\long library\\one.jar";
+        let mut args = vec![
+            "--module-path".into(),
+            format!("-DlegacyClassPath={cp}"),
+            "-cp".into(),
+            cp.into(),
+        ];
+        LegacyClasspath::new(&Source).rewrite(&mut args, cp);
+        assert_eq!(args[1], format!("-DlegacyClassPath={cp}"));
+        assert_eq!(args[3], "C:\\LIB~1\\one.jar");
     }
     #[test]
     fn unavailable_longer_or_invalid_alias_preserves_original() {

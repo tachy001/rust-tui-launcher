@@ -18,7 +18,16 @@ pub fn directory(config: &Config, id: &str) -> Result<PathBuf> {
 }
 pub fn list(config: &Config, id: &str) -> Result<Vec<ModEntry>> {
     let mut entries = vec![];
-    for entry in fs::read_dir(directory(config, id)?)? {
+    let directory = config.effective(id)?.instance_path(id)?.join("mods");
+    let files = match fs::read_dir(&directory) {
+        Ok(files) => files,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(entries),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("无法读取 Mod 目录：{}", directory.display()))
+        }
+    };
+    for entry in files {
         let entry = entry?;
         if !entry.file_type()?.is_file() {
             continue;
@@ -70,7 +79,7 @@ pub fn remove(config: &Config, id: &str, filename: &str) -> Result<PathBuf> {
     } else {
         base.to_owned()
     };
-    if safe_path(&mods, &counterpart)?.exists() {
+    if occupied(&safe_path(&mods, &counterpart)?)? {
         bail!("同时存在启用和禁用副本，请先整理同名文件，避免移除后管理记录产生歧义");
     }
     let mut next_inventory = None;
@@ -144,6 +153,27 @@ fn read_optional(path: &Path) -> Result<Option<Vec<u8>>> {
     }
 }
 
+fn occupied(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("无法检查 Mod 目标：{}", path.display())),
+    }
+}
+
+fn restore_file(source: &Path, destination: &Path) -> Result<()> {
+    // Unlike rename on Unix, hard_link atomically rejects an occupied name.
+    fs::hard_link(source, destination)
+        .context("无法恢复 Mod：目标已存在或文件系统不支持硬链接；备份已保留")?;
+    if let Err(error) = fs::remove_file(source) {
+        if let Err(rollback) = fs::remove_file(destination) {
+            bail!("恢复 Mod 失败：{error}；撤回新名称失败：{rollback}；备份已保留");
+        }
+        return Err(error).context("无法移除备份中的原名称，恢复已撤回");
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 pub struct RemovedMod {
     pub token: String,
@@ -154,7 +184,7 @@ pub struct RemovedMod {
 pub fn removed(config: &Config, id: &str) -> Result<Vec<RemovedMod>> {
     let base = config
         .effective(id)?
-        .instance_dir(id)?
+        .instance_path(id)?
         .join("tui-mc-removed-mods");
     let entries = match fs::read_dir(base) {
         Ok(entries) => entries,
@@ -211,7 +241,9 @@ pub fn restore(config: &Config, id: &str, token: &str) -> Result<String> {
     } else {
         filename.as_str()
     };
-    if safe_path(&mods, base)?.exists() || safe_path(&mods, &format!("{base}.disabled"))?.exists() {
+    if occupied(&safe_path(&mods, base)?)?
+        || occupied(&safe_path(&mods, &format!("{base}.disabled"))?)?
+    {
         bail!("已有同名启用 / 禁用文件，不会覆盖，请先整理冲突文件");
     }
     let inventory_path = dir.join(crate::modrinth::INVENTORY);
@@ -273,7 +305,7 @@ pub fn restore(config: &Config, id: &str, token: &str) -> Result<String> {
             }
         }
     }
-    fs::rename(&source, &dest)?;
+    restore_file(&source, &dest)?;
     let result = (|| -> Result<()> {
         if let Some(bytes) = &next_inventory {
             crate::storage::atomic_write(&inventory_path, bytes)?;
@@ -306,6 +338,76 @@ pub fn restore(config: &Config, id: &str, token: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn restore_publication_rejects_a_target_created_after_preflight() {
+        let temp = crate::test_support::Workspace::new();
+        let source = temp.path.join("backup.jar");
+        let destination = temp.path.join("restored.jar");
+        fs::write(&source, b"backup").unwrap();
+        assert!(!occupied(&destination).unwrap());
+        fs::write(&destination, b"concurrent file").unwrap();
+        assert!(restore_file(&source, &destination).is_err());
+        assert_eq!(fs::read(&source).unwrap(), b"backup");
+        assert_eq!(fs::read(&destination).unwrap(), b"concurrent file");
+        fs::remove_file(&destination).unwrap();
+        restore_file(&source, &destination).unwrap();
+        assert!(!source.exists());
+        assert_eq!(fs::read(destination).unwrap(), b"backup");
+    }
+    #[test]
+    #[ignore = "requires permission to create filesystem symbolic links"]
+    fn dangling_counterparts_block_removal_and_restore_without_changing_backup() {
+        let temp = crate::test_support::Workspace::new();
+        let config = Config {
+            game_dir: temp.path.clone(),
+            isolated: false,
+            ..Config::default()
+        };
+        let mods = directory(&config, "test").unwrap();
+        let enabled = mods.join("a.jar");
+        let disabled = mods.join("a.jar.disabled");
+        let absent = temp.path.join("absent.jar");
+        let link = |path: &Path| {
+            #[cfg(windows)]
+            std::os::windows::fs::symlink_file(&absent, path).unwrap();
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&absent, path).unwrap();
+        };
+        fs::write(&enabled, b"original").unwrap();
+        link(&disabled);
+        assert!(remove(&config, "test", "a.jar").is_err());
+        assert_eq!(fs::read(&enabled).unwrap(), b"original");
+        assert_eq!(fs::read_link(&disabled).unwrap(), absent);
+        fs::remove_file(&disabled).unwrap();
+        let backup = remove(&config, "test", "a.jar").unwrap();
+        let token = backup.file_name().unwrap().to_str().unwrap();
+        for path in [&enabled, &disabled] {
+            link(path);
+            assert!(restore(&config, "test", token).is_err());
+            assert_eq!(fs::read(backup.join("a.jar")).unwrap(), b"original");
+            assert_eq!(fs::read_link(path).unwrap(), absent);
+            fs::remove_file(path).unwrap();
+        }
+        assert_eq!(restore(&config, "test", token).unwrap(), "a.jar");
+        assert_eq!(fs::read(enabled).unwrap(), b"original");
+    }
+    #[test]
+    fn listing_does_not_create_missing_directories_or_hide_invalid_directory() {
+        let temp = crate::test_support::Workspace::new();
+        let root = temp.path.join("not-created");
+        let config = Config {
+            game_dir: root.clone(),
+            isolated: false,
+            ..Config::default()
+        };
+        assert!(list(&config, "test").unwrap().is_empty());
+        assert!(!root.exists());
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("mods"), b"not a directory").unwrap();
+        let error = list(&config, "test").unwrap_err();
+        assert!(error.to_string().contains("mods"));
+        assert_eq!(fs::read(root.join("mods")).unwrap(), b"not a directory");
+    }
     #[test]
     fn removal_preserves_backup_and_detaches_repair_records() {
         let temp = crate::test_support::Workspace::new();

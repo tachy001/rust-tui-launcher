@@ -27,6 +27,19 @@ pub struct Download {
     pub size: Option<u64>,
     pub alternatives: Vec<String>,
 }
+impl Download {
+    fn validate_integrity(&self) -> Result<()> {
+        if self.sha1.as_ref().is_some_and(|hash| {
+            hash.len() != 40 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }) {
+            bail!(
+                "下载 SHA-1 必须为 40 位十六进制字符串：{}",
+                self.dest.display()
+            );
+        }
+        Ok(())
+    }
+}
 /// A validated batch: each destination has one owner and one set of integrity constraints.
 struct DownloadPlan {
     jobs: Vec<Download>,
@@ -36,6 +49,7 @@ impl DownloadPlan {
         let mut destinations: HashMap<PathBuf, usize> = HashMap::new();
         let mut jobs: Vec<Download> = Vec::new();
         for entry in entries {
+            entry.validate_integrity()?;
             if let Some(&index) = destinations.get(&entry.dest) {
                 let existing = &mut jobs[index];
                 let same_hash = match (&existing.sha1, &entry.sha1) {
@@ -63,6 +77,13 @@ impl DownloadPlan {
                     existing.size = entry.size;
                 }
                 for url in std::iter::once(entry.url).chain(entry.alternatives) {
+                    if url.is_empty() {
+                        continue;
+                    }
+                    if existing.url.is_empty() {
+                        existing.url = url;
+                        continue;
+                    }
                     if url != existing.url && !existing.alternatives.contains(&url) {
                         existing.alternatives.push(url);
                     }
@@ -100,10 +121,17 @@ impl Downloader {
         job: usize,
     ) -> Result<()> {
         self.control.check()?;
-        if cached(entry)? {
+        entry.validate_integrity()?;
+        if cached_with_control(entry, &self.control)? {
             let size = fs::metadata(&entry.dest)?.len();
             meter.update(job, size, Some(size), 0);
             return Ok(());
+        }
+        if entry.url.is_empty() {
+            bail!(
+                "安装器生成的本地依赖缺失或校验失败，请修复或重新安装实例：{}",
+                entry.dest.display()
+            );
         }
         let parsed = reqwest::Url::parse(&entry.url)?;
         if parsed.scheme() != "https"
@@ -119,7 +147,7 @@ impl Downloader {
                 )));
             })?;
         // A different process may have committed the file while we waited.
-        if cached(entry)? {
+        if cached_with_control(entry, &self.control)? {
             let size = fs::metadata(&entry.dest)?.len();
             meter.update(job, size, Some(size), 0);
             return Ok(());
@@ -241,7 +269,12 @@ impl Downloader {
             // A complete .part can remain after a crash just before rename.
             if offset > 0
                 && entry.sha1.is_some()
-                && valid_file(partial, entry.sha1.as_deref(), entry.size)?
+                && valid_file_with_control(
+                    partial,
+                    entry.sha1.as_deref(),
+                    entry.size,
+                    &self.control,
+                )?
                 && valid_archive(partial, &entry.dest)?
             {
                 meter.update(job, offset, Some(offset), 0);
@@ -339,7 +372,7 @@ impl Downloader {
         }) {
             bail!("文件尚未下载完整");
         }
-        if !valid_file(partial, entry.sha1.as_deref(), entry.size)? {
+        if !valid_file_with_control(partial, entry.sha1.as_deref(), entry.size, &self.control)? {
             fs::remove_file(partial)?;
             binding.clear();
             bail!("文件大小或 SHA-1 校验失败");
@@ -425,22 +458,34 @@ fn commit(partial: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 pub(crate) fn cached(entry: &Download) -> Result<bool> {
+    cached_with_control(entry, &TaskControl::default())
+}
+fn cached_with_control(entry: &Download, control: &TaskControl) -> Result<bool> {
+    control.check()?;
     if !entry.dest.is_file() {
         return Ok(false);
     }
-    if !valid_file(&entry.dest, entry.sha1.as_deref(), entry.size)? {
+    if !valid_file_with_control(&entry.dest, entry.sha1.as_deref(), entry.size, control)? {
         return Ok(false);
     }
-    if entry.sha1.is_some() || entry.size.is_some() {
-        return valid_archive(&entry.dest, &entry.dest);
-    }
     // Maven profiles may omit hashes: a parseable archive avoids re-downloading every repair.
-    if is_archive(&entry.dest) {
-        return valid_archive(&entry.dest, &entry.dest);
+    if entry.sha1.is_some() || entry.size.is_some() || is_archive(&entry.dest) {
+        let valid = valid_archive(&entry.dest, &entry.dest)?;
+        control.check()?;
+        return Ok(valid);
     }
     Ok(false)
 }
 pub fn valid_file(path: &Path, expected: Option<&str>, size: Option<u64>) -> Result<bool> {
+    valid_file_with_control(path, expected, size, &TaskControl::default())
+}
+pub(crate) fn valid_file_with_control(
+    path: &Path,
+    expected: Option<&str>,
+    size: Option<u64>,
+    control: &TaskControl,
+) -> Result<bool> {
+    control.check()?;
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -453,10 +498,15 @@ pub fn valid_file(path: &Path, expected: Option<&str>, size: Option<u64>) -> Res
         return Ok(true);
     };
     let mut file = fs::File::open(path)?;
+    hash_matches(&mut file, expected, control)
+}
+fn hash_matches(reader: &mut impl Read, expected: &str, control: &TaskControl) -> Result<bool> {
     let mut hash = Sha1::new();
     let mut buf = [0u8; 65536];
     loop {
-        let n = file.read(&mut buf)?;
+        control.check()?;
+        let n = reader.read(&mut buf)?;
+        control.check()?;
         if n == 0 {
             break;
         }
@@ -468,6 +518,42 @@ pub fn valid_file(path: &Path, expected: Option<&str>, size: Option<u64>) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cancellation_during_hash_read_is_not_a_checksum_mismatch() {
+        struct CancellingReader {
+            control: TaskControl,
+            reads: usize,
+        }
+        impl Read for CancellingReader {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                assert_eq!(
+                    self.reads, 1,
+                    "must not read another block after cancellation"
+                );
+                buffer[..3].copy_from_slice(b"abc");
+                self.control.cancel();
+                Ok(3)
+            }
+        }
+        let control = TaskControl::default();
+        let mut reader = CancellingReader {
+            control: control.clone(),
+            reads: 0,
+        };
+        let error = hash_matches(
+            &mut reader,
+            "a9993e364706816aba3e25717850c26c9cd0d89d",
+            &control,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("取消"));
+        let workspace = crate::test_support::Workspace::new();
+        let path = workspace.path.join("retained.part");
+        fs::write(&path, b"abc").unwrap();
+        assert!(valid_file_with_control(&path, Some("invalid"), None, &control).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"abc");
+    }
     #[test]
     fn file_validation_requires_a_real_file_even_without_hash_or_size() {
         let workspace = crate::test_support::Workspace::new();
@@ -535,25 +621,106 @@ mod tests {
     }
     #[test]
     fn download_plan_merges_stronger_constraints_and_identical_content_mirrors() {
-        let mut mirror = planned_entry(Some("AABB"), Some(10));
+        let mut mirror = planned_entry(Some("A9993E364706816ABA3E25717850C26C9CD0D89D"), Some(10));
         mirror.url = "https://mirror.example.com/library.jar".into();
         let plan = DownloadPlan::new(vec![
             planned_entry(None, None),
-            planned_entry(Some("aabb"), Some(10)),
+            planned_entry(Some("a9993e364706816aba3e25717850c26c9cd0d89d"), Some(10)),
             mirror,
         ])
         .unwrap();
         assert_eq!(plan.jobs().len(), 1);
-        assert_eq!(plan.jobs()[0].sha1.as_deref(), Some("aabb"));
+        assert_eq!(
+            plan.jobs()[0].sha1.as_deref(),
+            Some("a9993e364706816aba3e25717850c26c9cd0d89d")
+        );
         assert_eq!(plan.jobs()[0].size, Some(10));
         assert_eq!(plan.jobs()[0].alternatives.len(), 1);
+    }
+    #[test]
+    fn local_and_remote_duplicate_merge_is_order_independent_with_matching_hash() {
+        let mut local = planned_entry(Some("a9993e364706816aba3e25717850c26c9cd0d89d"), Some(3));
+        local.url.clear();
+        let mut remote = local.clone();
+        remote.url = "https://example.com/generated.jar".into();
+        for entries in [
+            vec![local.clone(), remote.clone()],
+            vec![remote.clone(), local.clone()],
+        ] {
+            let plan = DownloadPlan::new(entries).unwrap();
+            assert_eq!(plan.jobs().len(), 1);
+            assert_eq!(plan.jobs()[0].url, remote.url);
+            assert!(plan.jobs()[0].alternatives.is_empty());
+            assert_eq!(plan.jobs()[0].sha1, local.sha1);
+        }
+        local.sha1 = None;
+        assert!(DownloadPlan::new(vec![local, remote]).is_err());
+    }
+    #[test]
+    fn local_only_artifact_is_verified_without_a_download_url() {
+        let workspace = crate::test_support::Workspace::new();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let downloader = Downloader {
+            retry: Default::default(),
+            client: Client::new(),
+            control: TaskControl::default(),
+            tx,
+            source: "official".into(),
+        };
+        let entry = Download {
+            url: String::new(),
+            dest: workspace.path.join("generated.bin"),
+            sha1: Some("a9993e364706816aba3e25717850c26c9cd0d89d".into()),
+            size: Some(3),
+            alternatives: vec![],
+        };
+        for bytes in [None, Some(b"bad".as_slice()), Some(b"abc".as_slice())] {
+            if let Some(bytes) = bytes {
+                fs::write(&entry.dest, bytes).unwrap();
+            }
+            let result = downloader.fetch(&entry);
+            if bytes == Some(b"abc".as_slice()) {
+                result.unwrap();
+            } else {
+                assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("本地依赖缺失或校验失败"));
+            }
+        }
+    }
+    #[test]
+    fn malformed_hash_is_rejected_before_url_parsing_or_destination_creation() {
+        let workspace = crate::test_support::Workspace::new();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let downloader = Downloader {
+            retry: Default::default(),
+            client: Client::new(),
+            control: TaskControl::default(),
+            tx,
+            source: "official".into(),
+        };
+        for hash in [
+            "".to_owned(),
+            "a".repeat(39),
+            "a".repeat(41),
+            "g".repeat(40),
+        ] {
+            let mut entry = planned_entry(Some(&hash), None);
+            entry.url = "not a URL".into();
+            entry.dest = workspace.path.join("uncreated/file.jar");
+            let error = downloader.fetch(&entry).unwrap_err();
+            assert!(error.to_string().contains("40 位十六进制"));
+            assert!(DownloadPlan::new(vec![planned_entry(None, None), entry]).is_err());
+            assert!(!workspace.path.join("uncreated").exists());
+        }
     }
     #[test]
     fn conflicting_downloads_fail_before_any_network_or_file_writes() {
         for pair in [
             vec![
-                planned_entry(Some("aaa"), None),
-                planned_entry(Some("bbb"), None),
+                planned_entry(Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), None),
+                planned_entry(Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"), None),
             ],
             vec![planned_entry(None, Some(1)), planned_entry(None, Some(2))],
         ] {

@@ -165,6 +165,34 @@ pub(crate) struct Identity {
     pub release: String,
 }
 impl Identity {
+    /// Read identity independently of installer-only embedded tools.
+    pub(crate) fn read(
+        archive: &mut zip::ZipArchive<fs::File>,
+        control: &TaskControl,
+    ) -> Result<Self> {
+        control.check()?;
+        let config = [
+            "net/optifine/Config.class",
+            "notch/net/optifine/Config.class",
+            "Config.class",
+        ]
+        .into_iter()
+        .find(|name| archive.file_names().any(|entry| entry == *name))
+        .context("安装包缺少 OptiFine Config class")?;
+        let mut values = config_constants(&bytes(archive, config, 4 * 1024 * 1024, control)?)?;
+        let mut field = |name| {
+            values
+                .remove(name)
+                .with_context(|| format!("OptiFine 缺少 {name} 常量"))
+        };
+        let identity = Self {
+            game: field("MC_VERSION")?,
+            edition: field("OF_EDITION")?,
+            release: field("OF_RELEASE")?,
+        };
+        identity.validate()?;
+        Ok(identity)
+    }
     pub(crate) fn version(&self) -> String {
         format!("{}_{}", self.edition, self.release)
     }
@@ -198,26 +226,7 @@ pub(crate) struct OptiFineArchive {
 impl OptiFineArchive {
     pub(crate) fn inspect(path: &Path, control: &TaskControl) -> Result<Self> {
         let mut archive = crate::installer_archive::open(path, control)?;
-        let config = [
-            "Config.class",
-            "net/optifine/Config.class",
-            "notch/net/optifine/Config.class",
-        ]
-        .into_iter()
-        .find(|name| archive.file_names().any(|entry| entry == *name))
-        .context("安装包缺少 OptiFine Config class")?;
-        let mut values = config_constants(&bytes(&mut archive, config, 4 * 1024 * 1024, control)?)?;
-        let mut field = |name| {
-            values
-                .remove(name)
-                .with_context(|| format!("OptiFine 缺少 {name} 常量"))
-        };
-        let identity = Identity {
-            game: field("MC_VERSION")?,
-            edition: field("OF_EDITION")?,
-            release: field("OF_RELEASE")?,
-        };
-        identity.validate()?;
+        let identity = Identity::read(&mut archive, control)?;
         let patcher = archive
             .file_names()
             .any(|entry| entry == "optifine/Patcher.class");
@@ -441,6 +450,62 @@ pub(crate) mod fixtures {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn qualified_optifine_identity_is_not_shadowed_by_generic_config() {
+        let workspace = crate::test_support::Workspace::new();
+        let path = workspace.path.join("mixed.jar");
+        let control = TaskControl::default();
+        for qualified in [
+            "net/optifine/Config.class",
+            "notch/net/optifine/Config.class",
+        ] {
+            fs::write(
+                &path,
+                fixtures::jar(&[
+                    ("Config.class", b"unrelated class"),
+                    (qualified, &fixtures::config("1.18.2")),
+                ]),
+            )
+            .unwrap();
+            let mut archive = crate::installer_archive::open(&path, &control).unwrap();
+            assert_eq!(
+                Identity::read(&mut archive, &control).unwrap().game,
+                "1.18.2"
+            );
+        }
+        fs::write(
+            &path,
+            fixtures::jar(&[("Config.class", &fixtures::config("1.7.10"))]),
+        )
+        .unwrap();
+        let mut archive = crate::installer_archive::open(&path, &control).unwrap();
+        assert_eq!(
+            Identity::read(&mut archive, &control).unwrap().game,
+            "1.7.10"
+        );
+    }
+    #[test]
+    fn identity_read_does_not_require_installer_wrapper_contents() {
+        let workspace = crate::test_support::Workspace::new();
+        let path = workspace.path.join("renamed.jar");
+        fs::write(
+            &path,
+            fixtures::jar(&[
+                ("net/optifine/Config.class", &fixtures::config("1.18.2")),
+                ("launchwrapper-of.txt", b"2.3"),
+            ]),
+        )
+        .unwrap();
+        let control = TaskControl::default();
+        let mut archive = crate::installer_archive::open(&path, &control).unwrap();
+        assert_eq!(
+            Identity::read(&mut archive, &control).unwrap().game,
+            "1.18.2"
+        );
+        assert!(OptiFineArchive::inspect(&path, &control).is_err());
+        control.cancel();
+        assert!(Identity::read(&mut archive, &control).is_err());
+    }
     #[test]
     fn reads_version_from_constant_value_fields_and_embedded_wrapper_not_filename() {
         let workspace = crate::test_support::Workspace::new();

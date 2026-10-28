@@ -1,5 +1,5 @@
 use crate::{
-    download::valid_file,
+    download::valid_file_with_control,
     metadata::{safe_path, valid_id},
     modrinth::{InstalledMod, Inventory, INVENTORY},
     storage::atomic_write,
@@ -20,7 +20,7 @@ impl ModFileState {
     pub(crate) fn enabled(self) -> bool {
         self == Self::Enabled
     }
-    fn destination(self, mods: &Path, filename: &str) -> Result<PathBuf> {
+    pub(crate) fn destination(self, mods: &Path, filename: &str) -> Result<PathBuf> {
         safe_path(
             mods,
             &if self.enabled() {
@@ -52,12 +52,28 @@ impl ModInstallState {
         valid_id(filename)?;
         let enabled = safe_path(&self.mods, filename)?;
         let disabled = safe_path(&self.mods, &format!("{filename}.disabled"))?;
-        for path in [&enabled, &disabled] {
-            if path.exists() && !path.is_file() {
-                bail!("Mod 目标不是普通文件：{}", path.display());
+        let regular_file = |path: &Path| -> Result<bool> {
+            let metadata = match fs::symlink_metadata(path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("无法检查 Mod 文件：{}", path.display()))
+                }
+            };
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                if metadata.file_attributes() & 0x400 != 0 {
+                    bail!("Mod 目标是链接或重解析点，请先手动处理：{}", path.display());
+                }
             }
-        }
-        match (enabled.is_file(), disabled.is_file()) {
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                bail!("Mod 目标不是普通文件，请先手动处理：{}", path.display());
+            }
+            Ok(true)
+        };
+        match (regular_file(&enabled)?, regular_file(&disabled)?) {
             (true, true) => bail!("Mod 同时存在启用和禁用副本，请先处理：{filename}"),
             (true, false) => Ok(Some(ModFileState::Enabled)),
             (false, true) => Ok(Some(ModFileState::Disabled)),
@@ -116,6 +132,14 @@ fn snapshot(path: &Path) -> Result<Option<Vec<u8>>> {
 
 impl ModInstallTransaction<'_> {
     pub(crate) fn commit(&self) -> Result<()> {
+        self.commit_with_verifier(|path, record| {
+            valid_file_with_control(path, Some(&record.sha1), Some(record.size), self.control)
+        })
+    }
+    fn commit_with_verifier(
+        &self,
+        mut verify: impl FnMut(&Path, &InstalledMod) -> Result<bool>,
+    ) -> Result<()> {
         let Self {
             dir,
             staging,
@@ -172,7 +196,7 @@ impl ModInstallTransaction<'_> {
                     }) {
                         bail!("该 JAR 文件名已由另一个项目管理：{}", record.filename);
                     }
-                    if valid_file(&dest, Some(&record.sha1), Some(record.size))? {
+                    if verify(&dest, record)? {
                         next.entries.insert(record.project.clone(), record.clone());
                         continue;
                     }
@@ -197,13 +221,17 @@ impl ModInstallTransaction<'_> {
                     moved.push((saved, dest.clone()));
                 }
                 let staged = safe_path(staging, &record.filename)?;
-                if !valid_file(&staged, Some(&record.sha1), Some(record.size))? {
+                if !verify(&staged, record)? {
                     bail!("Mod 暂存文件大小或 SHA-1 校验失败：{}", record.filename);
                 }
-                fs::rename(staged, &dest)?;
-                created.push(dest);
+                control.check()?;
+                fs::rename(&staged, &dest)?;
+                created.push((dest, staged));
                 next.entries.insert(record.project.clone(), record.clone());
             }
+            // Cancellation before metadata commit uses the same rollback as I/O failures.
+            // Once committing snapshots, finish the transaction without pausing halfway.
+            control.check()?;
             atomic_write(
                 &backup.join("previous-inventory.json"),
                 &serde_json::to_vec_pretty(current)?,
@@ -237,10 +265,19 @@ impl ModInstallTransaction<'_> {
         })();
         if let Err(error) = result {
             let mut rollback_errors = vec![];
-            for path in created.into_iter().rev() {
-                if let Err(error) = fs::remove_file(&path) {
+            for (path, staged) in created.into_iter().rev() {
+                // Preserve downloaded input for recovery when its original slot is free.
+                // Never overwrite an independently recreated staging file.
+                let restore = (|| -> std::io::Result<()> {
+                    if staged.try_exists()? {
+                        fs::remove_file(&path)
+                    } else {
+                        fs::rename(&path, &staged)
+                    }
+                })();
+                if let Err(error) = restore {
                     if error.kind() != std::io::ErrorKind::NotFound {
-                        rollback_errors.push(format!("移除 {}：{error}", path.display()));
+                        rollback_errors.push(format!("退回暂存文件 {}：{error}", path.display()));
                     }
                 }
             }
@@ -289,6 +326,34 @@ impl ModInstallTransaction<'_> {
 mod tests {
     use super::*;
     use sha1::{Digest, Sha1};
+    #[test]
+    #[ignore = "requires filesystem symbolic link permission"]
+    fn linked_and_dangling_mods_are_not_treated_as_replaceable_files() {
+        let workspace = crate::test_support::Workspace::new();
+        let dir = &workspace.path;
+        fs::create_dir(dir.join("mods")).unwrap();
+        let target = dir.join("shared.jar");
+        fs::write(&target, b"shared").unwrap();
+        for name in ["linked.jar", "disabled.jar.disabled"] {
+            #[cfg(windows)]
+            std::os::windows::fs::symlink_file(&target, dir.join("mods").join(name)).unwrap();
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&target, dir.join("mods").join(name)).unwrap();
+        }
+        let state = ModInstallState::new(dir, &Inventory::default());
+        for dangling in [false, true] {
+            if dangling {
+                fs::remove_file(&target).unwrap();
+            }
+            for name in ["linked.jar", "disabled.jar"] {
+                assert!(state.state("project", name).is_err());
+            }
+        }
+        assert!(fs::symlink_metadata(dir.join("mods/linked.jar"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
     fn record(project: &str, filename: &str, bytes: &[u8]) -> InstalledMod {
         InstalledMod {
             project: project.into(),
@@ -413,6 +478,76 @@ mod tests {
         assert_eq!(fs::read(dir.join(INVENTORY)).unwrap(), index);
     }
     #[test]
+    fn cancellation_after_first_replacement_restores_files_and_records() {
+        let workspace = crate::test_support::Workspace::new();
+        let dir = &workspace.path;
+        let current = prepare(dir);
+        let staging = dir.join("staging");
+        fs::create_dir(&staging).unwrap();
+        fs::write(staging.join("new.jar"), b"new").unwrap();
+        fs::write(staging.join("second.jar"), b"second").unwrap();
+        let index = fs::read(dir.join(INVENTORY)).unwrap();
+        let receipt = fs::read(dir.join(crate::pack_state::RECEIPT)).unwrap();
+        let records = [
+            (
+                record("a", "new.jar", b"new"),
+                "https://example.com/a".into(),
+            ),
+            (
+                record("b", "second.jar", b"second"),
+                "https://example.com/b".into(),
+            ),
+        ];
+        let control = crate::task::TaskControl::default();
+        let mut cancelled = false;
+        let error = ModInstallTransaction::new(
+            dir,
+            &staging,
+            "cancel-rollback",
+            &records,
+            &current,
+            &control,
+        )
+        .commit_with_verifier(|path, record| {
+            if record.project == "b" {
+                assert_eq!(fs::read(dir.join("mods/new.jar.disabled")).unwrap(), b"new");
+                assert!(!dir.join("mods/old.jar.disabled").exists());
+                cancelled = true;
+                control.cancel();
+            }
+            valid_file_with_control(path, Some(&record.sha1), Some(record.size), &control)
+        })
+        .unwrap_err();
+        assert!(cancelled);
+        let message = format!("{error:#}");
+        assert!(message.contains("取消"), "{message}");
+        assert!(!message.contains("回滚未完全成功"), "{message}");
+        assert_eq!(fs::read(dir.join("mods/old.jar.disabled")).unwrap(), b"old");
+        assert!(!dir.join("mods/new.jar.disabled").exists());
+        assert!(!dir.join("mods/second.jar").exists());
+        assert_eq!(fs::read(staging.join("second.jar")).unwrap(), b"second");
+        assert_eq!(fs::read(staging.join("new.jar")).unwrap(), b"new");
+        assert_eq!(fs::read(dir.join(INVENTORY)).unwrap(), index);
+        assert_eq!(
+            fs::read(dir.join(crate::pack_state::RECEIPT)).unwrap(),
+            receipt
+        );
+        ModInstallTransaction::new(
+            dir,
+            &staging,
+            "retry-after-cancel",
+            &records,
+            &current,
+            &crate::task::TaskControl::default(),
+        )
+        .commit()
+        .unwrap();
+        assert_eq!(fs::read(dir.join("mods/new.jar.disabled")).unwrap(), b"new");
+        assert_eq!(fs::read(dir.join("mods/second.jar")).unwrap(), b"second");
+        assert!(!staging.join("new.jar").exists());
+        assert!(!staging.join("second.jar").exists());
+    }
+    #[test]
     fn later_failure_rolls_back_disabled_files_and_both_metadata_snapshots() {
         let workspace = crate::test_support::Workspace::new();
         let dir = &workspace.path;
@@ -447,6 +582,7 @@ mod tests {
         assert_eq!(fs::read(dir.join("mods/old.jar.disabled")).unwrap(), b"old");
         assert!(!dir.join("mods/new.jar.disabled").exists());
         assert_eq!(fs::read(dir.join("mods/manual.jar")).unwrap(), b"manual");
+        assert_eq!(fs::read(staging.join("new.jar")).unwrap(), b"new");
         assert_eq!(fs::read(dir.join(INVENTORY)).unwrap(), index);
         assert_eq!(
             fs::read(dir.join(crate::pack_state::RECEIPT)).unwrap(),

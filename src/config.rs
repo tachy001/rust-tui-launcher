@@ -20,6 +20,31 @@ pub struct InstanceSettings {
 mod tests {
     use super::*;
     #[test]
+    fn browsing_instance_content_does_not_create_shared_or_isolated_directories() {
+        let temp = crate::test_support::Workspace::new();
+        for isolated in [false, true] {
+            let root = temp.path.join(if isolated { "isolated" } else { "shared" });
+            let config = Config {
+                game_dir: root.clone(),
+                isolated,
+                ..Config::default()
+            };
+            assert_eq!(
+                config.instance_path("test").unwrap(),
+                if isolated {
+                    root.join("versions/test")
+                } else {
+                    root.clone()
+                }
+            );
+            assert!(crate::mods::list(&config, "test").unwrap().is_empty());
+            assert!(crate::mods::removed(&config, "test").unwrap().is_empty());
+            assert!(crate::worlds::list(&config, "test").unwrap().is_empty());
+            assert!(!root.exists());
+            assert!(config.instance_path("../escape").is_err());
+        }
+    }
+    #[test]
     fn rejects_nul_in_both_custom_argument_fields() {
         let mut config = Config {
             jvm_args: "-Dvalue=\0".into(),
@@ -286,6 +311,15 @@ impl Config {
         let mut config = self.clone();
         config.active_profile = Some((id.into(), profile.clone()));
         config
+    }
+    /// Computes the effective instance path without creating or canonicalizing it.
+    pub(crate) fn instance_path(&self, id: &str) -> Result<PathBuf> {
+        crate::metadata::valid_id(id)?;
+        Ok(if self.isolated {
+            self.game_dir.join("versions").join(id)
+        } else {
+            self.game_dir.clone()
+        })
     }
     pub fn instance_dir(&self, id: &str) -> Result<PathBuf> {
         crate::metadata::valid_id(id)?;

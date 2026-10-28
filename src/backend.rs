@@ -10,11 +10,14 @@ use anyhow::{bail, Context, Result};
 use md5::Md5;
 use reqwest::blocking::Client;
 use serde_json::Value;
-use sha1::{Digest, Sha1};
+use sha1::Digest;
+#[cfg(test)]
+use sha1::Sha1;
+#[cfg(test)]
+use std::io::Read;
 use std::{
     collections::HashMap,
     fs,
-    io::Read,
     path::Path,
     process::{Command, Stdio},
     sync::mpsc::Sender,
@@ -47,11 +50,20 @@ pub enum Message {
     },
 }
 fn download_entry(entry: &Value, dest: &Path) -> Result<Download> {
+    let sha1 = match entry.get("sha1") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(hash)) => Some(hash.clone()),
+        _ => bail!("资源 SHA-1 必须为字符串"),
+    };
+    let size = match entry.get("size") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(value.as_u64().context("资源大小必须为非负整数")?),
+    };
     Ok(Download {
         url: entry["url"].as_str().context("资源缺少下载地址")?.into(),
         dest: dest.into(),
-        sha1: entry["sha1"].as_str().map(str::to_owned),
-        size: entry["size"].as_u64(),
+        sha1,
+        size,
         alternatives: vec![],
     })
 }
@@ -333,6 +345,14 @@ impl Backend {
         Ok(libraries)
     }
     pub fn launch(&self, config: &Config, id: &str) -> Result<()> {
+        self.launch_with_accounts(config, id, self)
+    }
+    fn launch_with_accounts(
+        &self,
+        config: &Config,
+        id: &str,
+        accounts: &dyn crate::account_session_service::SessionAccountSource,
+    ) -> Result<()> {
         valid_id(id)?;
         config.validate()?;
         let root = config.root()?;
@@ -355,19 +375,34 @@ impl Backend {
             bail!("客户端缺失，请先安装");
         }
         if let Some(hash) = meta["downloads"]["client"]["sha1"].as_str() {
-            if !verify(&jar, hash)? {
+            if !crate::download::valid_file_with_control(&jar, Some(hash), None, &self.control)? {
                 bail!("客户端校验失败，请重新安装");
             }
         }
         let game_dir = config.instance_dir(id)?;
+        // Hold the shared game lease before Mod scanning and runtime selection.
+        // Another instance may otherwise change the same directory's Mod files.
+        let _game_options = crate::download_lock::DownloadLease::acquire(
+            &game_dir.join("options.txt"),
+            &self.control,
+            || self.log("等待使用同一游戏目录的进程退出…"),
+        )?;
         let plan = crate::game_java_service::GameJavaResolver::new(
             &crate::game_java_service::JarClientVersionSource,
         )
         .resolve(&root, &resolved, &self.control)?;
         self.log(format!("Java 要求来源：{}", plan.origin));
-        let requirement = plan.requirement;
+        let mod_games = if matches!(
+            meta["mainClass"].as_str(),
+            Some("cpw.mods.modlauncher.Launcher" | "cpw.mods.bootstraplauncher.BootstrapLauncher")
+        ) {
+            crate::installed_mod_service::InstalledModService
+                .optifine_games(&game_dir, &self.control)?
+        } else {
+            vec![]
+        };
+        let requirement = plan.requirement.with_installed_optifine(mod_games);
         let required = requirement.recommended();
-        let session = self.account_session(&config)?;
         let resolution = crate::runtime_service::JavaRuntimeService::new(self).resolve(
             &config,
             id,
@@ -391,12 +426,6 @@ impl Backend {
         }
         let platform = crate::launch_platform::LaunchPlatform::new(runtime.architecture);
         quick_play.features(meta, &platform.rules())?;
-        // Protect the shared directory before any resource mapping or Mod audit.
-        let _game_options = crate::download_lock::DownloadLease::acquire(
-            &game_dir.join("options.txt"),
-            &self.control,
-            || self.log("等待使用同一游戏目录的进程退出…"),
-        )?;
         quick_play.validate_world(&game_dir)?;
         let launch_meta = platform.profile(meta);
         let native_plan = crate::native_patch_service::current_service(runtime.architecture)
@@ -435,7 +464,6 @@ impl Backend {
         let natives = native_directory.path()?;
         let separator = if cfg!(windows) { ";" } else { ":" };
         let classpath = cp.render(&jar, separator)?;
-        let uuid = session.uuid.clone();
         let repository = crate::asset_service::AssetRepository::new(&root);
         let downloader = self.downloader();
         let (asset_id, index) = repository.version_index(meta, id, &downloader)?;
@@ -452,6 +480,12 @@ impl Backend {
         if let Some(logging) = &logging {
             logging.prepare(&self.downloader())?;
         }
+        // Resolve credentials after potentially lengthy runtime/resource downloads.
+        // A token accepted before preparation could expire before Java starts.
+        let session =
+            crate::account_session_service::AccountSessionService::new(accounts, &self.control)
+                .resolve(&config.username)?;
+        let uuid = session.uuid.clone();
         let mut values: HashMap<&str, String> = [
             ("auth_player_name", session.name.clone()),
             ("auth_uuid", uuid),
@@ -674,19 +708,6 @@ fn redact_token(line: &str, token: &str) -> String {
         line.into()
     }
 }
-fn verify(path: &Path, expected: &str) -> Result<bool> {
-    let mut file = fs::File::open(path)?;
-    let mut hash = Sha1::new();
-    let mut buf = [0u8; 65536];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hash.update(&buf[..n]);
-    }
-    Ok(format!("{:x}", hash.finalize()).eq_ignore_ascii_case(expected))
-}
 fn artifacts(lib: &Value) -> Result<Vec<(Value, bool)>> {
     crate::library_service::LibraryResolver::current().resolve(lib)
 }
@@ -908,17 +929,58 @@ mod tests {
         assert_eq!(offline_uuid("Notch"), "b50ad385829d3141a2167e7d7539ba7f");
     }
     #[test]
-    fn rejects_corrupt_download() {
-        let path = std::env::temp_dir().join(format!("tui-mc-hash-{}", std::process::id()));
-        fs::write(&path, b"abc").unwrap();
-        assert!(verify(&path, "a9993e364706816aba3e25717850c26c9cd0d89d").unwrap());
-        assert!(!verify(&path, "bad").unwrap());
-        fs::remove_file(path).unwrap();
+    fn download_metadata_does_not_silently_discard_invalid_integrity() {
+        for invalid in [
+            serde_json::json!({"sha1":42}),
+            serde_json::json!({"size":-1}),
+            serde_json::json!({"size":"42"}),
+            serde_json::json!({"size":1.5}),
+        ] {
+            let mut entry = serde_json::json!({"url":"https://example.test/file"});
+            entry
+                .as_object_mut()
+                .unwrap()
+                .extend(invalid.as_object().unwrap().clone());
+            assert!(download_entry(&entry, Path::new("file")).is_err());
+        }
+        let entry = serde_json::json!({"url":"https://example.test/file", "sha1":null,"size":null});
+        let download = download_entry(&entry, Path::new("file")).unwrap();
+        assert!(download.sha1.is_none());
+        assert!(download.size.is_none());
+        let entry = serde_json::json!({"url":"https://example.test/file", "sha1":"a9993e364706816aba3e25717850c26c9cd0d89d", "size":0});
+        let download = download_entry(&entry, Path::new("file")).unwrap();
+        assert_eq!(download.size, Some(0));
+        assert_eq!(download.sha1.as_deref(), entry["sha1"].as_str());
     }
     #[test]
     #[ignore = "requires java and javac on PATH"]
     fn real_jvm_launch_with_spaced_paths() {
-        let root = std::env::temp_dir().join(format!("tui mc launch {}", std::process::id()));
+        struct FixtureAccounts {
+            version_dir: std::path::PathBuf,
+        }
+        impl crate::account_session_service::SessionAccountSource for FixtureAccounts {
+            fn load(&self) -> Result<crate::accounts::Accounts> {
+                assert!(
+                    self.version_dir.join("tui-mc-natives").is_dir(),
+                    "credentials must be resolved after launch resources"
+                );
+                Ok(crate::accounts::Accounts::default())
+            }
+            fn minecraft_token(
+                &self,
+                _: &crate::accounts::Account,
+            ) -> Result<Option<zeroize::Zeroizing<String>>> {
+                panic!("fixture must not access credentials")
+            }
+            fn refresh(&self, _: &crate::accounts::Account) -> Result<()> {
+                panic!("fixture must not refresh credentials")
+            }
+            fn now(&self) -> u64 {
+                panic!("offline fixture does not need a token clock")
+            }
+        }
+        let workspace = crate::test_support::Workspace::new();
+        let root = workspace.path.join("tui mc launch");
         let dir = root.join("versions/fixture");
         fs::create_dir_all(&dir).unwrap();
         fs::create_dir_all(root.join("assets/indexes")).unwrap();
@@ -966,67 +1028,150 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         Backend::new(tx)
             .unwrap()
-            .launch(&config, "fixture")
+            .launch_with_accounts(
+                &config,
+                "fixture",
+                &FixtureAccounts {
+                    version_dir: dir.clone(),
+                },
+            )
             .unwrap();
         let log = fs::read_to_string(dir.join("tui-mc-game.log")).unwrap();
         assert!(log.contains("Notch"));
         assert!(log.contains(&offline_uuid("Notch")));
         assert!(log.contains("tui mc launch"));
-        // Remove only files created by this test; no recursive directory deletion.
-        for file in [
-            "LaunchFixture.java",
-            "LaunchFixture.class",
-            "fixture.jar",
-            "fixture.json",
-            "tui-mc-game.log",
-        ] {
-            fs::remove_file(dir.join(file)).unwrap();
-        }
-        fs::remove_dir(dir.join("tui-mc-natives").join(format!(
-            "{}-{}",
-            std::env::consts::OS,
-            std::env::consts::ARCH
-        )))
-        .unwrap();
-        fs::remove_dir(dir.join("tui-mc-natives")).unwrap();
-        fs::remove_dir(&dir).unwrap();
-        fs::remove_dir(root.join("versions")).unwrap();
-        fs::remove_file(root.join("assets/indexes/fixture.json")).unwrap();
-        fs::remove_dir(root.join("assets/indexes")).unwrap();
-        fs::remove_dir(root.join("assets")).unwrap();
-        for file in fs::read_dir(root.join("tui-mc-locks")).unwrap() {
-            fs::remove_file(file.unwrap().path()).unwrap();
-        }
-        fs::remove_dir(root.join("tui-mc-locks")).unwrap();
-        fs::remove_dir(root).unwrap();
     }
     #[test]
     #[ignore = "requires access to official Mojang services"]
     fn official_metadata_download() {
+        struct Version;
+        impl crate::platform_rule_service::OsVersionSource for Version {
+            fn version(&self) -> Option<&str> {
+                None
+            }
+        }
         let (tx, rx) = std::sync::mpsc::channel();
         let backend = Backend::new(tx).unwrap();
         backend.catalog().unwrap();
         let Message::Versions(versions) = rx.recv().unwrap() else {
             panic!("missing catalog");
         };
-        let version = versions.iter().find(|v| v.id == "1.21.1").unwrap();
         let workspace = crate::test_support::Workspace::new();
         let dir = workspace.path.join("metadata");
-        let path = dir.join("version.json");
-        backend
-            .fetch(&version.url, &path, Some(&version.sha1))
-            .unwrap();
-        let meta: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(meta["id"], "1.21.1");
-        assert!(meta["mainClass"].is_string());
-        assert!(!arguments(&meta["arguments"]["jvm"]).is_empty());
-        for lib in meta["libraries"].as_array().unwrap() {
-            if allowed(lib) {
-                for (entry, _) in artifacts(lib).unwrap() {
-                    safe_path(&dir, entry["path"].as_str().unwrap()).unwrap();
+        for id in ["1.7.10", "1.12.2", "1.21.1"] {
+            let version = versions.iter().find(|v| v.id == id).unwrap();
+            let path = dir.join(format!("{id}.json"));
+            backend
+                .fetch(&version.url, &path, Some(&version.sha1))
+                .unwrap();
+            let raw: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            let meta = crate::version_profile_service::VersionProfileDecoder
+                .decode(raw, id)
+                .unwrap();
+            assert_eq!(meta["id"], id);
+            assert!(meta["mainClass"].is_string());
+            assert!(
+                !crate::launch_options::game_arguments(&Config::default(), &meta)
+                    .unwrap()
+                    .is_empty()
+            );
+            if id == "1.21.1" {
+                assert!(!arguments(&meta["arguments"]["jvm"]).is_empty());
+            } else {
+                assert!(meta["minecraftArguments"].is_string());
+            }
+            for os in ["windows", "linux", "osx"] {
+                for bits in ["32", "64"] {
+                    let resolver = crate::library_service::LibraryResolver::new(os, bits);
+                    let rules = crate::platform_rule_service::PlatformRuleEvaluator::new(
+                        os,
+                        if bits == "32" { "x86" } else { "amd64" },
+                        &Version,
+                    );
+                    for lib in meta["libraries"].as_array().unwrap() {
+                        if !rules.allowed(lib, &HashMap::new()) {
+                            continue;
+                        }
+                        for (entry, _) in resolver.resolve(lib).unwrap() {
+                            let target = safe_path(&dir, entry["path"].as_str().unwrap()).unwrap();
+                            let download = download_entry(&entry, &target).unwrap();
+                            assert_eq!(
+                                reqwest::Url::parse(&download.url).unwrap().scheme(),
+                                "https"
+                            );
+                            if let Some(hash) = download.sha1 {
+                                assert!(
+                                    hash.len() == 40
+                                        && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
-        fs::remove_file(path).unwrap();
+        for message in rx.try_iter() {
+            if let Message::Log(line) = message {
+                assert!(
+                    !line.starts_with("无法获取有效实时元数据，使用已校验缓存"),
+                    "在线版本验收发生缓存回退：{line}"
+                );
+            }
+        }
+    }
+    #[test]
+    #[ignore = "requires TUI_TEST_INSTALLED_ROOT containing installed instances; read-only"]
+    fn installed_profiles_resolve_and_verify_all_launch_libraries() {
+        let root = std::path::PathBuf::from(
+            std::env::var_os("TUI_TEST_INSTALLED_ROOT").expect("set installed root"),
+        );
+        let platform = crate::launch_platform::LaunchPlatform::new(
+            crate::java_architecture::JavaArchitecture::X64,
+        );
+        let mut instances = 0;
+        let mut failures = vec![];
+        for entry in fs::read_dir(root.join("versions")).unwrap() {
+            let entry = entry.unwrap();
+            if !entry.file_type().unwrap().is_dir() {
+                continue;
+            }
+            let id = entry.file_name().into_string().unwrap();
+            if !entry.path().join(format!("{id}.json")).is_file() {
+                continue;
+            }
+            let resolved = crate::version::resolve(&root, &id).unwrap();
+            let profile = platform.profile(&resolved.meta);
+            let mut count = 0;
+            let mut generated = 0;
+            for library in profile["libraries"].as_array().unwrap() {
+                for (artifact, _) in platform.libraries().resolve(library).unwrap() {
+                    let path =
+                        safe_path(&root.join("libraries"), artifact["path"].as_str().unwrap())
+                            .unwrap();
+                    let download = download_entry(&artifact, &path).unwrap();
+                    if !crate::download::cached(&download).unwrap() {
+                        failures.push(format!("{id}: {}", path.display()));
+                    }
+                    generated += usize::from(download.url.is_empty());
+                    count += 1;
+                }
+            }
+            let arguments = platform.arguments(&profile["arguments"]["jvm"], &HashMap::new());
+            assert!(
+                arguments.iter().any(|arg| arg == "${classpath}"),
+                "{id}: missing inherited classpath"
+            );
+            eprintln!(
+                "{id}: {count} libraries, {generated} local-only artifacts, main={}",
+                profile["mainClass"]
+            );
+            instances += 1;
+        }
+        assert!(instances > 0);
+        assert!(
+            failures.is_empty(),
+            "Missing/corrupt cached libraries:\n{}",
+            failures.join("\n")
+        );
     }
 }

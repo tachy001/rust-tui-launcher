@@ -11,8 +11,16 @@ use std::{
 pub(crate) fn open(path: &Path, control: &TaskControl) -> Result<zip::ZipArchive<fs::File>> {
     control.check()?;
     let file = fs::File::open(path)?;
+    open_file(file, control)
+}
+
+pub(crate) fn open_file(
+    file: fs::File,
+    control: &TaskControl,
+) -> Result<zip::ZipArchive<fs::File>> {
+    control.check()?;
     let mut directory = file.try_clone()?;
-    let archive = zip::ZipArchive::new(file).context("安装器 ZIP 目录无效")?;
+    let archive = zip::ZipArchive::new(file).context("归档 ZIP 目录无效")?;
     let length = directory.metadata()?.len();
     directory.seek(SeekFrom::Start(archive.central_directory_start()))?;
     let mut count = 0;
@@ -21,10 +29,10 @@ pub(crate) fn open(path: &Path, control: &TaskControl) -> Result<zip::ZipArchive
         let mut signature = [0; 4];
         directory
             .read_exact(&mut signature)
-            .context("安装器 ZIP 目录被截断")?;
+            .context("归档 ZIP 目录被截断")?;
         if signature != *b"PK\x01\x02" {
             if !matches!(&signature, b"PK\x05\x06" | b"PK\x06\x06" | b"PK\x05\x05") {
-                bail!("安装器 ZIP 目录终止标记无效");
+                bail!("归档 ZIP 目录终止标记无效");
             }
             break;
         }
@@ -36,18 +44,18 @@ pub(crate) fn open(path: &Path, control: &TaskControl) -> Result<zip::ZipArchive
         let end = directory
             .stream_position()?
             .checked_add(u64::from(name) + u64::from(extra) + u64::from(comment))
-            .context("安装器目录偏移溢出")?;
+            .context("归档目录偏移溢出")?;
         if end > length {
-            bail!("安装器 ZIP 目录记录越界");
+            bail!("归档 ZIP 目录记录越界");
         }
         directory.seek(SeekFrom::Start(end))?;
         count += 1;
         if count > 100_000 {
-            bail!("安装器 ZIP 条目超过数量限制");
+            bail!("归档 ZIP 条目超过数量限制");
         }
     }
     if count != archive.len() {
-        bail!("安装器 ZIP 有重复名称或目录记录不一致");
+        bail!("归档 ZIP 有重复名称或目录记录不一致");
     }
     control.check()?;
     Ok(archive)

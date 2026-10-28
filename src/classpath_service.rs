@@ -111,7 +111,16 @@ impl BootstrapCompatibility {
         let Some(mode) = self.mode else {
             return Ok(());
         };
-        for argument in jvm {
+        let mut offset = 0;
+        let slots: Vec<_> = crate::jvm_argument_service::argument_groups(jvm)
+            .filter_map(|group| {
+                let index = offset;
+                offset += group.len();
+                group[0].starts_with("-DignoreList=").then_some(index)
+            })
+            .collect();
+        for index in slots {
+            let argument = &mut jvm[index];
             let Some(value) = argument.strip_prefix("-DignoreList=") else {
                 continue;
             };
@@ -254,6 +263,31 @@ mod tests {
                 .rewrite(&mut jvm, &[], Path::new("base.jar"))
                 .unwrap();
             assert_eq!(jvm, ["-DignoreList=original"]);
+        }
+    }
+    #[test]
+    fn bootstrap_rewrite_preserves_option_operands() {
+        for version in ["0.1.16", "2.0.2"] {
+            let compatibility = BootstrapCompatibility::from_metadata(&metadata(version)).unwrap();
+            let mut jvm = vec![
+                "--module-path".into(),
+                "-DignoreList=literal-directory".into(),
+                "-DignoreList=asm".into(),
+            ];
+            compatibility
+                .rewrite(
+                    &mut jvm,
+                    &["libraries/asm.jar".into()],
+                    Path::new("versions/base/base.jar"),
+                )
+                .unwrap();
+            assert_eq!(jvm[1], "-DignoreList=literal-directory");
+            assert!(jvm[2].contains("base.jar"));
+            let mut operand_only = vec!["-cp".into(), "-DignoreList=literal-directory".into()];
+            compatibility
+                .rewrite(&mut operand_only, &[], Path::new("invalid,client.jar"))
+                .unwrap();
+            assert_eq!(operand_only[1], "-DignoreList=literal-directory");
         }
     }
     #[test]

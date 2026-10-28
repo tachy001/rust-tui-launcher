@@ -1,6 +1,6 @@
 use crate::{
     config::Config,
-    download::valid_file,
+    download::valid_file_with_control,
     download_lock::DownloadLease,
     installation_service::RuntimeInstallSession,
     metadata::{safe_path, valid_id},
@@ -143,6 +143,7 @@ impl<'a> RuntimeGeneration<'a> {
         self.session.destination(name)
     }
     pub(crate) fn reusable(&self, files: &Map<String, Value>) -> Result<Option<PathBuf>> {
+        self.control.check()?;
         let Some((root, pointer)) = current(&self.repository)? else {
             return Ok(None);
         };
@@ -163,7 +164,7 @@ impl<'a> RuntimeGeneration<'a> {
                     let Some(size) = raw["size"].as_u64() else {
                         return Ok(None);
                     };
-                    if !valid_file(&path, Some(hash), Some(size))? {
+                    if !valid_file_with_control(&path, Some(hash), Some(size), self.control)? {
                         return Ok(None);
                     }
                     #[cfg(unix)]
@@ -203,7 +204,7 @@ impl<'a> RuntimeGeneration<'a> {
                         else {
                             return Ok(None);
                         };
-                        if !valid_file(&path, Some(hash), Some(size))? {
+                        if !valid_file_with_control(&path, Some(hash), Some(size), self.control)? {
                             return Ok(None);
                         }
                     }
@@ -322,6 +323,16 @@ mod tests {
         control.cancel();
         assert!(resumed.publish().is_err());
         assert_eq!(current(&workspace.path).unwrap().unwrap().0, old);
+    }
+    #[test]
+    fn cancelled_reuse_is_not_reported_as_a_missing_runtime() {
+        let workspace = crate::test_support::Workspace::new();
+        let control = TaskControl::default();
+        let generation = RuntimeGeneration::begin(&workspace.path, HASH, &control, || {}).unwrap();
+        control.cancel();
+        let error = generation.reusable(&Map::new()).unwrap_err();
+        assert!(error.to_string().contains("取消"));
+        assert!(current(&workspace.path).unwrap().is_none());
     }
     #[test]
     fn healthy_generation_is_reused_only_when_all_declared_file_hashes_match() {

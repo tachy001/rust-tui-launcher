@@ -6,6 +6,8 @@ use crate::{
 use anyhow::{bail, Context, Result};
 use zeroize::Zeroizing;
 
+const SESSION_VALIDITY_MARGIN: u64 = 120;
+
 pub(crate) trait SessionAccountSource {
     fn load(&self) -> Result<Accounts>;
     fn minecraft_token(&self, account: &Account) -> Result<Option<Zeroizing<String>>>;
@@ -31,11 +33,11 @@ impl<'a> AccountSessionService<'a> {
             return Self::offline(&account.name);
         }
         Self::validate(account)?;
-        if account.expires_at > self.source.now().saturating_add(120) {
+        if self.usable(account) {
             let token = self.source.minecraft_token(account)?;
             self.control.check()?;
             if let Some(token) = token.filter(|token| !token.is_empty()) {
-                if account.expires_at > self.source.now() {
+                if self.usable(account) {
                     return Self::session(account, token);
                 }
             }
@@ -62,10 +64,13 @@ impl<'a> AccountSessionService<'a> {
             .filter(|token| !token.is_empty())
             .context("刷新后游戏凭证仍缺失，请重新登录")?;
         self.control.check()?;
-        if current.expires_at <= self.source.now() {
-            bail!("刷新后的游戏令牌已过期，请重新登录");
+        if !self.usable(current) {
+            bail!("刷新后的游戏令牌已过期或即将过期，请重新登录");
         }
         Self::session(current, token)
+    }
+    fn usable(&self, account: &Account) -> bool {
+        account.expires_at > self.source.now().saturating_add(SESSION_VALIDITY_MARGIN)
     }
     fn validate(account: &Account) -> Result<()> {
         crate::auth::validate_client_id(&account.client_id)?;
@@ -122,6 +127,8 @@ mod tests {
         refreshed: Cell<bool>,
         calls: RefCell<Vec<&'static str>>,
         fail: &'static str,
+        clock: Cell<u64>,
+        token_delay: u64,
     }
     fn source() -> Source {
         let mut accounts = Accounts::default();
@@ -133,6 +140,8 @@ mod tests {
             refreshed: Cell::new(false),
             calls: RefCell::new(vec![]),
             fail: "",
+            clock: Cell::new(100),
+            token_delay: 0,
         }
     }
     impl SessionAccountSource for Source {
@@ -146,6 +155,8 @@ mod tests {
         }
         fn minecraft_token(&self, _: &Account) -> Result<Option<Zeroizing<String>>> {
             self.calls.borrow_mut().push("token");
+            self.clock
+                .set(self.clock.get().saturating_add(self.token_delay));
             if self.fail == "token" {
                 bail!("keyring unavailable");
             }
@@ -162,7 +173,7 @@ mod tests {
             Ok(())
         }
         fn now(&self) -> u64 {
-            100
+            self.clock.get()
         }
     }
     #[test]
@@ -175,6 +186,37 @@ mod tests {
         assert_eq!(session.access_token.as_str(), "cached-token");
         assert_eq!(session.user_type, "msa");
         assert_eq!(*source.calls.borrow(), ["load", "token"]);
+    }
+    #[test]
+    fn slow_credential_read_refreshes_cache_but_rejects_short_lived_refresh() {
+        let mut source = source();
+        source.initial.entries[0].expires_at = 230;
+        source.token_delay = 10;
+        let session = AccountSessionService::new(&source, &TaskControl::default())
+            .resolve("Fallback")
+            .unwrap();
+        assert_eq!(session.access_token.as_str(), "refreshed-token");
+        assert_eq!(
+            *source.calls.borrow(),
+            ["load", "token", "refresh", "load", "token"]
+        );
+
+        source.refreshed.set(false);
+        source.clock.set(100);
+        source.calls.borrow_mut().clear();
+        source.after.entries[0].expires_at = 240;
+        assert!(AccountSessionService::new(&source, &TaskControl::default())
+            .resolve("Fallback")
+            .is_err());
+        assert_eq!(
+            source
+                .calls
+                .borrow()
+                .iter()
+                .filter(|call| **call == "refresh")
+                .count(),
+            1
+        );
     }
     #[test]
     fn missing_empty_or_expiring_cache_is_recovered_once() {

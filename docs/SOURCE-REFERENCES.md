@@ -4,6 +4,18 @@
 
 ## Java 运行时兼容范围
 
+2026-10-26 补充：复读 HMCLCore `JavaVersionConstraint.LAUNCH_WRAPPER` 按 artifactId/version 判断的逻辑，以及 PCL `ModJava.GetJavaRequirement` 的 Fabric 0.17.0 分界。Rust 原有版本边界保持不变，补齐 Maven 分类器和显式 @jar 的身份识别，避免相同加载器因坐标表示不同漏掉限制；非 JAR 与被平台规则禁用的依赖不参与。此实现选择与边界测试不等于这些归档的实际加载验收。
+
+2026-10-25 补充：`forge_ceiling` 已根据活动 Forge Maven 坐标中的已知正式 Minecraft 版本接入 PCL 的 1.13–1.14 最高 Java 10、1.15 最高 Java 15。不会从实例名称推断，也不会给快照或缺失游戏前缀的坐标猜测范围；历史游戏实际启动仍未验收。
+
+### 2026-10-25 启动准备与账户时序补充
+
+本地 HMCL `LauncherHelper` 在依赖校验之后调用 `logIn`，而 PCL `ModLaunch` 的任务表先放置登录、再补全文件。本项目采用前者的顺序：完成 Java、库、native、资源与日志配置准备后，再通过 `AccountSessionService` 取得会话，减少长下载消耗令牌有效期。120 秒有效期余量是本项目已有策略，现统一检查凭证读取前后及刷新结果，并非声称来自 HMCL 的同名常量。
+
+对照 HMCL `DefaultLauncher` 的参数拼接，支持同一配置同时提供旧式 `minecraftArguments` 和新式 `arguments.game`；版本继承时子配置切换参数格式的替换规则保持不变。JVM 参数分组则依据 Java 选项/操作数语义独立实现，避免类路径文字被误当成开关，并应用于默认属性、兼容检查、内存检查、Windows 缩短及 BootstrapLauncher 忽略列表。
+
+真实 Forge 52.1.20 配置还确认 `net.minecraftforge.bootstrap.ForgeBootstrap` 与旧 `cpw.mods.bootstraplauncher.BootstrapLauncher` 不同，并包含空 URL 的安装器生成客户端 JAR；库解析必须保留显式空 URL，不能将其和缺失 URL 的仓库回退混同。本地原版、Forge、Fabric、NeoForge 依赖校验通过，仍不代表实际游戏运行通过。详细证据与未验收项见 `ROADMAP.md`。
+
 - [HMCL JavaVersionConstraint.java](https://github.com/HMCL-dev/HMCL/blob/main/HMCLCore/src/main/java/org/jackhuang/hmcl/game/JavaVersionConstraint.java)：重点阅读 `GAME_JSON`、`LAUNCH_WRAPPER`、`MODDED_JAVA_*`、`MODLAUNCHER_8`。元数据最低要求和加载器兼容范围是不同约束；部分约束是强制限制，部分是建议。
 - [PCL ModJava.vb](https://github.com/Hex-Dragon/PCL2/blob/main/Plain%20Craft%20Launcher%202/Modules/Minecraft/ModJava.vb)：重点阅读 `GetJavaRequirement` 和 `SelectOrDownloadJava`。按游戏和加载器计算范围，再选择 / 下载运行时；还处理 Forge 更新号、NeoForge 和旧 Fabric 的最高版本限制。
 
@@ -13,13 +25,13 @@
 
 8 项本地运行时策略检查通过，覆盖既有取消 / 回退策略和新增上下限处理，没有启动 Java 或游戏。真实历史 Forge 实例尚未验收。
 
-尚未统一的规则：两份快照对于部分历史 Forge 的 Java 上限、补丁级别和建议 / 强制程度不同。已新增完整版本模型，但 JavaRequirement 尚未实现 Java 8u320 / 8u321 等加载器更新号边界；仍需按具体加载器版本逐项核对，不能把所有旧 Forge 简化成同一个最高版本。
+当前已实现：JavaRequirement 按 PCL 的 Forge 范围检查 Java 更新号，包括 Forge 34.0.0–36.2.25 的 8u320 上限；8u321 及更高更新号会被拒绝，厂商 build 不改变更新号边界。详见下方“Forge 的 Java 更新号与候选筛选”及 runtime_service.rs 的边界用例。两份参考快照对部分历史 Forge 的适用范围和强制程度不同，不能把所有旧 Forge 简化成同一个最高版本。
 
 进一步阅读 [HMCL JavaManager.java](https://github.com/HMCL-dev/HMCL/blob/main/HMCL/src/main/java/org/jackhuang/hmcl/java/JavaManager.java) 的 `chooseJava`：优先接近游戏建议的主版本，同一主版本比较完整版本。对照 PCL `GetJavaRequirement` / `SelectOrDownloadJava` 可见完整版本还参与范围判断，单纯保留主版本不足以实现这些兼容规则。
 
 本项目新增 `JavaVersion`，解析 Java 8 的 `1.8.0_321-b07` / `8u451` 与新版点分、`+build`、LTS 和预览格式；规范化数字部分以便比较，同时保留原版本文本。JavaRuntime 组合该对象，主版本由对象派生，避免主版本和完整版本分别保存后不一致。同主版本优先正式版，再按数字更新号和构建号选择较新候选；手动路径选择策略不变。探测输出按实际 Java / OpenJDK 版本头识别，跳过 JAVA_TOOL_OPTIONS 等警告，而非把输出第一行当作版本说明。
 
-14 项相关本地检查通过，包括原有运行时策略检查，没有执行 JVM。此模型不把不同厂商的更新号强行映射为同一种补丁级别；完整加载器版本范围、架构检测和真实厂商输出适配仍需继续核验。
+初次实现时 14 项相关本地检查通过，没有执行 JVM。此模型不把不同厂商的更新号强行映射为同一种补丁级别；后续已接入架构探测、按目标平台选择依赖及多项 Forge 更新号范围，完整加载器覆盖和真实厂商兼容仍需继续核验。
 
 继续采用 PCL `GetJavaRequirement` 的已知 Fabric 规则：Loader 0.17.0 之前的 Mixin / ASM 不兼容 Java 25。本项目将该上限接入现有 `JavaRequirement`，根据 KnotClient 启动主类与当前平台启用的 `net.fabricmc:fabric-loader` 纯数字版本判断，而非实例 ID。旧版限制最高 Java 24；0.17.0+ 不套用此规则，未知限定符版本不猜测。元数据最低版本超过上限时报冲突，避免无效下载；手动 Java、安装结果及失败回退均不能绕过已知上限。
 

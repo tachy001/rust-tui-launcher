@@ -13,7 +13,8 @@ impl JvmMemory {
             maximum: None,
             initial: None,
         };
-        for argument in arguments {
+        for group in crate::jvm_argument_service::argument_groups(arguments) {
+            let argument = &group[0];
             let setting = if let Some(value) = argument
                 .strip_prefix("-Xmx")
                 .or_else(|| argument.strip_prefix("-XX:MaxHeapSize="))
@@ -74,6 +75,9 @@ mod tests {
 
     #[test]
     fn checks_effective_overrides_and_aliases_in_order() {
+        let memory = parse(&["-Xmx512M", "-cp", "-Xmxinvalid", "--module-path", "-Xms2g"]).unwrap();
+        assert_eq!(memory.maximum, Some(512 << 20));
+        assert_eq!(memory.initial, None);
         let memory = parse(&["-Xmx512M", "-XX:MaxHeapSize=2g", "-Xms1024m"]).unwrap();
         assert_eq!(memory.maximum, Some(2 << 30));
         assert!(memory.warning(JavaArchitecture::X86).is_some());

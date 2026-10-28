@@ -55,11 +55,14 @@ impl DevicePolling {
         })
     }
     fn wait_duration(&self, now: Instant) -> Result<Duration> {
+        Ok(self.interval.min(self.remaining(now)?))
+    }
+    fn remaining(&self, now: Instant) -> Result<Duration> {
         let remaining = self.deadline.saturating_duration_since(now);
         if remaining.is_zero() {
             bail!("设备登录码已过期");
         }
-        Ok(self.interval.min(remaining))
+        Ok(remaining)
     }
     fn slow_down(&mut self) {
         self.interval = self.interval.saturating_add(Duration::from_secs(5));
@@ -271,18 +274,25 @@ impl Backend {
         }
         let token = loop {
             self.auth_wait(polling.wait_duration(Instant::now())?)?;
-            polling.wait_duration(Instant::now())?;
+            let request_timeout = polling
+                .remaining(Instant::now())?
+                .min(Duration::from_secs(30));
             let response = self
                 .client
                 .post(TOKEN_URL)
+                .timeout(request_timeout)
                 .form(&[
                     ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
                     ("client_id", client_id.as_str()),
                     ("device_code", device.device_code.as_str()),
                 ])
-                .send();
+                .send()
+                .and_then(|response| {
+                    let status = response.status();
+                    response.json::<Value>().map(|value| (status, value))
+                });
             self.control.check()?;
-            let response = match response {
+            let (status, value) = match response {
                 Ok(response) => response,
                 Err(error) if error.is_timeout() => {
                     polling.connection_timeout();
@@ -291,8 +301,6 @@ impl Backend {
                 }
                 Err(error) => return Err(error).context("轮询微软登录失败"),
             };
-            let status = response.status();
-            let value: Value = response.json().context("微软登录响应格式错误")?;
             if status.is_success() {
                 break serde_json::from_value::<OAuthToken>(value)?;
             }
@@ -407,10 +415,6 @@ impl Backend {
         self.finish_auth(&account.client_id, &oauth, Some(&refresh_session))?;
         Ok(())
     }
-    pub fn account_session(&self, config: &Config) -> Result<Session> {
-        crate::account_session_service::AccountSessionService::new(self, &self.control)
-            .resolve(&config.username)
-    }
 }
 impl crate::account_session_service::SessionAccountSource for Backend {
     fn load(&self) -> Result<Accounts> {
@@ -485,6 +489,7 @@ mod tests {
     fn device_polling_bounds_waits_by_expiration_and_preserves_backoff() {
         let now = std::time::Instant::now();
         let mut polling = super::DevicePolling::new(now, 30, 5).unwrap();
+        assert_eq!(polling.remaining(now).unwrap().as_secs(), 30);
         assert_eq!(polling.wait_duration(now).unwrap().as_secs(), 5);
         polling.slow_down();
         assert_eq!(polling.wait_duration(now).unwrap().as_secs(), 10);
@@ -499,6 +504,16 @@ mod tests {
         );
         assert!(polling
             .wait_duration(now + std::time::Duration::from_secs(30))
+            .is_err());
+        assert_eq!(
+            polling
+                .remaining(now + std::time::Duration::from_secs(29))
+                .unwrap()
+                .as_secs(),
+            1
+        );
+        assert!(polling
+            .remaining(now + std::time::Duration::from_secs(30))
             .is_err());
         assert!(super::DevicePolling::new(now, 0, 5).is_err());
         let huge = super::DevicePolling::new(now, 10, u64::MAX).unwrap();

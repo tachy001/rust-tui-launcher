@@ -5,7 +5,7 @@ use crate::storage::atomic_write;
 use crate::{
     backend::Backend,
     config::Config,
-    download::{valid_file, Download},
+    download::{valid_file_with_control, Download},
     metadata::{safe_path, valid_id},
     version,
 };
@@ -384,6 +384,7 @@ impl Backend {
             }
         }
         let mut downloads = vec![];
+        let mut cached_copies = vec![];
         let mut records = vec![];
         let mut filenames = HashSet::new();
         for version in plan {
@@ -400,7 +401,8 @@ impl Backend {
             }) {
                 bail!("该 JAR 文件名已由另一个项目管理：{}", file.filename);
             }
-            let already_valid = valid_file(&active, Some(&hash), Some(file.size))?;
+            let already_valid =
+                valid_file_with_control(&active, Some(&hash), Some(file.size), &self.control)?;
             if active.exists()
                 && !already_valid
                 && current
@@ -418,17 +420,23 @@ impl Backend {
                 &format!("{}.disabled", file.filename),
             )?;
             if !already_valid && target.loader == "fabric" {
-                fs::copy(artifacts.artifact(&version)?, &dest)?;
-            } else if !already_valid && valid_file(&disabled, Some(&hash), Some(file.size))? {
-                fs::copy(&disabled, &dest)?;
+                crate::storage::atomic_copy_controlled(
+                    &dest,
+                    &mut fs::File::open(artifacts.artifact(&version)?)?,
+                    &self.control,
+                )?;
+            } else if !already_valid
+                && valid_file_with_control(&disabled, Some(&hash), Some(file.size), &self.control)?
+            {
+                crate::storage::atomic_copy_controlled(
+                    &dest,
+                    &mut fs::File::open(&disabled)?,
+                    &self.control,
+                )?;
             } else if !already_valid {
-                downloads.push(Download {
-                    url: file.url.clone(),
-                    dest,
-                    sha1: Some(hash.clone()),
-                    size: Some(file.size),
-                    alternatives: vec![],
-                });
+                let download = artifacts.download(&version)?;
+                cached_copies.push((download.dest.clone(), dest));
+                downloads.push(download);
             }
             records.push((
                 InstalledMod {
@@ -449,6 +457,13 @@ impl Backend {
         }
         self.downloader()
             .many(downloads, config.download_threads, "Mod 下载与依赖")?;
+        for (cached, staged) in cached_copies {
+            crate::storage::atomic_copy_controlled(
+                &staged,
+                &mut fs::File::open(cached)?,
+                &self.control,
+            )?;
+        }
         if target.loader == "fabric" {
             let mut paths = crate::fabric_check::active_paths(config, id)?;
             paths.retain(|path| {
@@ -509,21 +524,39 @@ impl Backend {
             return Ok(());
         }
         let mods = dir.join("mods");
-        let mut downloads = vec![];
+        let activation = crate::mod_install_service::ModInstallState::new(&dir, &inventory);
+        let mut targets = vec![];
+        let mut filenames = HashSet::new();
         for record in inventory.entries.values() {
             self.control.check()?;
             valid_id(&record.filename)?;
-            let active = safe_path(&mods, &record.filename)?;
-            let disabled = safe_path(&mods, &format!("{}.disabled", record.filename))?;
-            let dest = if !active.exists() && disabled.is_file() {
-                disabled
-            } else {
-                active
-            };
-            if dest.is_file() && valid_file(&dest, Some(&record.sha1), Some(record.size))? {
+            if !filenames.insert(record.filename.to_lowercase()) {
+                bail!("Mod 修复清单包含重复文件名：{}", record.filename);
+            }
+            let dest = activation
+                .state(&record.project, &record.filename)?
+                .destination(&mods, &record.filename)?;
+            targets.push((record, dest));
+        }
+        let mut pending = vec![];
+        for (record, dest) in targets {
+            self.control.check()?;
+            if dest.is_file()
+                && valid_file_with_control(
+                    &dest,
+                    Some(&record.sha1),
+                    Some(record.size),
+                    &self.control,
+                )?
+            {
                 continue;
             }
             identifier(&record.version)?;
+            pending.push((record, dest));
+        }
+        let mut downloads = vec![];
+        for (record, dest) in pending {
+            self.control.check()?;
             let version: ModVersion = serde_json::from_value(
                 self.get_json(&format!("{API}/version/{}", record.version))?,
             )?;
@@ -569,6 +602,66 @@ fn commit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn repair_preserves_disabled_mod_and_rejects_ambiguous_copies() {
+        let temp = crate::test_support::Workspace::new();
+        let config = Config {
+            game_dir: temp.path.clone(),
+            isolated: false,
+            ..Config::default()
+        };
+        fs::create_dir(temp.path.join("mods")).unwrap();
+        let disabled = temp.path.join("mods/a.jar.disabled");
+        let active = temp.path.join("mods/a.jar");
+        fs::write(&disabled, b"abc").unwrap();
+        let record = InstalledMod {
+            project: "a".into(),
+            version: "v1".into(),
+            version_number: "1".into(),
+            filename: "a.jar".into(),
+            sha1: "a9993e364706816aba3e25717850c26c9cd0d89d".into(),
+            size: 3,
+            published: String::new(),
+        };
+        let inventory = Inventory {
+            entries: BTreeMap::from([("a".into(), record)]),
+        };
+        let bytes = serde_json::to_vec(&inventory).unwrap();
+        fs::write(temp.path.join(INVENTORY), &bytes).unwrap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let backend = Backend::new(tx).unwrap();
+        let mutation =
+            crate::instance_service::InstanceMutation::begin(&config.root().unwrap(), "test")
+                .unwrap();
+        backend
+            .repair_mod_inventory_with_session(&config, "test", &mutation)
+            .unwrap();
+        assert!(!active.exists());
+        fs::write(&active, b"abc").unwrap();
+        let error = backend
+            .repair_mod_inventory_with_session(&config, "test", &mutation)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("同时存在启用和禁用"));
+        assert_eq!(fs::read(&active).unwrap(), b"abc");
+        assert_eq!(fs::read(&disabled).unwrap(), b"abc");
+        assert_eq!(fs::read(temp.path.join(INVENTORY)).unwrap(), bytes);
+        // A missing earlier entry must not begin remote resolution before a later conflict.
+        let mut conflicting = inventory;
+        let mut missing = conflicting.entries["a"].clone();
+        missing.project = "0".into();
+        missing.filename = "missing.jar".into();
+        missing.version = "invalid/version".into();
+        conflicting.entries.insert("0".into(), missing);
+        fs::write(
+            temp.path.join(INVENTORY),
+            serde_json::to_vec(&conflicting).unwrap(),
+        )
+        .unwrap();
+        let error = backend
+            .repair_mod_inventory_with_session(&config, "test", &mutation)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("同时存在启用和禁用"));
+    }
     #[test]
     fn reinstall_can_adopt_verified_file_without_staged_download() {
         let temp = crate::test_support::Workspace::new();

@@ -14,6 +14,9 @@ impl LoaderOutputRequirement {
         let id = profile["id"].as_str().context("现代加载器缺少实例 ID")?;
         valid_id(id)?;
         valid_id(game)?;
+        let normalized = crate::version_profile_service::VersionProfileDecoder
+            .decode(profile.clone(), id)
+            .context("加载器安装包的版本配置无效")?;
         if id == game
             || profile
                 .get("inheritsFrom")
@@ -36,7 +39,7 @@ impl LoaderOutputRequirement {
             )?;
         }
         Ok(Self {
-            profile: profile.clone(),
+            profile: normalized,
             id: id.into(),
             game: game.into(),
         })
@@ -58,6 +61,9 @@ impl LoaderOutputRequirement {
         }
         control.check()?;
         let actual: Value = serde_json::from_slice(&bytes).context("安装器生成的实例配置损坏")?;
+        let actual = crate::version_profile_service::VersionProfileDecoder
+            .decode(actual, &self.id)
+            .context("安装器生成的版本配置格式无效")?;
         if actual["id"].as_str() != Some(&self.id)
             || actual["inheritsFrom"].as_str() != Some(&self.game)
         {
@@ -69,6 +75,7 @@ impl LoaderOutputRequirement {
             "minecraftArguments",
             "jar",
             "downloads",
+            "javaVersion",
         ] {
             if let Some(expected) = self.profile.get(field).filter(|value| !value.is_null()) {
                 if actual.get(field) != Some(expected) {
@@ -151,6 +158,77 @@ mod tests {
         let control = TaskControl::default();
         control.cancel();
         assert!(required.verify(root, &control).is_err());
+    }
+    #[test]
+    fn equivalent_nullable_fields_and_argument_aliases_do_not_fail_output_validation() {
+        let workspace = crate::test_support::Workspace::new();
+        let mut expected = profile();
+        expected["arguments"] =
+            json!({"jvm":null,"game":[{"rules":null,"values":["--example","literal"]}]});
+        let mut output = expected.clone();
+        output["arguments"] = json!({"game":[{"value":["--example","literal"]}]});
+        let required = LoaderOutputRequirement::new(&expected, "game").unwrap();
+        write(&workspace.path, &output);
+        required
+            .verify(&workspace.path, &TaskControl::default())
+            .unwrap();
+        output["arguments"]["game"][0]["value"][1] = json!("changed");
+        write(&workspace.path, &output);
+        assert!(required
+            .verify(&workspace.path, &TaskControl::default())
+            .is_err());
+    }
+    #[test]
+    fn invalid_containers_are_rejected_before_install_and_in_generated_output() {
+        let workspace = crate::test_support::Workspace::new();
+        for (field, value) in [
+            ("javaVersion", json!("21")),
+            ("arguments", json!({"jvm":"-Xmx2G"})),
+            ("downloads", json!({"client":"client.jar"})),
+            ("logging", json!([])),
+            ("assetIndex", json!(false)),
+        ] {
+            let mut invalid = profile();
+            invalid[field] = value;
+            let error = LoaderOutputRequirement::new(&invalid, "game")
+                .err()
+                .unwrap();
+            assert!(format!("{error:#}").contains(field));
+            let requirement = LoaderOutputRequirement::new(&profile(), "game").unwrap();
+            write(&workspace.path, &invalid);
+            assert!(requirement
+                .verify(&workspace.path, &TaskControl::default())
+                .is_err());
+        }
+    }
+    #[test]
+    fn declared_java_requirement_must_survive_installer_output() {
+        let workspace = crate::test_support::Workspace::new();
+        let mut expected = profile();
+        expected["javaVersion"] = json!({"majorVersion":21,"component":"java-runtime-delta"});
+        let required = LoaderOutputRequirement::new(&expected, "game").unwrap();
+        write(&workspace.path, &expected);
+        required
+            .verify(&workspace.path, &TaskControl::default())
+            .unwrap();
+        for changed in [
+            Value::Null,
+            json!({"majorVersion":8,"component":"jre-legacy"}),
+            json!({"majorVersion":21,"component":"java-runtime-gamma"}),
+        ] {
+            let mut output = expected.clone();
+            output["javaVersion"] = changed;
+            write(&workspace.path, &output);
+            let error = required
+                .verify(&workspace.path, &TaskControl::default())
+                .unwrap_err();
+            assert!(error.to_string().contains("javaVersion"));
+        }
+        expected.as_object_mut().unwrap().remove("javaVersion");
+        write(&workspace.path, &expected);
+        assert!(required
+            .verify(&workspace.path, &TaskControl::default())
+            .is_err());
     }
     #[test]
     fn changed_entrypoint_arguments_parent_and_dependency_are_rejected() {

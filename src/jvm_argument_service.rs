@@ -1,6 +1,39 @@
 use anyhow::{bail, Result};
 use serde_json::Value;
 
+/// Keep separate Java option operands opaque to flag-specific policies.
+pub(crate) fn argument_groups(arguments: &[String]) -> impl Iterator<Item = &[String]> {
+    let mut remaining = arguments;
+    std::iter::from_fn(move || {
+        let first = remaining.first()?;
+        let takes_operand = matches!(
+            first.as_str(),
+            "-cp"
+                | "-classpath"
+                | "--class-path"
+                | "-p"
+                | "--module-path"
+                | "--upgrade-module-path"
+                | "--add-modules"
+                | "--limit-modules"
+                | "--add-reads"
+                | "--add-exports"
+                | "--add-opens"
+                | "--patch-module"
+                | "--enable-native-access"
+                | "--source"
+        );
+        let count = if takes_operand && remaining.len() > 1 {
+            2
+        } else {
+            1
+        };
+        let (group, rest) = remaining.split_at(count);
+        remaining = rest;
+        Some(group)
+    })
+}
+
 pub(crate) struct JvmArgumentCompatibility {
     major: u64,
 }
@@ -19,7 +52,8 @@ impl JvmArgumentCompatibility {
         };
         let mut removed = std::collections::BTreeSet::new();
         let mut collectors = std::collections::BTreeMap::new();
-        for argument in arguments {
+        for group in argument_groups(arguments) {
+            let argument = &group[0];
             let xx = argument.strip_prefix("-XX:");
             let name = xx.map(|value| {
                 value
@@ -79,7 +113,7 @@ impl JvmArgumentCompatibility {
                     }
                 }
             }
-            output.arguments.push(argument.clone());
+            output.arguments.extend_from_slice(group);
         }
         let enabled: Vec<_> = collectors
             .into_iter()
@@ -132,9 +166,7 @@ impl<'a> JvmArgumentDefaults<'a> {
         });
         if self.os == "macos"
             && lwjgl3
-            && !arguments
-                .iter()
-                .any(|argument| argument == "-XstartOnFirstThread")
+            && !argument_groups(arguments).any(|group| group[0] == "-XstartOnFirstThread")
         {
             arguments.push("-XstartOnFirstThread".into());
         }
@@ -142,7 +174,8 @@ impl<'a> JvmArgumentDefaults<'a> {
 
     fn property(arguments: &mut Vec<String>, name: &str, value: &str) {
         let property = format!("-D{name}");
-        if !arguments.iter().any(|argument| {
+        if !argument_groups(arguments).any(|group| {
+            let argument = &group[0];
             argument == &property
                 || argument
                     .strip_prefix(&property)
@@ -163,6 +196,23 @@ mod tests {
             .iter()
             .map(|argument| (*argument).into())
             .collect()
+    }
+
+    #[test]
+    fn option_operands_are_not_removed_or_treated_as_collector_flags() {
+        let args = options(&[
+            "-cp",
+            "-Xincgc",
+            "--module-path",
+            "-XX:+UseZGC",
+            "-XX:+UseG1GC",
+        ]);
+        let result = JvmArgumentCompatibility::new(21).normalize(&args).unwrap();
+        assert_eq!(result.arguments, args);
+        assert!(result.warnings.is_empty());
+        let mut args = options(&["-cp", "-Dlog4j2.formatMsgNoLookups=false"]);
+        JvmArgumentDefaults::new(21, "windows").apply(&mut args, &json!({}));
+        assert!(args.contains(&"-Dlog4j2.formatMsgNoLookups=true".into()));
     }
 
     #[test]

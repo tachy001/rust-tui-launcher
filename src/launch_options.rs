@@ -64,8 +64,7 @@ impl QuickPlayTarget {
             Self::Singleplayer(_) => Some("--quickPlaySingleplayer"),
             Self::None => None,
         };
-        let supported = meta["minecraftArguments"].as_str().is_none()
-            && option.is_some_and(|option| has_option(&candidate, option));
+        let supported = option.is_some_and(|option| has_option(&candidate, option));
         if matches!(self, Self::Singleplayer(_)) && !supported {
             bail!("此版本未声明可用的单人 Quick Play 参数，请从游戏内打开存档");
         }
@@ -168,8 +167,13 @@ pub(crate) fn game_arguments_for(
     let mut args = if let Some(legacy) = meta["minecraftArguments"].as_str() {
         shlex::split(legacy).context("无法解析旧版启动参数")?
     } else {
-        crate::metadata::arguments_for(&meta["arguments"]["game"], &features, platform)
+        Vec::new()
     };
+    args.extend(crate::metadata::arguments_for(
+        &meta["arguments"]["game"],
+        &features,
+        platform,
+    ));
     if !has_option(&args, "--width") {
         args.extend(["--width".into(), config.width.to_string()]);
     }
@@ -236,6 +240,28 @@ mod tests {
         ] {
             assert!(server_address(invalid).is_err(), "{invalid}");
         }
+    }
+    #[test]
+    fn mixed_argument_formats_keep_loader_and_quickplay_options() {
+        let meta = serde_json::json!({"minecraftArguments":"--username ${auth_player_name}","arguments":{"game":["--tweakClass","example.Loader",
+            {"rules":[{"action":"allow","features":{"is_quick_play_multiplayer":true}}],"value":["--quickPlayMultiplayer","${quickPlayMultiplayer}"]}]}});
+        let config = Config {
+            server: "example.org".into(),
+            ..Config::default()
+        };
+        let args = game_arguments(&config, &meta).unwrap();
+        assert_eq!(
+            &args[..4],
+            [
+                "--username",
+                "${auth_player_name}",
+                "--tweakClass",
+                "example.Loader"
+            ]
+        );
+        assert!(args.iter().any(|arg| arg == "--quickPlayMultiplayer"));
+        assert!(!args.iter().any(|arg| arg == "--server"));
+        assert_eq!(args.iter().filter(|arg| *arg == "--width").count(), 1);
     }
     #[test]
     fn modern_quickplay_and_legacy_server_arguments_are_distinct() {

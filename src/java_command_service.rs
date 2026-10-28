@@ -76,18 +76,15 @@ impl JavaCommandPlan {
         }
         let mut ranges = vec![];
         let mut index = 0;
-        while index < jvm.len() {
-            if matches!(jvm[index].as_str(), "-cp" | "-classpath" | "--class-path")
-                && jvm.get(index + 1).is_some_and(|arg| arg == classpath)
+        for group in crate::jvm_argument_service::argument_groups(jvm) {
+            if matches!(group[0].as_str(), "-cp" | "-classpath" | "--class-path")
+                && group.get(1).is_some_and(|arg| arg == classpath)
             {
                 ranges.push(index..index + 2);
-                index += 2;
-            } else if jvm[index].strip_prefix("--class-path=") == Some(classpath) {
+            } else if group[0].strip_prefix("--class-path=") == Some(classpath) {
                 ranges.push(index..index + 1);
-                index += 1;
-            } else {
-                index += 1;
             }
+            index += group.len();
         }
         if ranges.is_empty() {
             bail!("Windows 启动命令过长，未发现可缩短的标准类路径参数。请缩短游戏目录或自定义 JVM 参数");
@@ -327,6 +324,47 @@ mod tests {
         assert!(plan.arguments()[1].starts_with('@'));
         drop(plan);
         assert!(!path.exists());
+    }
+    #[test]
+    fn long_command_keeps_classpath_lookalikes_inside_operands() {
+        let temp = crate::test_support::Workspace::new();
+        let cp = "C:\\library\\a.jar;".repeat(2300);
+        let args = vec![
+            "--module-path".into(),
+            "--class-path=marker".into(),
+            "-cp".into(),
+            cp.clone(),
+        ];
+        let plan = JavaCommandPlan::for_platform(
+            "windows",
+            Path::new("java"),
+            args,
+            4,
+            17,
+            &cp,
+            &temp.path,
+        )
+        .unwrap();
+        assert_eq!(
+            &plan.arguments()[..2],
+            ["--module-path", "--class-path=marker"]
+        );
+        assert!(plan.arguments()[2].starts_with('@'));
+        drop(plan);
+        let args = vec!["--module-path".into(), format!("--class-path={cp}")];
+        let error = JavaCommandPlan::for_platform(
+            "windows",
+            Path::new("java"),
+            args,
+            2,
+            17,
+            &cp,
+            &temp.path,
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("未发现可缩短"));
+        assert_eq!(fs::read_dir(&temp.path).unwrap().count(), 0);
     }
     #[test]
     fn direct_arguments_and_other_platforms_do_not_create_files() {

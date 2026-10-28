@@ -36,11 +36,36 @@ impl VersionProfileDecoder {
                 }
             }
         }
+        if let Some(java) = object.get("javaVersion") {
+            if let Some(major) = java.get("majorVersion") {
+                if !major.as_u64().is_some_and(|major| major > 0) {
+                    bail!("字段 javaVersion.majorVersion 必须为正整数");
+                }
+            }
+            if let Some(component) = java.get("component").filter(|value| !value.is_null()) {
+                let component = component
+                    .as_str()
+                    .filter(|component| !component.trim().is_empty())
+                    .context("字段 javaVersion.component 必须为非空字符串")?;
+                crate::metadata::valid_id(component)
+                    .context("字段 javaVersion.component 不是有效组件名称")?;
+            }
+        }
         if let Some(libraries) = optional(&mut object, "libraries") {
             let libraries = libraries.as_array().context("字段 libraries 必须为数组")?;
             for (index, library) in libraries.iter().enumerate() {
                 if !library.is_object() {
                     bail!("字段 libraries[{index}] 必须为对象");
+                }
+                if let Some(rules) = library.get("rules").filter(|value| !value.is_null()) {
+                    let rules = rules
+                        .as_array()
+                        .with_context(|| format!("字段 libraries[{index}].rules 必须为数组"))?;
+                    for (rule_index, rule) in rules.iter().enumerate() {
+                        validate_rule(rule).with_context(|| {
+                            format!("字段 libraries[{index}].rules[{rule_index}] 无效")
+                        })?;
+                    }
                 }
             }
         }
@@ -74,6 +99,11 @@ impl VersionProfileDecoder {
                                 if !rules.is_array() {
                                     bail!("字段 arguments.{kind}[{index}].rules 必须为数组");
                                 }
+                                for (rule_index, rule) in
+                                    rules.as_array().unwrap().iter().enumerate()
+                                {
+                                    validate_rule(rule).with_context(|| format!("字段 arguments.{kind}[{index}].rules[{rule_index}] 无效"))?;
+                                }
                             }
                             // HMCL's RuledArgument also accepts the plural
                             // spelling, with values taking precedence over value.
@@ -98,6 +128,30 @@ impl VersionProfileDecoder {
         }
         Ok(Value::Object(object))
     }
+}
+fn validate_rule(rule: &Value) -> Result<()> {
+    let rule = rule.as_object().context("规则必须为对象")?;
+    if !rule.get("action").is_some_and(Value::is_string) {
+        bail!("规则 action 必须为字符串");
+    }
+    if let Some(features) = rule.get("features").filter(|value| !value.is_null()) {
+        let features = features.as_object().context("规则 features 必须为对象")?;
+        if !features.values().all(Value::is_boolean) {
+            bail!("规则 features 的值必须为布尔值");
+        }
+    }
+    if let Some(os) = rule.get("os").filter(|value| !value.is_null()) {
+        let os = os.as_object().context("规则 os 必须为对象")?;
+        for field in ["name", "arch", "version"] {
+            if os
+                .get(field)
+                .is_some_and(|value| !value.is_null() && !value.is_string())
+            {
+                bail!("规则 os.{field} 必须为字符串");
+            }
+        }
+    }
+    Ok(())
 }
 fn optional<'a>(object: &'a mut Map<String, Value>, key: &str) -> Option<&'a mut Value> {
     if object.get(key).is_some_and(Value::is_null) {
@@ -125,6 +179,80 @@ mod tests {
             crate::metadata::arguments(&decoded["arguments"]["game"]),
             ["--alias", "literal", "--unconditional"]
         );
+    }
+    #[test]
+    fn library_rule_shapes_are_checked_even_for_other_platforms() {
+        for rules in [
+            json!("allow"),
+            json!([null]),
+            json!([{"action":"allow","os":{"name":"osx","version":10}}]),
+            json!([{"action":"allow","features":{"future":0}}]),
+        ] {
+            let error = VersionProfileDecoder
+                .decode(
+                    json!({"libraries":[{"name":"test:lib:1","rules":rules}]}),
+                    "broken-library",
+                )
+                .unwrap_err();
+            assert!(format!("{error:#}").contains("libraries[0].rules"));
+        }
+        for rules in [
+            Value::Null,
+            json!([]),
+            json!([{"action":"allow","os":{"name":"future-os"},"features":{"future":false}}]),
+        ] {
+            assert!(VersionProfileDecoder
+                .decode(
+                    json!({"libraries":[{"name":"test:lib:1","rules":rules}]}),
+                    "valid-library"
+                )
+                .is_ok());
+        }
+    }
+    #[test]
+    fn argument_rule_shapes_fail_with_precise_location() {
+        for rule in [
+            json!(false),
+            json!({"action":true}),
+            json!({"action":"allow","features":{"demo":"false"}}),
+            json!({"action":"allow","os":{"arch":64}}),
+        ] {
+            let error = VersionProfileDecoder
+                .decode(
+                    json!({"arguments":{"game":[{"rules":[rule],"value":"--example"}]}}),
+                    "broken-rules",
+                )
+                .unwrap_err();
+            assert!(format!("{error:#}").contains("arguments.game[0].rules[0]"));
+        }
+        assert!(VersionProfileDecoder.decode(json!({"arguments":{"game":[{"rules":[{"action":"allow","features":{"future_feature":true},"os":null}],"value":"--example"}]}}), "future").is_ok());
+    }
+    #[test]
+    fn java_requirements_validate_values_without_requiring_optional_fields() {
+        for major in [json!(0), json!(-1), json!("21"), json!(21.5), Value::Null] {
+            let error = VersionProfileDecoder
+                .decode(json!({"javaVersion":{"majorVersion":major}}), "broken-java")
+                .unwrap_err();
+            assert!(format!("{error:#}").contains("javaVersion.majorVersion"));
+        }
+        for component in [json!(""), json!("  "), json!("../runtime"), json!(21)] {
+            assert!(VersionProfileDecoder
+                .decode(
+                    json!({"javaVersion":{"component":component}}),
+                    "broken-java"
+                )
+                .is_err());
+        }
+        for java in [
+            json!({}),
+            json!({"component":null}),
+            json!({"component":"custom-runtime"}),
+            json!({"majorVersion":25}),
+        ] {
+            assert!(VersionProfileDecoder
+                .decode(json!({"javaVersion":java}), "valid-java")
+                .is_ok());
+        }
     }
     #[test]
     fn malformed_containers_fail_with_profile_and_field_context() {

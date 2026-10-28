@@ -99,9 +99,11 @@ mod quick_play_tests {
     }
 }
 pub fn list(config: &Config, id: &str) -> Result<Vec<String>> {
-    let saves = config.effective(id)?.instance_dir(id)?.join("saves");
-    if !saves.exists() {
-        return Ok(vec![]);
+    let saves = config.effective(id)?.instance_path(id)?.join("saves");
+    match fs::symlink_metadata(&saves) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(error) => return Err(error).context("无法读取存档目录"),
     }
     reject_link(&saves)?;
     let mut result = vec![];

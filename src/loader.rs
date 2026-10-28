@@ -50,30 +50,10 @@ impl Backend {
             .map_err(|_| anyhow::anyhow!("无效 API 地址"))?
             .extend(["versions", "loader", game]);
         let list = self.cached_metadata(list_url.as_str(), |bytes| {
-            let list: Value = serde_json::from_slice(bytes)?;
-            crate::loader_catalog::json_versions(list.clone())?;
-            Ok(list)
+            crate::loader_catalog::json_versions(serde_json::from_slice(bytes)?)
         })?;
-        let entries = list.as_array().context("加载器列表格式错误")?;
-        let chosen = if let Some(requested) = requested {
-            entries
-                .iter()
-                .find(|entry| entry["loader"]["version"] == requested)
-        } else {
-            entries
-                .iter()
-                .find(|entry| {
-                    let version = entry["loader"]["version"].as_str().unwrap_or("");
-                    entry["loader"]["stable"]
-                        .as_bool()
-                        .unwrap_or(!version.contains("beta") && !version.contains("alpha"))
-                })
-                .or_else(|| entries.first())
-        }
-        .context("该游戏版本没有可用的加载器版本")?;
-        let version = chosen["loader"]["version"]
-            .as_str()
-            .context("加载器缺少版本号")?;
+        let chosen = crate::loader_catalog::LoaderVersion::select(&list, requested)?;
+        let version = chosen.version.as_str();
         self.log(format!("{} {version} / Minecraft {game}", loader.name()));
         let mut profile_url = client;
         profile_url
@@ -226,13 +206,34 @@ mod tests {
     #[test]
     #[ignore = "requires official Fabric and Quilt services"]
     fn official_loader_profiles() {
-        let (tx, _) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::channel();
         let backend = Backend::new(tx).unwrap();
         for loader in [Loader::Fabric, Loader::Quilt] {
             let profile = backend.loader_profile(loader, "1.21.1", None).unwrap();
             assert_eq!(profile["inheritsFrom"], "1.21.1");
             for library in profile["libraries"].as_array().unwrap() {
                 crate::version::maven_path(library["name"].as_str().unwrap()).unwrap();
+                for os in ["windows", "linux", "osx"] {
+                    let resolver = crate::library_service::LibraryResolver::new(os, "64");
+                    for (entry, _) in resolver.resolve(library).unwrap() {
+                        crate::metadata::safe_path(
+                            std::path::Path::new("libraries"),
+                            entry["path"].as_str().unwrap(),
+                        )
+                        .unwrap();
+                        let url = reqwest::Url::parse(entry["url"].as_str().unwrap()).unwrap();
+                        assert_eq!(url.scheme(), "https");
+                        assert!(url.host_str().is_some());
+                    }
+                }
+            }
+        }
+        for message in rx.try_iter() {
+            if let crate::backend::Message::Log(line) = message {
+                assert!(
+                    !line.starts_with("无法获取有效实时元数据，使用已校验缓存"),
+                    "在线加载器验收发生缓存回退：{line}"
+                );
             }
         }
     }

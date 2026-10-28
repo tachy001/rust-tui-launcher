@@ -7,6 +7,7 @@ pub struct JavaRequirement {
     recommended: u64,
     maximum: Option<JavaCeiling>,
     profile: Option<Value>,
+    installed_optifine_games: Vec<String>,
 }
 struct JavaCeiling {
     major: u64,
@@ -45,6 +46,42 @@ impl JavaCeiling {
     }
 }
 impl JavaRequirement {
+    fn cleanroom_minimum(meta: &Value) -> Result<u64> {
+        let mut minimum = 0;
+        for library in meta["libraries"].as_array().into_iter().flatten() {
+            if !crate::metadata::allowed(library) {
+                continue;
+            }
+            let Some(name) = library["name"].as_str() else {
+                continue;
+            };
+            let (coordinate, extension) = name.split_once('@').unwrap_or((name, "jar"));
+            let parts: Vec<_> = coordinate.split(':').collect();
+            if extension != "jar"
+                || !(3..=4).contains(&parts.len())
+                || parts[0] != "com.cleanroommc"
+                || parts[1] != "cleanroom"
+            {
+                continue;
+            }
+            // HMCL GameJavaVersion strips the alpha suffix before the 0.5.0 boundary.
+            let version = parts[2].strip_suffix("-alpha").unwrap_or(parts[2]);
+            let numbers = version
+                .split('.')
+                .map(str::parse::<u64>)
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .context("无法识别 Cleanroom 版本的 Java 要求")?;
+            if numbers.len() != 3 || parts.iter().any(|part| part.is_empty()) {
+                bail!("无法识别 Cleanroom 版本的 Java 要求：{name}");
+            }
+            minimum = minimum.max(if numbers.as_slice() >= [0, 5, 0].as_slice() {
+                25
+            } else {
+                21
+            });
+        }
+        Ok(minimum)
+    }
     fn restrict(&mut self, ceiling: JavaCeiling) {
         if self
             .maximum
@@ -54,7 +91,10 @@ impl JavaRequirement {
             self.maximum = Some(ceiling);
         }
     }
-    fn forge_ceiling(meta: &Value) -> Result<Option<JavaCeiling>> {
+    fn forge_ceiling(
+        meta: &Value,
+        installed_optifine_games: &[String],
+    ) -> Result<Option<JavaCeiling>> {
         if !matches!(
             meta["mainClass"].as_str(),
             Some("cpw.mods.modlauncher.Launcher" | "cpw.mods.bootstraplauncher.BootstrapLauncher")
@@ -62,6 +102,7 @@ impl JavaRequirement {
             return Ok(None);
         }
         let mut found = None;
+        let mut game_version = None;
         for library in meta["libraries"].as_array().into_iter().flatten() {
             if !crate::metadata::allowed(library) {
                 continue;
@@ -83,17 +124,17 @@ impl JavaRequirement {
             {
                 continue;
             }
-            let text = match parts[2].split_once('-') {
+            let (text, game) = match parts[2].split_once('-') {
                 Some((game, forge))
                     if game.starts_with("1.")
                         && game.split('.').all(|part| {
                             !part.is_empty() && part.bytes().all(|c| c.is_ascii_digit())
                         }) =>
                 {
-                    forge
+                    (forge, Some(game))
                 }
                 Some(_) => continue,
-                None => parts[2],
+                None => (parts[2], None),
             };
             let Ok(numbers) = text
                 .split('.')
@@ -109,11 +150,50 @@ impl JavaRequirement {
                 bail!("当前平台包含互相冲突的 Forge 版本，请修复实例依赖");
             }
             found = Some(version);
+            if let Some(game) = game {
+                if game_version.is_some_and(|previous| previous != game) {
+                    bail!("当前平台 Forge 库指向不同 Minecraft 版本，请修复实例依赖");
+                }
+                game_version = Some(game);
+            }
         }
         let Some(version) = found else {
             return Ok(None);
         };
-        let ceiling = if ([34, 0, 0]..=[36, 2, 25]).contains(&version) {
+        let optifine = meta["libraries"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|library| {
+                crate::metadata::allowed(library)
+                    && library["name"].as_str().is_some_and(|name| {
+                        let parts: Vec<_> = name.split(':').collect();
+                        parts.len() == 3
+                            && parts[0] == "optifine"
+                            && parts[1] == "OptiFine"
+                            && !parts[2].is_empty()
+                    })
+            });
+        // PCL GetJavaRequirement: use the active Maven identity, never a renamed instance ID.
+        let ceiling = if game_version.is_some_and(|game| {
+            matches!(
+                game,
+                "1.13" | "1.13.1" | "1.13.2" | "1.14" | "1.14.1" | "1.14.2" | "1.14.3" | "1.14.4"
+            )
+        }) {
+            JavaCeiling::major(10, "Minecraft 1.13–1.14 Forge")
+        } else if game_version.is_some_and(|game| matches!(game, "1.15" | "1.15.1" | "1.15.2")) {
+            JavaCeiling::major(15, "Minecraft 1.15 Forge")
+        } else if (optifine
+            || game_version.is_some_and(|game| {
+                installed_optifine_games
+                    .iter()
+                    .any(|installed| installed == game)
+            }))
+            && game_version.is_some_and(|game| matches!(game, "1.18" | "1.18.1" | "1.18.2"))
+        {
+            JavaCeiling::major(18, "Minecraft 1.18 Forge + OptiFine")
+        } else if ([34, 0, 0]..=[36, 2, 25]).contains(&version) {
             JavaCeiling {
                 major: 8,
                 release: Some(crate::java_version::JavaVersion::parse("8u320")?),
@@ -137,8 +217,11 @@ impl JavaRequirement {
             return None;
         }
         let name = library["name"].as_str()?;
-        let parts: Vec<_> = name.split(':').collect();
-        if parts.len() != 3
+        let (coordinate, extension) = name.split_once('@').unwrap_or((name, "jar"));
+        let parts: Vec<_> = coordinate.split(':').collect();
+        if extension != "jar"
+            || !(3..=4).contains(&parts.len())
+            || parts.iter().any(|part| part.is_empty())
             || parts[0] != group
             || parts[1] != artifact
             || !parts[2]
@@ -156,27 +239,28 @@ impl JavaRequirement {
     pub fn from_metadata(meta: &Value) -> Result<Self> {
         // A host-only conflict must not discard a valid JVM target (e.g. Rosetta).
         // Unconditional malformed metadata / incompatible limits still fail here.
-        let mut requirement = match Self::from_profile(meta) {
+        let mut requirement = match Self::from_profile(meta, &[]) {
             Ok(requirement) => requirement,
             Err(host_error) => crate::java_architecture::JavaArchitecture::ALL
                 .into_iter()
                 .find_map(|arch| {
                     let profile = crate::launch_platform::LaunchPlatform::new(arch).profile(meta);
-                    Self::from_profile(&profile).ok()
+                    Self::from_profile(&profile, &[]).ok()
                 })
                 .ok_or(host_error)?,
         };
         requirement.profile = Some(meta.clone());
         Ok(requirement)
     }
-    fn from_profile(meta: &Value) -> Result<Self> {
+    fn from_profile(meta: &Value, installed_optifine_games: &[String]) -> Result<Self> {
         let recommended = match meta.pointer("/javaVersion/majorVersion") {
             None => 8,
             Some(value) => value
                 .as_u64()
                 .filter(|major| *major > 0)
                 .ok_or_else(|| anyhow::anyhow!("版本元数据中的 Java majorVersion 必须为正整数"))?,
-        };
+        }
+        .max(Self::cleanroom_minimum(meta)?);
         // HMCL's LAUNCH_WRAPPER constraint: old LaunchWrapper assumes URLClassLoader.
         // Inspect the launcher and library identity, not an instance's editable name.
         let legacy_wrapper = meta["mainClass"] == "net.minecraft.launchwrapper.Launch"
@@ -213,6 +297,7 @@ impl JavaRequirement {
             recommended,
             maximum: None,
             profile: None,
+            installed_optifine_games: installed_optifine_games.to_vec(),
         };
         if legacy_wrapper {
             requirement.restrict(JavaCeiling::major(8, "旧 LaunchWrapper"));
@@ -220,7 +305,7 @@ impl JavaRequirement {
         if old_fabric {
             requirement.restrict(JavaCeiling::major(24, "Fabric Loader 0.17.0 之前的版本"));
         }
-        if let Some(ceiling) = Self::forge_ceiling(meta)? {
+        if let Some(ceiling) = Self::forge_ceiling(meta, installed_optifine_games)? {
             requirement.restrict(ceiling);
         }
         if let Some(maximum) = &requirement.maximum {
@@ -233,11 +318,16 @@ impl JavaRequirement {
     pub fn recommended(&self) -> u64 {
         self.recommended
     }
+    pub(crate) fn with_installed_optifine(mut self, games: Vec<String>) -> Self {
+        self.installed_optifine_games = games;
+        self
+    }
     fn check_runtime(&self, runtime: &JavaRuntime) -> Result<()> {
         if let Some(profile) = &self.profile {
             let profile =
                 crate::launch_platform::LaunchPlatform::new(runtime.architecture).profile(profile);
-            return Self::from_profile(&profile)?.check_runtime(runtime);
+            return Self::from_profile(&profile, &self.installed_optifine_games)?
+                .check_runtime(runtime);
         }
         if runtime.major() < self.recommended {
             bail!(
@@ -289,6 +379,7 @@ impl JavaRequirement {
             recommended,
             maximum: None,
             profile: None,
+            installed_optifine_games: vec![],
         }
     }
 }
@@ -439,6 +530,72 @@ mod tests {
             version: crate::java_version::JavaVersion::parse(version).unwrap(),
             description: String::new(),
             architecture: crate::java_architecture::JavaArchitecture::X64,
+        }
+    }
+    #[test]
+    fn forge_optifine_ceiling_requires_both_active_components_and_matching_game() {
+        let mut profile = forge_profile("40.2.0", 17);
+        profile["libraries"][0]["name"] = "net.minecraftforge:forge:1.18.2-40.2.0:universal".into();
+        let installed = JavaRequirement::from_metadata(&profile)
+            .unwrap()
+            .with_installed_optifine(vec!["1.18.2".into()]);
+        assert!(installed.check(full_runtime("19")).is_err());
+        assert!(installed.check(full_runtime("18")).is_ok());
+        let unrelated = JavaRequirement::from_metadata(&profile)
+            .unwrap()
+            .with_installed_optifine(vec!["1.20.1".into()]);
+        assert!(unrelated.check(full_runtime("19")).is_ok());
+        assert!(JavaRequirement::from_metadata(&profile)
+            .unwrap()
+            .check(full_runtime("19"))
+            .is_ok());
+        profile["libraries"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"name":"optifine:OptiFine:1.18.2_HD_U_H9"}));
+        let requirement = JavaRequirement::from_metadata(&profile).unwrap();
+        assert!(requirement.check(full_runtime("18")).is_ok());
+        assert!(requirement.check(full_runtime("19")).is_err());
+        profile["libraries"][1]["rules"] = serde_json::json!([{"action":"disallow"}]);
+        assert!(JavaRequirement::from_metadata(&profile)
+            .unwrap()
+            .check(full_runtime("19"))
+            .is_ok());
+        profile["libraries"][1]
+            .as_object_mut()
+            .unwrap()
+            .remove("rules");
+        profile["mainClass"] = "net.minecraft.client.main.Main".into();
+        assert!(JavaRequirement::from_metadata(&profile)
+            .unwrap()
+            .check(full_runtime("19"))
+            .is_ok());
+    }
+    #[test]
+    fn historical_forge_ceiling_uses_active_coordinate_not_instance_name() {
+        for (game, build, allowed, rejected) in [
+            ("1.13.2", "25.0.223", "10", "11"),
+            ("1.14.4", "28.2.26", "10", "11"),
+            ("1.15.2", "31.2.57", "15", "16"),
+        ] {
+            let mut profile = forge_profile(build, 8);
+            profile["libraries"][0]["name"] =
+                format!("net.minecraftforge:forge:{game}-{build}:universal").into();
+            let requirement = JavaRequirement::from_metadata(&profile).unwrap();
+            assert!(requirement.check(full_runtime("8u451")).is_ok());
+            assert!(requirement.check(full_runtime(allowed)).is_ok());
+            assert!(requirement.check(full_runtime(rejected)).is_err());
+            profile["mainClass"] = "net.minecraft.client.main.Main".into();
+            assert!(JavaRequirement::from_metadata(&profile)
+                .unwrap()
+                .check(full_runtime("21"))
+                .is_ok());
+            profile["mainClass"] = "cpw.mods.modlauncher.Launcher".into();
+            profile["libraries"][0]["rules"] = serde_json::json!([{"action":"disallow"}]);
+            assert!(JavaRequirement::from_metadata(&profile)
+                .unwrap()
+                .check(full_runtime("21"))
+                .is_ok());
         }
     }
     #[test]
@@ -601,6 +758,154 @@ mod tests {
         installed: Option<u64>,
         calls: Cell<usize>,
     }
+    #[test]
+    fn installed_optifine_constraint_survives_runtime_install_and_fallback() {
+        let mut profile = forge_profile("40.2.0", 17);
+        profile["libraries"][0]["name"] = "net.minecraftforge:forge:1.18.2-40.2.0:universal".into();
+        let requirement = || {
+            JavaRequirement::from_metadata(&profile)
+                .unwrap()
+                .with_installed_optifine(vec!["1.18.2".into()])
+        };
+        for (local, installed, expected) in [
+            (Some(19), None, None),
+            (Some(18), None, Some(18)),
+            (None, Some(19), None),
+            (None, Some(17), Some(17)),
+        ] {
+            let source = Source {
+                local,
+                installed,
+                calls: Cell::new(0),
+            };
+            let result = JavaRuntimeService::new(&source).resolve(
+                &Config::default(),
+                "renamed",
+                requirement(),
+            );
+            match expected {
+                Some(major) => assert_eq!(result.unwrap().into_runtime().major(), major),
+                None => assert!(result.is_err()),
+            }
+            assert_eq!(source.calls.get(), 1);
+        }
+        let source = Source {
+            local: Some(19),
+            installed: Some(17),
+            calls: Cell::new(0),
+        };
+        let config = Config {
+            java: "manual-java".into(),
+            ..Config::default()
+        };
+        assert!(JavaRuntimeService::new(&source)
+            .resolve(&config, "renamed", requirement())
+            .is_err());
+        assert_eq!(source.calls.get(), 0);
+    }
+    #[test]
+    fn cleanroom_provisioning_uses_resolved_plan_and_never_falls_back_below_minimum() {
+        struct NoClient;
+        impl crate::game_java_service::ClientVersionSource for NoClient {
+            fn read(
+                &self,
+                _: &std::path::Path,
+                _: &crate::task::TaskControl,
+            ) -> Result<crate::game_java_service::ClientJavaInfo> {
+                panic!("explicit inherited requirement should not read client");
+            }
+        }
+        struct Provisioner {
+            local: u64,
+            installed: Option<u64>,
+            requested: Cell<Option<u64>>,
+        }
+        impl JavaRuntimeSource for Provisioner {
+            fn select(&self, _: &Config, _: &JavaRequirement) -> Result<JavaRuntime> {
+                Ok(runtime(self.local))
+            }
+            fn install(&self, _: &Config, instance: &str, major: u64) -> Result<JavaRuntime> {
+                assert_eq!(instance, "renamed-pack");
+                self.requested.set(Some(major));
+                self.installed
+                    .map(runtime)
+                    .context("fixture download failed")
+            }
+        }
+        for (loader, expected, component) in [
+            ("0.4.9", 21, "java-runtime-delta"),
+            ("0.5.0-alpha", 25, "java-runtime-epsilon"),
+        ] {
+            for (local, installed, success, warning) in [
+                (8, Some(expected), true, false),
+                (8, Some(8), false, false),
+                (8, None, false, false),
+                (expected + 1, None, true, true),
+            ] {
+                let resolved = crate::version::ResolvedVersion {
+                    meta: serde_json::json!({"javaVersion":{"majorVersion":8,"component":"jre-legacy"},
+                        "libraries":[{"name":format!("com.cleanroommc:cleanroom:{loader}")}]}),
+                    jar_id: "1.12.2".into(),
+                    chain: vec!["1.12.2".into(), "renamed-pack".into()],
+                };
+                let plan = crate::game_java_service::GameJavaResolver::new(&NoClient)
+                    .resolve(
+                        std::path::Path::new("unused"),
+                        &resolved,
+                        &crate::task::TaskControl::default(),
+                    )
+                    .unwrap();
+                assert!(plan.component.is_none());
+                assert_eq!(
+                    crate::java::component_for(plan.requirement.recommended()).unwrap(),
+                    component
+                );
+                let source = Provisioner {
+                    local,
+                    installed,
+                    requested: Cell::new(None),
+                };
+                let result = JavaRuntimeService::new(&source).resolve(
+                    &Config::default(),
+                    "renamed-pack",
+                    plan.requirement,
+                );
+                assert_eq!(source.requested.get(), Some(expected));
+                assert_eq!(result.is_ok(), success);
+                if let Ok(result) = result {
+                    assert_eq!(result.warning().is_some(), warning);
+                    assert_eq!(
+                        result.into_runtime().major(),
+                        if warning { local } else { expected }
+                    );
+                }
+            }
+        }
+    }
+    #[test]
+    fn cleanroom_minimum_filters_runtime_candidates_and_respects_library_rules() {
+        let profile = serde_json::json!({"libraries":[{"name":"com.cleanroommc:cleanroom:0.5.0-alpha:universal@jar"}]});
+        let requirement = JavaRequirement::from_metadata(&profile).unwrap();
+        assert!(requirement.check(runtime(21)).is_err());
+        assert_eq!(
+            requirement
+                .choose(vec![runtime(8), runtime(21), runtime(25)])
+                .unwrap()
+                .major(),
+            25
+        );
+        let mut excluded = profile.clone();
+        excluded["libraries"][0]["rules"] = serde_json::json!([{"action":"disallow"}]);
+        assert_eq!(
+            JavaRequirement::from_metadata(&excluded)
+                .unwrap()
+                .recommended(),
+            8
+        );
+        let mut malformed = profile;
+        malformed["libraries"][0]["name"] = "com.cleanroommc:cleanroom:invalid".into();
+        assert!(JavaRequirement::from_metadata(&malformed).is_err());
+    }
     fn runtime(major: u64) -> JavaRuntime {
         JavaRuntime {
             path: format!("java{major}").into(),
@@ -735,6 +1040,33 @@ mod tests {
             "libraries":[{"name":format!("net.minecraft:launchwrapper:{version}")}],
             "javaVersion":{"majorVersion":8}
         })
+    }
+    #[test]
+    fn loader_limits_recognize_classified_and_explicit_jar_coordinates() {
+        for suffix in ["@jar", ":client", ":client@jar"] {
+            for (mut profile, coordinate) in [
+                (wrapper("1.12"), "net.minecraft:launchwrapper:1.12"),
+                (fabric("0.16.14"), "net.fabricmc:fabric-loader:0.16.14"),
+            ] {
+                profile["libraries"][0]["name"] = format!("{coordinate}{suffix}").into();
+                assert!(JavaRequirement::from_metadata(&profile)
+                    .unwrap()
+                    .check(runtime(25))
+                    .is_err());
+                profile["libraries"][0]["rules"] = serde_json::json!([{"action":"disallow"}]);
+                assert!(JavaRequirement::from_metadata(&profile)
+                    .unwrap()
+                    .check(runtime(25))
+                    .is_ok());
+            }
+        }
+        for suffix in ["@pom", ":client@zip", ":", ":client:extra"] {
+            let profile = fabric(&format!("0.16.14{suffix}"));
+            assert!(JavaRequirement::from_metadata(&profile)
+                .unwrap()
+                .check(runtime(25))
+                .is_ok());
+        }
     }
     #[test]
     fn old_wrapper_cannot_fallback_to_new_java_or_silently_replace_explicit_java() {

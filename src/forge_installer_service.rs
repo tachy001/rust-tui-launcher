@@ -65,6 +65,9 @@ fn json_entry(
 fn validate_profile(profile: &Value, game: &str) -> Result<String> {
     let id = profile["id"].as_str().context("安装器缺少客户端版本 ID")?;
     valid_id(id)?;
+    crate::version_profile_service::VersionProfileDecoder
+        .decode(profile.clone(), id)
+        .context("Forge 安装包版本配置格式无效")?;
     if id == game {
         bail!("加载器实例 ID 不能覆盖原版父版本");
     }
@@ -402,16 +405,23 @@ impl<'a> InstallerArtifactService<'a> {
             entry["path"].as_str().context("内置库缺少目标路径")?,
         )?;
         let cached = || -> Result<bool> {
-            Ok(
-                crate::download::valid_file(&destination, Some(hash), Some(size))?
-                    && zip::ZipArchive::new(fs::File::open(&destination)?).is_ok(),
-            )
+            Ok(crate::download::valid_file_with_control(
+                &destination,
+                Some(hash),
+                Some(size),
+                self.control,
+            )? && zip::ZipArchive::new(fs::File::open(&destination)?).is_ok())
         };
         if cached()? {
             return Ok(());
         }
         let archive = self.source.prepare(root, &reference.source)?;
-        if !crate::download::valid_file(&archive, Some(&reference.source.sha1), None)? {
+        if !crate::download::valid_file_with_control(
+            &archive,
+            Some(&reference.source.sha1),
+            None,
+            self.control,
+        )? {
             bail!("内置库来源安装器校验失败");
         }
         let mut archive = crate::installer_archive::open(&archive, self.control)?;
@@ -496,6 +506,26 @@ mod tests {
         fn prepare(&self, _: &Path, _: &InstallerSource) -> Result<PathBuf> {
             self.calls.set(self.calls.get() + 1);
             Ok(self.path.clone())
+        }
+    }
+    #[test]
+    fn legacy_installer_rejects_malformed_launch_metadata() {
+        let workspace = crate::test_support::Workspace::new();
+        let path = workspace.path.join("installer.jar");
+        for (field, value) in [
+            ("minecraftArguments", json!(["--demo"])),
+            ("arguments", json!({"game":[false]})),
+            ("downloads", json!({"client":"invalid"})),
+            ("javaVersion", json!(21)),
+        ] {
+            let mut description = old();
+            description["versionInfo"][field] = value;
+            installer(&path, &description);
+            let error =
+                ForgeInstallerPlan::inspect(&path, GAME, Some(FULL), &TaskControl::default())
+                    .err()
+                    .unwrap();
+            assert!(format!("{error:#}").contains(field));
         }
     }
     #[test]

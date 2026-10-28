@@ -1,6 +1,10 @@
 use regex::Regex;
 use serde_json::Value;
-use std::{collections::HashMap, sync::OnceLock};
+use std::{
+    collections::HashMap,
+    process::{Command, Stdio},
+    sync::OnceLock,
+};
 
 pub(crate) trait OsVersionSource {
     fn version(&self) -> Option<&str>;
@@ -11,27 +15,111 @@ impl OsVersionSource for HostVersion {
         static VERSION: OnceLock<Option<String>> = OnceLock::new();
         VERSION
             .get_or_init(|| {
-                let output = if cfg!(windows) {
-                    std::process::Command::new("cmd")
-                        .args(["/C", "ver"])
-                        .output()
+                let mut command = if cfg!(windows) {
+                    let mut command = Command::new("cmd");
+                    // AutoRun may print unrelated version numbers or wait
+                    // for input before the built-in `ver` command executes.
+                    command.args(["/D", "/C", "ver"]);
+                    command
                 } else if cfg!(target_os = "macos") {
-                    std::process::Command::new("sw_vers")
-                        .arg("-productVersion")
-                        .output()
+                    let mut command = Command::new("sw_vers");
+                    command.arg("-productVersion");
+                    command
                 } else {
-                    std::process::Command::new("uname").arg("-r").output()
+                    let mut command = Command::new("uname");
+                    command.arg("-r");
+                    command
+                };
+                let output = VersionProbe {
+                    timeout: std::time::Duration::from_secs(5),
                 }
+                .run(&mut command)
                 .ok()?;
-                if !output.status.success() {
-                    return None;
-                }
-                Regex::new(r"\d+\.\d+(?:\.\d+)*")
-                    .ok()?
-                    .find(&String::from_utf8_lossy(&output.stdout))
-                    .map(|value| value.as_str().to_owned())
+                parse_host_version(&String::from_utf8_lossy(&output), cfg!(windows))
             })
             .as_deref()
+    }
+}
+
+struct VersionProbe {
+    timeout: std::time::Duration,
+}
+impl VersionProbe {
+    fn run(&self, command: &mut Command) -> anyhow::Result<Vec<u8>> {
+        use crate::process_service::{ManagedProcess, ProcessHandle};
+        use anyhow::{bail, Context};
+        use std::{
+            io::Read,
+            sync::mpsc,
+            thread,
+            time::{Duration, Instant},
+        };
+        const LIMIT: u64 = 4096;
+        let mut child = ManagedProcess::spawn(
+            command
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null()),
+        )?;
+        let stdout = child.take_stdout().context("系统版本探测没有输出管道")?;
+        let (sender, receiver) = mpsc::sync_channel(1);
+        // Read at most LIMIT + 1 bytes; never join a reader that may still be
+        // waiting on an inherited pipe after a process cleanup failure.
+        thread::Builder::new()
+            .name("os-version-output".into())
+            .spawn(move || {
+                let mut bytes = Vec::new();
+                let result = stdout
+                    .take(LIMIT + 1)
+                    .read_to_end(&mut bytes)
+                    .map(|_| bytes);
+                let _ = sender.send(result);
+            })?;
+        let started = Instant::now();
+        let result = (|| {
+            let mut output = None;
+            loop {
+                if output.is_none() {
+                    match receiver.try_recv() {
+                        Ok(bytes) => {
+                            let bytes = bytes.context("读取系统版本失败")?;
+                            if bytes.len() as u64 > LIMIT {
+                                bail!("系统版本探测输出过长");
+                            }
+                            output = Some(bytes);
+                        }
+                        Err(mpsc::TryRecvError::Empty) => {}
+                        Err(mpsc::TryRecvError::Disconnected) => bail!("系统版本读取线程意外退出"),
+                    }
+                }
+                if let Some(status) = child.poll()? {
+                    if !status.success() {
+                        bail!("系统版本探测失败：{status}");
+                    }
+                    if let Some(bytes) = output {
+                        return Ok(bytes);
+                    }
+                }
+                if started.elapsed() >= self.timeout {
+                    bail!("系统版本探测超时");
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        })();
+        child.terminate().context("系统版本探测进程清理失败")?;
+        result
+    }
+}
+
+fn parse_host_version(output: &str, windows: bool) -> Option<String> {
+    if windows {
+        Regex::new(r"\d+\.\d+(?:\.\d+)*")
+            .ok()?
+            .find(output)
+            .map(|value| value.as_str().to_owned())
+    } else {
+        let version = output.trim();
+        (!version.is_empty()).then(|| version.to_owned())
     }
 }
 
@@ -155,6 +243,77 @@ impl<'a> PlatformRuleEvaluator<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "subprocess fixture invoked by version_probe_bounds_output_and_lifetime"]
+    fn version_probe_child() {
+        match std::env::var("TUI_VERSION_PROBE_FIXTURE").unwrap().as_str() {
+            "hang" => std::thread::sleep(std::time::Duration::from_secs(30)),
+            "large" => println!("{}", "x".repeat(8192)),
+            "fail" => std::process::exit(23),
+            _ => println!("6.8.0-test-kernel"),
+        }
+    }
+    #[test]
+    fn version_probe_bounds_output_and_lifetime() {
+        for (mode, expected) in [
+            ("ok", ""),
+            ("large", "输出过长"),
+            ("fail", "探测失败"),
+            ("hang", "超时"),
+        ] {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "platform_rule_service::tests::version_probe_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("TUI_VERSION_PROBE_FIXTURE", mode);
+            let probe = VersionProbe {
+                timeout: std::time::Duration::from_secs(2),
+            };
+            let started = std::time::Instant::now();
+            let result = probe.run(&mut command);
+            if mode == "ok" {
+                assert!(String::from_utf8(result.unwrap())
+                    .unwrap()
+                    .contains("6.8.0-test-kernel"));
+            } else {
+                assert!(
+                    format!("{:#}", result.unwrap_err()).contains(expected),
+                    "{mode}"
+                );
+            }
+            assert!(started.elapsed() < std::time::Duration::from_secs(15));
+        }
+    }
+    #[test]
+    fn host_version_preserves_kernel_suffix_for_version_rules() {
+        let parsed = parse_host_version("6.8.0-52-generic\n", false).unwrap();
+        struct Parsed(String);
+        impl OsVersionSource for Parsed {
+            fn version(&self) -> Option<&str> {
+                Some(&self.0)
+            }
+        }
+        let source = Parsed(parsed);
+        let evaluator = PlatformRuleEvaluator::new("linux", "x86_64", &source);
+        assert!(evaluator.allowed(
+            &item(serde_json::json!({"version":"-generic$"})),
+            &HashMap::new()
+        ));
+        assert!(!evaluator.allowed(
+            &item(serde_json::json!({"version":"^6\\.8\\.0$"})),
+            &HashMap::new()
+        ));
+        assert_eq!(
+            parse_host_version("Microsoft Windows [Version 10.0.22631.1]\r\n", true).as_deref(),
+            Some("10.0.22631.1")
+        );
+        assert_eq!(parse_host_version("15.7\n", false).as_deref(), Some("15.7"));
+        assert!(parse_host_version(" \n", false).is_none());
+    }
     struct Version(Option<&'static str>);
     impl OsVersionSource for Version {
         fn version(&self) -> Option<&str> {

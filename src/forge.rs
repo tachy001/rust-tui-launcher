@@ -70,19 +70,9 @@ impl Backend {
                 version.to_owned()
             } else {
                 let metadata = self.maven_metadata(&format!("{base}/maven-metadata.xml"))?;
-                let re = regex::Regex::new(r"<version>([^<]+)</version>")?;
-                let mut versions = re
-                    .captures_iter(&metadata)
-                    .map(|c| c[1].to_owned())
-                    .filter(|v| v.starts_with(&prefix))
-                    .collect::<Vec<_>>();
-                versions.sort_by_key(|v| natural_key(v));
-                versions
-                    .iter()
-                    .rev()
-                    .find(|v| !v.contains("beta") && !v.contains("alpha"))
-                    .or_else(|| versions.last())
-                    .context("该游戏版本没有适用的 NeoForge")?
+                let versions = crate::loader_catalog::maven_versions(&metadata, &prefix)?;
+                crate::loader_catalog::LoaderVersion::select(&versions, None)?
+                    .version
                     .clone()
             };
             if !full.starts_with(&prefix) {
@@ -105,9 +95,19 @@ impl Backend {
         };
         let installer = source.cache_path(&root)?;
         let previous = cache.join(format!("{artifact}-{full}-installer.jar"));
-        if !installer.exists() && crate::download::valid_file(&previous, Some(&source.sha1), None)?
+        if !installer.exists()
+            && crate::download::valid_file_with_control(
+                &previous,
+                Some(&source.sha1),
+                None,
+                &self.control,
+            )?
         {
-            crate::storage::atomic_copy(&installer, &mut fs::File::open(previous)?)?;
+            crate::storage::atomic_copy_controlled(
+                &installer,
+                &mut fs::File::open(previous)?,
+                &self.control,
+            )?;
         }
         self.downloader().fetch(&Download {
             url: source.url.clone(),

@@ -31,6 +31,9 @@ pub(crate) struct ManagedProcess {
     resources: Option<Box<dyn Send>>,
 }
 impl ManagedProcess {
+    pub(crate) fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
+        self.child.stdout.take()
+    }
     pub(crate) fn spawn(command: &mut Command) -> Result<Self> {
         let (child, tree) = crate::process_tree_service::ProcessTree::spawn(command)?;
         Ok(Self {

@@ -1,5 +1,5 @@
 use crate::{
-    download::valid_file,
+    download::valid_file_with_control,
     metadata::{safe_path, valid_id},
     storage::atomic_copy_controlled,
     task::TaskControl,
@@ -61,10 +61,10 @@ pub fn reconstruct(
     // Validate the complete plan before writing any mapped paths.
     for (source, dest, hash, size) in plan {
         control.check()?;
-        if dest.is_file() && valid_file(&dest, Some(hash), size)? {
+        if dest.is_file() && valid_file_with_control(&dest, Some(hash), size, control)? {
             continue;
         }
-        if !source.is_file() || !valid_file(&source, Some(hash), size)? {
+        if !source.is_file() || !valid_file_with_control(&source, Some(hash), size, control)? {
             bail!("旧版资源缺失或损坏，请先修复实例：{}", source.display());
         }
         atomic_copy_controlled(&dest, &mut fs::File::open(&source)?, control)?;

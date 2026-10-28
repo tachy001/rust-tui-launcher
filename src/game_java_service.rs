@@ -27,17 +27,9 @@ impl ClientVersionSource for JarClientVersionSource {
             }
             Err(error) => return Err(error).context("无法读取客户端版本信息"),
         };
-        let mut archive = zip::ZipArchive::new(file).context("客户端 JAR 损坏，请先修复实例")?;
+        let mut archive = crate::installer_archive::open_file(file, control)
+            .with_context(|| format!("客户端 JAR 无效，请修复实例：{}", jar.display()))?;
         let mut info = ClientJavaInfo::default();
-        if archive
-            .file_names()
-            .filter(|name| *name == "version.json")
-            .take(2)
-            .count()
-            > 1
-        {
-            bail!("客户端包含重复 version.json，请修复实例");
-        }
         match archive.by_name("version.json") {
             Ok(mut entry) => {
                 const LIMIT: u64 = 1024 * 1024;
@@ -166,11 +158,23 @@ impl<'a> GameJavaResolver<'a> {
         }
         if meta.pointer("/javaVersion/majorVersion").is_some() {
             let requirement = JavaRequirement::from_metadata(meta)?;
-            check_component(component, requirement.recommended())?;
+            let declared = meta["javaVersion"]["majorVersion"]
+                .as_u64()
+                .context("无效的 Java 版本")?;
+            check_component(component, declared)?;
+            let raised = requirement.recommended() > declared;
             return Ok(GameJavaPlan {
                 requirement,
-                component: component.map(str::to_owned),
-                origin: "版本元数据",
+                component: if raised {
+                    None
+                } else {
+                    component.map(str::to_owned)
+                },
+                origin: if raised {
+                    "加载器 Java 要求"
+                } else {
+                    "版本元数据"
+                },
             });
         }
         let jar = root
@@ -213,10 +217,16 @@ impl<'a> GameJavaResolver<'a> {
             effective["javaVersion"] = serde_json::json!({});
         }
         effective["javaVersion"]["majorVersion"] = major.into();
+        let requirement = JavaRequirement::from_metadata(&effective)?;
+        let raised = requirement.recommended() > major;
         Ok(GameJavaPlan {
-            requirement: JavaRequirement::from_metadata(&effective)?,
-            component,
-            origin,
+            requirement,
+            component: if raised { None } else { component },
+            origin: if raised {
+                "加载器 Java 要求"
+            } else {
+                origin
+            },
         })
     }
 }
@@ -368,6 +378,39 @@ mod tests {
             &version(base, meta),
             &TaskControl::default(),
         )
+    }
+    #[test]
+    fn cleanroom_plans_replace_inherited_java_component_and_preserve_higher_requirements() {
+        let source = stub(ClientJavaInfo::default);
+        for (loader, expected) in [
+            ("0.4.9", 21),
+            ("0.5.0-alpha", 25),
+            ("0.5.0", 25),
+            ("1.0.0", 25),
+        ] {
+            for explicit in [false, true] {
+                let mut meta =
+                    json!({"libraries":[{"name":format!("com.cleanroommc:cleanroom:{loader}")}]});
+                if explicit {
+                    meta["javaVersion"] = json!({"majorVersion":8,"component":"jre-legacy"});
+                }
+                let plan = resolve(&source, "1.12.2", meta).unwrap();
+                assert_eq!(plan.requirement.recommended(), expected);
+                assert!(plan.component.is_none());
+                assert_eq!(plan.origin, "加载器 Java 要求");
+            }
+        }
+        let plan = resolve(
+            &source,
+            "1.12.2",
+            json!({
+                "libraries":[{"name":"com.cleanroommc:cleanroom:0.4.9"}],
+                "javaVersion":{"majorVersion":25,"component":"java-runtime-epsilon"}
+            }),
+        )
+        .unwrap();
+        assert_eq!(plan.requirement.recommended(), 25);
+        assert_eq!(plan.component.as_deref(), Some("java-runtime-epsilon"));
     }
     #[test]
     fn explicit_requirement_wins_without_accessing_client() {
@@ -657,6 +700,48 @@ mod tests {
             .unwrap();
         }
         zip.finish().unwrap();
+    }
+    #[test]
+    fn client_identity_rejects_hidden_duplicate_metadata_and_entry_points() {
+        let workspace = crate::test_support::Workspace::new();
+        let path = workspace.path.join("ambiguous-client.jar");
+        for (original, alias, first, second) in [
+            (
+                "version.json",
+                "versiom.json",
+                br#"{"java_version":17}"#.as_slice(),
+                br#"{"java_version":21}"#.as_slice(),
+            ),
+            (
+                "net/minecraft/client/main/Main.class",
+                "net/minecraft/client/main/Maim.class",
+                b"\xca\xfe\xba\xbe\0\0\0\x3d".as_slice(),
+                b"\xca\xfe\xba\xbe\0\0\0\x41".as_slice(),
+            ),
+        ] {
+            let mut archive = zip::ZipWriter::new(fs::File::create(&path).unwrap());
+            for (name, content) in [(original, first), (alias, second)] {
+                archive
+                    .start_file(name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                archive.write_all(content).unwrap();
+            }
+            archive.finish().unwrap();
+            let mut bytes = fs::read(&path).unwrap();
+            for offset in 0..=bytes.len() - alias.len() {
+                if &bytes[offset..offset + alias.len()] == alias.as_bytes() {
+                    bytes[offset..offset + alias.len()].copy_from_slice(original.as_bytes());
+                }
+            }
+            fs::write(&path, bytes).unwrap();
+            let error = JarClientVersionSource
+                .read(&path, &TaskControl::default())
+                .err()
+                .expect("ambiguous client must be rejected");
+            let message = format!("{error:#}");
+            assert!(message.contains("重复"), "{message}");
+            assert!(message.contains("ambiguous-client.jar"), "{message}");
+        }
     }
     #[test]
     fn real_zip_provider_reads_embedded_metadata_and_bytecode_header() {

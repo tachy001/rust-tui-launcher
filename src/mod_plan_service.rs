@@ -1,6 +1,6 @@
 use crate::{
     backend::Backend,
-    download::{valid_file, Download},
+    download::{valid_file_with_control, Download},
     metadata::{safe_path, valid_id},
     mod_dependency_service::ModPlanValidator,
     modrinth::{primary_file, ModVersion},
@@ -22,6 +22,17 @@ pub(crate) struct StagedModArtifacts<'a> {
     cache: PathBuf,
 }
 impl<'a> StagedModArtifacts<'a> {
+    pub(crate) fn download(&self, version: &ModVersion) -> Result<Download> {
+        valid_id(&version.id)?;
+        let file = primary_file(version)?;
+        Ok(Download {
+            url: file.url.clone(),
+            dest: safe_path(&self.cache.join(&version.id), &file.filename)?,
+            sha1: Some(file.hashes["sha1"].clone()),
+            size: Some(file.size),
+            alternatives: vec![],
+        })
+    }
     pub(crate) fn new(backend: &'a Backend, game_dir: &'a Path) -> Self {
         Self {
             backend,
@@ -38,19 +49,13 @@ impl ModArtifactSource for StagedModArtifacts<'_> {
         let hash = &file.hashes["sha1"];
         for name in [file.filename.clone(), format!("{}.disabled", file.filename)] {
             let path = safe_path(&self.game_dir.join("mods"), &name)?;
-            if valid_file(&path, Some(hash), Some(file.size))? {
+            if valid_file_with_control(&path, Some(hash), Some(file.size), &self.backend.control)? {
                 return Ok(path);
             }
         }
-        let destination = safe_path(&self.cache.join(&version.id), &file.filename)?;
-        self.backend.downloader().fetch(&Download {
-            url: file.url.clone(),
-            dest: destination.clone(),
-            sha1: Some(hash.clone()),
-            size: Some(file.size),
-            alternatives: vec![],
-        })?;
-        Ok(destination)
+        let download = self.download(version)?;
+        self.backend.downloader().fetch(&download)?;
+        Ok(download.dest)
     }
 }
 
@@ -325,6 +330,35 @@ mod tests {
             .unwrap()
             .unwrap()
             .contains("未安装"));
+    }
+    #[test]
+    fn persistent_candidate_cache_is_reused_by_batch_and_later_tasks() {
+        let workspace = crate::test_support::Workspace::new();
+        let (version, original) = fixture(
+            &workspace.path,
+            "candidate1",
+            "example",
+            json!({"id":"example","version":"1"}),
+        );
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let backend = Backend::new(tx).unwrap();
+        let source = StagedModArtifacts::new(&backend, &workspace.path);
+        let download = source.download(&version).unwrap();
+        fs::create_dir_all(download.dest.parent().unwrap()).unwrap();
+        fs::copy(&original, &download.dest).unwrap();
+        let cached = download.dest.clone();
+        // The fixture URL must never be requested; the batch path verifies the cache.
+        backend
+            .downloader()
+            .many(vec![download], 4, "cached candidates")
+            .unwrap();
+        let later_task = StagedModArtifacts::new(&backend, &workspace.path);
+        assert_eq!(later_task.artifact(&version).unwrap(), cached);
+        assert_eq!(fs::read(&cached).unwrap(), fs::read(original).unwrap());
+        let mut other_version = version.clone();
+        other_version.id = "candidate2".into();
+        assert_ne!(later_task.download(&other_version).unwrap().dest, cached);
+        assert!(!workspace.path.join("mods").exists());
     }
     #[test]
     fn verified_disabled_mod_is_reused_without_network_or_changing_its_state() {

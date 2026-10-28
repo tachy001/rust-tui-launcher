@@ -52,6 +52,7 @@ mod memory_service;
 mod minecraft_profile_service;
 #[macro_use]
 mod localization;
+mod installed_mod_service;
 mod local_mod_service;
 mod metadata;
 mod metadata_cache;

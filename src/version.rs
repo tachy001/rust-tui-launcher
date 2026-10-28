@@ -1,7 +1,7 @@
 use crate::metadata::{safe_path, valid_id};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
-use std::{collections::HashSet, fs, path::Path};
+use std::{collections::HashSet, fs, io::Read, path::Path};
 
 #[derive(Debug)]
 pub struct ResolvedVersion {
@@ -42,9 +42,25 @@ fn resolve_inner(
     let child: Value = if let Some((_, profile)) = candidate.filter(|(target, _)| *target == id) {
         profile.clone()
     } else {
-        serde_json::from_slice(
-            &fs::read(&path).with_context(|| format!("缺少版本 {id} 的元数据，请先安装父版本"))?,
-        )?
+        let file = fs::File::open(&path).with_context(|| {
+            format!(
+                "无法读取版本 {id} 元数据：{}；请检查实例或安装父版本",
+                path.display()
+            )
+        })?;
+        let limit = crate::metadata_cache::MAX_METADATA as u64;
+        if file.metadata()?.len() > limit {
+            bail!("版本 {id} 元数据超过 16 MiB 限制：{}", path.display());
+        }
+        let mut bytes = Vec::new();
+        file.take(limit + 1)
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("读取版本 {id} 元数据失败：{}", path.display()))?;
+        if bytes.len() as u64 > limit {
+            bail!("版本 {id} 元数据超过 16 MiB 限制：{}", path.display());
+        }
+        serde_json::from_slice(&bytes)
+            .with_context(|| format!("版本 {id} JSON 损坏：{}", path.display()))?
     };
     let child = crate::version_profile_service::VersionProfileDecoder.decode(child, id)?;
     let mut resolved = if let Some(parent) = child["inheritsFrom"].as_str() {
@@ -157,6 +173,71 @@ pub fn maven_path(name: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn profile_reads_are_bounded_and_errors_identify_the_inherited_file() {
+        let workspace = crate::test_support::Workspace::new();
+        let base = workspace.path.join("versions/base");
+        fs::create_dir_all(&base).unwrap();
+        let path = base.join("base.json");
+        fs::File::create(&path)
+            .unwrap()
+            .set_len(crate::metadata_cache::MAX_METADATA as u64 + 1)
+            .unwrap();
+        let child = json!({"inheritsFrom":"base"});
+        let error =
+            resolve_guarded(&workspace.path, "child", Some(&child), |_| Ok(())).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("16 MiB"));
+        assert!(message.contains("base.json"));
+        fs::write(&path, b"{").unwrap();
+        let error =
+            resolve_guarded(&workspace.path, "child", Some(&child), |_| Ok(())).unwrap_err();
+        assert!(format!("{error:#}").contains("base.json"));
+    }
+    #[test]
+    fn child_java_requirement_replaces_parent_component_before_runtime_planning() {
+        struct NoClientRead;
+        impl crate::game_java_service::ClientVersionSource for NoClientRead {
+            fn read(
+                &self,
+                _: &Path,
+                _: &crate::task::TaskControl,
+            ) -> Result<crate::game_java_service::ClientJavaInfo> {
+                panic!("explicit Java version must not need client fallback")
+            }
+        }
+        let workspace = crate::test_support::Workspace::new();
+        let base = workspace.path.join("versions/base");
+        fs::create_dir_all(&base).unwrap();
+        fs::write(
+            base.join("base.json"),
+            json!({"id":"base","javaVersion":{"majorVersion":8,"component":"jre-legacy"}})
+                .to_string(),
+        )
+        .unwrap();
+        for (child_java, major, component) in [
+            (json!({"majorVersion":21}), 21, None),
+            (
+                json!({"majorVersion":17,"component":"java-runtime-gamma"}),
+                17,
+                Some("java-runtime-gamma"),
+            ),
+            (Value::Null, 8, Some("jre-legacy")),
+        ] {
+            let child = json!({"inheritsFrom":"base","javaVersion":child_java});
+            let resolved =
+                resolve_guarded(&workspace.path, "child", Some(&child), |_| Ok(())).unwrap();
+            let plan = crate::game_java_service::GameJavaResolver::new(&NoClientRead)
+                .resolve(
+                    &workspace.path,
+                    &resolved,
+                    &crate::task::TaskControl::default(),
+                )
+                .unwrap();
+            assert_eq!(plan.requirement.recommended(), major);
+            assert_eq!(plan.component.as_deref(), component);
+        }
+    }
     #[test]
     fn nullable_child_metadata_keeps_parent_client_and_arguments() {
         let temp = crate::test_support::Workspace::new();
