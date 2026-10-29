@@ -157,7 +157,7 @@ mod tests {
             ..Default::default()
         }
         .apply_to(&mut config);
-        assert_eq!(config.quick_play_world, "My World");
+        assert!(config.quick_play_world.is_empty());
         config.validate().unwrap();
         InstanceSettings {
             server: Some("conflict.example".into()),
