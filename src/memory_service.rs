@@ -8,6 +8,12 @@ pub(crate) struct JvmMemory {
 }
 
 impl JvmMemory {
+    pub(crate) fn initial_argument(minimum_mb: u32, maximum_mb: u32) -> Option<String> {
+        (minimum_mb > 0 && minimum_mb <= maximum_mb).then(|| format!("-Xms{minimum_mb}M"))
+    }
+    pub(crate) fn maximum_bytes(&self) -> Option<u64> {
+        self.maximum
+    }
     pub(crate) fn from_arguments(arguments: &[String]) -> Result<Self> {
         let mut memory = Self {
             maximum: None,
@@ -68,6 +74,15 @@ impl JvmMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn initial_heap_is_optional_and_does_not_exceed_selected_maximum() {
+        assert_eq!(
+            JvmMemory::initial_argument(512, 2048),
+            Some("-Xms512M".into())
+        );
+        assert!(JvmMemory::initial_argument(0, 2048).is_none());
+        assert!(JvmMemory::initial_argument(2048, 512).is_none());
+    }
 
     fn parse(args: &[&str]) -> Result<JvmMemory> {
         JvmMemory::from_arguments(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>())
@@ -79,7 +94,7 @@ mod tests {
         assert_eq!(memory.maximum, Some(512 << 20));
         assert_eq!(memory.initial, None);
         let memory = parse(&["-Xmx512M", "-XX:MaxHeapSize=2g", "-Xms1024m"]).unwrap();
-        assert_eq!(memory.maximum, Some(2 << 30));
+        assert_eq!(memory.maximum_bytes(), Some(2 << 30));
         assert!(memory.warning(JavaArchitecture::X86).is_some());
         assert!(memory.warning(JavaArchitecture::Arm).is_some());
         assert!(memory.warning(JavaArchitecture::X64).is_none());

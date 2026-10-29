@@ -32,18 +32,7 @@ impl GameLanguage {
 
     pub(crate) fn for_version(&self, base: &str, meta: &Value) -> Option<String> {
         let preferred = self.0.as_deref()?;
-        let modern = language_format(base)
-            .or_else(|| meta["assets"].as_str().and_then(language_format))
-            .or_else(|| meta["assetIndex"]["id"].as_str().and_then(language_format))
-            .or_else(|| {
-                // The 2016 transition is resolved only with a known version/asset ID.
-                let year: u32 = meta["releaseTime"].as_str()?.get(..4)?.parse().ok()?;
-                match year {
-                    2012..=2015 => Some(Some(false)),
-                    2017.. => Some(Some(true)),
-                    _ => None,
-                }
-            })??;
+        let modern = Self::modern_format(base, meta)?;
         let before_classical_chinese = std::iter::once(base)
             .chain(meta["assets"].as_str())
             .chain(meta["assetIndex"]["id"].as_str())
@@ -67,6 +56,25 @@ impl GameLanguage {
             // Old language registries use region-qualified codes exclusively.
             None
         }
+    }
+
+    pub(crate) fn requires_legacy_resource_check(base: &str, meta: &Value) -> bool {
+        Self::modern_format(base, meta) == Some(false)
+    }
+
+    fn modern_format(base: &str, meta: &Value) -> Option<bool> {
+        language_format(base)
+            .or_else(|| meta["assets"].as_str().and_then(language_format))
+            .or_else(|| meta["assetIndex"]["id"].as_str().and_then(language_format))
+            .or_else(|| {
+                // The 2016 transition is resolved only with a known version/asset ID.
+                let year: u32 = meta["releaseTime"].as_str()?.get(..4)?.parse().ok()?;
+                match year {
+                    2012..=2015 => Some(Some(false)),
+                    2017.. => Some(Some(true)),
+                    _ => None,
+                }
+            })?
     }
 
     pub(crate) fn enabled(&self) -> bool {
@@ -195,6 +203,29 @@ impl GameOptionsService {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn numeric_region_language_still_requires_legacy_resource_validation() {
+        let language = GameLanguage::parse("es_419").unwrap();
+        for version in ["1.5.2", "1.10.2", "1.11", "1.21.1"] {
+            assert_eq!(
+                language.for_version(version, &json!({})).as_deref(),
+                Some("es_419")
+            );
+            assert_eq!(
+                GameLanguage::requires_legacy_resource_check(version, &json!({})),
+                matches!(version, "1.5.2" | "1.10.2")
+            );
+        }
+        assert!(GameLanguage::requires_legacy_resource_check(
+            "renamed",
+            &json!({"assets":"1.5"})
+        ));
+        assert!(!GameLanguage::requires_legacy_resource_check(
+            "unknown",
+            &json!({})
+        ));
+    }
 
     #[test]
     fn respects_legacy_modern_and_unsupported_versions() {

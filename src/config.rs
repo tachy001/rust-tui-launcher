@@ -5,6 +5,10 @@ use std::{collections::HashMap, fs, path::PathBuf};
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct InstanceSettings {
+    pub min_memory_mb: Option<u32>,
+    pub auto_memory: Option<bool>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
     pub java: Option<String>,
     pub memory_mb: Option<u32>,
     pub isolated: Option<bool>,
@@ -69,6 +73,23 @@ mod tests {
         assert_eq!(config.language, "auto");
         assert_eq!(config.game_language, "launcher");
         assert!(config.patch_natives);
+    }
+    #[test]
+    fn instance_window_dimensions_inherit_independently_and_validate() {
+        let mut config = Config::default();
+        let mut settings: InstanceSettings = serde_json::from_str("{}").unwrap();
+        assert!(settings.width.is_none() && settings.height.is_none());
+        settings.width = Some(1280);
+        let restored: InstanceSettings =
+            serde_json::from_slice(&serde_json::to_vec(&settings).unwrap()).unwrap();
+        let mut effective = config.clone();
+        restored.apply_to(&mut effective);
+        assert_eq!((effective.width, effective.height), (1280, config.height));
+        config.instances.insert("test".into(), restored);
+        config.validate().unwrap();
+        config.instances.get_mut("test").unwrap().height = Some(0);
+        assert!(config.validate().is_err());
+        assert_eq!((config.width, config.height), (960, 540));
     }
     #[test]
     fn instance_overrides_do_not_modify_global_settings() {
@@ -150,6 +171,32 @@ mod tests {
     }
 
     #[test]
+    fn quick_play_conflicts_are_rejected_before_saving_global_or_instance_settings() {
+        let mut config = Config {
+            server: "example.org".into(),
+            quick_play_world: "World".into(),
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+        config.quick_play_world.clear();
+        config.validate().unwrap();
+        config.instances.insert(
+            "test".into(),
+            InstanceSettings {
+                quick_play_world: Some("World".into()),
+                ..Default::default()
+            },
+        );
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("实例 test"));
+        config.instances.get_mut("test").unwrap().server = Some(String::new());
+        config.validate().unwrap();
+        assert_eq!(config.server, "example.org");
+    }
+    #[test]
     fn language_settings_inherit_and_validate_without_changing_global() {
         let mut config = Config::default();
         config.instances.insert(
@@ -174,6 +221,8 @@ mod tests {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    pub min_memory_mb: u32,
+    pub auto_memory: bool,
     pub game_dir: PathBuf,
     pub java: String,
     pub username: String,
@@ -201,6 +250,8 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            min_memory_mb: 0,
+            auto_memory: false,
             game_dir: PathBuf::from(".minecraft"),
             java: "auto".into(),
             username: "Player".into(),
@@ -262,10 +313,7 @@ impl Config {
     fn validate_values(&self) -> Result<()> {
         crate::localization::UiLanguage::parse(&self.language)?;
         crate::language_service::GameLanguage::parse(&self.game_language)?;
-        crate::launch_options::server_address(&self.server)?;
-        if !self.quick_play_world.is_empty() {
-            crate::metadata::valid_id(&self.quick_play_world)?;
-        }
+        crate::launch_options::QuickPlayTarget::from_config(self)?;
         crate::sources::validate(&self.download_source)?;
         if self.username.is_empty()
             || self.username.len() > 16
@@ -278,6 +326,9 @@ impl Config {
         }
         if !(512..=65536).contains(&self.memory_mb) {
             bail!("内存应为 512–65536 MB");
+        }
+        if self.min_memory_mb > 65536 {
+            bail!("最小内存应为 0–65536 MB，0 表示由 Java 决定");
         }
         if self.java.trim().is_empty() || self.game_dir.as_os_str().is_empty() {
             bail!("Java 和游戏目录不能为空");

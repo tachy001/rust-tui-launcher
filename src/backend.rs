@@ -546,7 +546,24 @@ impl Backend {
         if let Some(logging) = &logging {
             values.insert("logging_config_path", logging.path().display().to_string());
         }
-        let mut args = vec![format!("-Xmx{}M", config.memory_mb)];
+        let allocation = crate::memory_allocation_service::MemoryAllocationService::new(
+            &crate::memory_allocation_service::SystemMemory,
+        )
+        .resolve(config.auto_memory, config.memory_mb, runtime.architecture);
+        let memory_mb = allocation.megabytes;
+        if let Some(warning) = allocation.warning {
+            self.log(warning);
+        } else if config.auto_memory {
+            self.log(format!("自动内存建议：{memory_mb} MiB"));
+        }
+        let mut args = vec![format!("-Xmx{memory_mb}M")];
+        if let Some(initial) =
+            crate::memory_service::JvmMemory::initial_argument(config.min_memory_mb, memory_mb)
+        {
+            args.push(initial);
+        } else if config.min_memory_mb > memory_mb {
+            self.log("最小内存超过本次最大堆，已由 Java 决定初始堆大小");
+        }
         if native_plan.lwjgl_changed {
             // This property is read only by Sodium; keep it before user arguments
             // so an explicit user choice still takes precedence.
@@ -599,6 +616,13 @@ impl Backend {
             self.log(warning);
         }
         let memory = crate::memory_service::JvmMemory::from_arguments(&compatible.arguments)?;
+        if let Some(maximum) = memory.maximum_bytes() {
+            if config.auto_memory && maximum != u64::from(memory_mb) * 1024 * 1024 {
+                self.log(format!("JVM 参数覆盖内存建议，最终最大堆：{maximum} 字节"));
+            } else {
+                self.log(format!("最终 JVM 最大堆：{maximum} 字节"));
+            }
+        }
         if let Some(warning) = memory.warning(runtime.architecture) {
             self.log(warning);
         }
@@ -633,8 +657,10 @@ impl Backend {
                 language.for_version(resolved.chain.first().context("版本链为空")?, meta)
             {
                 let options = crate::language_service::GameOptionsService;
-                if code != code.to_lowercase()
-                    && !options.legacy_language_available(&jar, &index, &code)?
+                if crate::language_service::GameLanguage::requires_legacy_resource_check(
+                    resolved.chain.first().context("版本链为空")?,
+                    meta,
+                ) && !options.legacy_language_available(&jar, &index, &code)?
                 {
                     self.log(format!(
                         "旧版游戏不含语言 {code}，保留原语言，避免旧版语言加载崩溃"

@@ -1,8 +1,30 @@
 # 后端源码对照记录
 
+2026-10-29 macOS 内存统计另核对 Apple [XNU vm_statistics.h](https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/mach/vm_statistics.h)：free_count 包含 speculative_count。实现改用本地 libc 0.2.191 的 host_statistics64 绑定及 sysconf 页大小，以 free+inactive 估算可用内存，不再调用 vm_stat。目标平台分支尚待 macOS 编译和实机验证。
+
+## 自动内存源码核对（2026-10-29）
+
+后续接入状态：已新增 MemoryAllocationService 和分平台探测提供者，在 Java 选择后生成建议值；手动模式不探测，失败回退配置值并提示。Windows 系统接口实测通过，Linux/macOS 仅文本解析样本验证。另参照 HMCL `GameSettings.minMemoryProperty` 与 `DefaultLauncher` 的 Xms 条件接入可继承初始堆：未设置或超出最大堆时不生成默认 Xms。下方“尚未接入”段落记录的是最初核对时状态，以此更新为准。
+
+本地 HMCL `HMCLGameInstance` 在构建启动参数时读取 `SystemInfo.getPhysicalMemoryStatus().available()`，交给 `HMCLGameRepository.getAutoAllocatedMemory`：先保留 512 MiB；剩余不超过 8 GiB 时使用 80%，超过部分使用 20%，建议上限 16 GiB；32 位 Java 的普通计算分支上限 768 MiB。可用量不大于保留量时源码直接返回可用量，需要单独测试这个边界，不能按总物理内存计算。
+
+本地 PCL `PageSetupLaunch.GetRam` 另有按可安装 Mod/OptiFine/普通版本区分的需求阈值，Mod 阈值随目录中的 jar/zip/litemod 数量调整，并按阶段分配可用内存。这不是 HMCL 算法的同义实现。
+
+本项目当前 `Backend` 仍以 `config.memory_mb` 直接生成 `-Xmx`。自动模式尚未接入；实现须分离可用内存系统探测与纯分配策略，在选定 Java 后使用其实际架构，明确探测失败回退与手动参数优先级，并覆盖三平台及低内存边界。不能仅增加 UI 开关就声明支持。
+
+2026-10-28 设置界面：阅读 PCL `Pages/PageSetup/PageSetupLeft.xaml`、`PageSetupLaunch.xaml` 与 HMCL `ui/main/SettingsPage.java`、`DownloadSettingsPage.java`，按启动、下载、显示语言和高级职责组织现有设置。分类名称按 TUI 已实现能力调整，并非逐项复制上游全部选项；新增存档快捷启动和本地库修补入口对应本项目已有后端。
+
+2026-10-28 Forge 安装顺序：本地 HMCL `HMCLCore/src/main/java/org/jackhuang/hmcl/download/forge/ForgeInstallTask.java` 的 `execute` 先调用 `detectForgeInstallerType` 读取安装描述并核对游戏版本，再建立 `GameDownloadTask`。Rust 复用已有 `ForgeInstallerPlan::inspect`，将它移动到原版安装前，提前发现包内容错误；没有照搬上游任务结构。
+
+2026-10-28 特殊快照补充：PCL `ModDownload.vb::DlNeoForgeListEntry` 对 `0.` 开头坐标从第二段读取游戏 ID，最后一段数字用于构建排序（源码示例 `0.25w14craftmine.3-beta`）。Rust 已补齐周编号/特殊快照的精确前缀查询，保留数字构建排序，并验证同名前缀隔离和无构建结果；真实安装运行仍未验收。
+
 参考的是工作区 `../references/HMCL-main` 与 `../references/PCL-main` 的本地快照；下方上游链接便于定位，不代表已核对上游最新提交。规则按 Rust 服务职责独立实现，未直接移植 Java / VB 源码。
 
 ## Java 运行时兼容范围
+
+2026-10-28 加载器目录补充：本地 PCL `ModDownload.vb::DlNeoForgeListEntry` 对年份编号使用坐标前三个数字恢复 Minecraft 年份/次版本/补丁，并去除游戏末尾 `.0`；`+` 后内容附加为游戏快照后缀。Rust 的正式版查询据此区分 `26.1.0.` 与 `26.1.1.`，并排除属于其他游戏快照的构建；已接入年份编号 `-snapshot-N` 查询与精确后缀匹配；旧周编号快照及实际快照安装运行仍未验收。PCL 用 `ContainsIgnoreCase` 识别 alpha/beta，本项目同步大小写处理并保留已有 snapshot 排除。
+
+本地 HMCL Fabric/Quilt `LoaderInfo.stable` 为布尔字段。Rust 目录与安装入口现统一消费类型化版本记录，遵循显式布尔值；缺省值推断和冲突记录拒绝是本项目策略，不宣称来自上游。2026-10-28 使用既有官方缓存复核：Fabric 255 项、Quilt 307 项均通过，默认选择分别为 0.20.1、0.24.0；这些是缓存内容，不代表线上最新状态。
 
 2026-10-26 补充：复读 HMCLCore `JavaVersionConstraint.LAUNCH_WRAPPER` 按 artifactId/version 判断的逻辑，以及 PCL `ModJava.GetJavaRequirement` 的 Fabric 0.17.0 分界。Rust 原有版本边界保持不变，补齐 Maven 分类器和显式 @jar 的身份识别，避免相同加载器因坐标表示不同漏掉限制；非 JAR 与被平台规则禁用的依赖不参与。此实现选择与边界测试不等于这些归档的实际加载验收。
 

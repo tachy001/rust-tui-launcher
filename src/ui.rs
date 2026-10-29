@@ -61,15 +61,29 @@ const INSTANCE_MENU: [&str; 13] = [
     "导出整合包",
     "移入回收站",
 ];
-const SETTINGS_MENU: [&str; 6] = [
-    "全局游戏与下载设置",
-    "检测本机 Java",
-    "回收站",
+const SETTINGS_MENU: [&str; 12] = [
+    "全局游戏设置",
+    "Java 管理",
+    "通用",
+    "外观与界面语言",
+    "下载",
+    "高级与兼容性",
     "任务日志",
+    "回收站",
     "导入整合包",
     "CurseForge API 密钥",
+    "全部设置",
+    "帮助",
 ];
-const SETTINGS: [&str; 17] = [
+const SETTING_GROUPS: [&[usize]; 6] = [
+    &[19, 2, 4, 8, 9, 13, 14, 15, 17],
+    &[1],
+    &[0, 3, 10],
+    &[16],
+    &[7, 11, 12],
+    &[20, 5, 6, 18],
+];
+const SETTINGS: [&str; 21] = [
     "离线用户名",
     "Java 路径（auto 自动匹配）",
     "最大内存 / MB",
@@ -87,6 +101,10 @@ const SETTINGS: [&str; 17] = [
     "直连服务器（留空进入菜单）",
     "游戏语言（launcher 跟随 / zh_cn / en_us / keep 保持）",
     "界面语言 / UI language（zh_cn / en_us）",
+    "快速进入存档（目录名，留空关闭）",
+    "本地库兼容修补（true / false）",
+    "自动分配内存（false 使用最大内存设置）",
+    "最小内存 / MB（0 由 Java 决定）",
 ];
 #[derive(Clone, Copy, PartialEq)]
 enum WorkKind {
@@ -152,6 +170,7 @@ struct App {
     rx: Receiver<Message>,
     editor: Option<Editor>,
     setting: usize,
+    setting_group: Option<usize>,
     scope: Option<String>,
     mod_instance: Option<String>,
     mod_list: Vec<ModEntry>,
@@ -215,6 +234,7 @@ impl App {
             rx,
             editor: None,
             setting: 0,
+            setting_group: None,
             scope: None,
             mod_instance,
             mod_list: vec![],
@@ -293,7 +313,7 @@ impl App {
         match self.tab {
             0 => self.local_visible().len(),
             1 => self.remote_visible().len(),
-            2 => SETTINGS.len(),
+            2 => self.setting_indices().len(),
             3 => {
                 if let Some((_, versions)) = &self.mod_versions {
                     versions.len()
@@ -416,6 +436,20 @@ impl App {
             }
             2 => {
                 if self.task.is_none() {
+                    if self.scope.is_some() && global_only_setting(self.setting) {
+                        self.log(tr("此项为全局设置，按 G 切换到全局后修改"));
+                        return;
+                    }
+                    if matches!(self.setting, 4 | 12 | 13 | 18 | 19) {
+                        let result =
+                            parse_bool(&self.setting_value(self.setting)).and_then(|current| {
+                                self.save_setting(if current { "false" } else { "true" })
+                            });
+                        if let Err(error) = result {
+                            self.log(format!("{error:#}"));
+                        }
+                        return;
+                    }
                     if self.setting == 16 {
                         if self.scope.is_some() {
                             self.log(tr("此项为全局设置，按 G 切换到全局后修改"));
@@ -501,6 +535,9 @@ impl App {
         }
     }
     fn open_page(&mut self, page: usize) {
+        if page == 2 {
+            self.setting_group = None;
+        }
         self.nav_focused = false;
         if self.tab < 2 {
             self.list_queries[self.tab] = self.query.clone();
@@ -555,32 +592,37 @@ impl App {
     }
     fn menu_action(&mut self) {
         let parent = (self.tab, self.selection);
-        if self.task.is_some() && !(self.tab == 8 && matches!(self.selection, 2 | 3)) {
+        if self.task.is_some() && !(self.tab == 8 && matches!(self.selection, 6 | 7 | 11)) {
             self.task_popup = true;
             return;
         }
         if self.tab == 8 {
             match self.selection {
-                0 => {
+                10 => {
                     self.scope = None;
                     self.open_page(2);
                 }
-                1 => {
-                    self.key(event::KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
-                }
-                2 => self.open_page(5),
-                3 => self.open_page(6),
-                4 => {
+                7 => self.open_page(5),
+                6 => self.open_page(6),
+                11 => self.help = true,
+                8 => {
                     self.editor = Some(Editor {
                         kind: EditKind::ImportPack,
                         text: String::new(),
                     })
                 }
-                5 => {
+                9 => {
                     self.editor = Some(Editor {
                         kind: EditKind::CurseKey,
                         text: String::new(),
                     })
+                }
+                0..=5 => {
+                    let group = self.selection;
+                    self.scope = None;
+                    self.open_page(2);
+                    self.setting_group = Some(group);
+                    self.setting = SETTING_GROUPS[group][0];
                 }
                 _ => {}
             }
@@ -765,6 +807,17 @@ impl App {
             }
         }
     }
+    fn setting_indices(&self) -> Vec<usize> {
+        self.setting_group
+            .map(|group| SETTING_GROUPS[group].to_vec())
+            .unwrap_or_else(|| (0..SETTINGS.len()).collect())
+    }
+    fn setting_position(&self) -> usize {
+        self.setting_indices()
+            .iter()
+            .position(|index| *index == self.setting)
+            .unwrap_or(0)
+    }
     fn setting_value(&self, index: usize) -> String {
         let c = match self
             .scope
@@ -792,7 +845,12 @@ impl App {
             13 => c.fullscreen.to_string(),
             14 => c.server,
             15 => c.game_language,
-            _ => c.language,
+            16 => c.language,
+            17 => c.quick_play_world,
+            18 => c.patch_natives.to_string(),
+            19 => c.auto_memory.to_string(),
+            20 => c.min_memory_mb.to_string(),
+            _ => String::new(),
         }
     }
     fn save_setting(&mut self, value: &str) -> Result<()> {
@@ -805,9 +863,15 @@ impl App {
                 4 => instance.isolated = Some(parse_bool(value)?),
                 5 => instance.jvm_args = Some(value.into()),
                 6 => instance.game_args = Some(value.into()),
+                8 => instance.width = Some(value.parse().context("宽度必须为整数")?),
+                9 => instance.height = Some(value.parse().context("高度必须为整数")?),
                 13 => instance.fullscreen = Some(parse_bool(value)?),
                 14 => instance.server = Some(value.trim().into()),
                 15 => instance.game_language = Some(value.trim().into()),
+                17 => instance.quick_play_world = Some(value.trim().into()),
+                18 => instance.patch_natives = Some(parse_bool(value)?),
+                19 => instance.auto_memory = Some(parse_bool(value)?),
+                20 => instance.min_memory_mb = Some(value.parse().context("内存必须为整数 MB")?),
                 _ => bail!("此项为全局设置，按 G 切换到全局后修改"),
             }
         } else {
@@ -828,7 +892,12 @@ impl App {
                 13 => candidate.fullscreen = parse_bool(value)?,
                 14 => candidate.server = value.trim().into(),
                 15 => candidate.game_language = value.trim().into(),
-                _ => candidate.language = value.trim().into(),
+                16 => candidate.language = value.trim().into(),
+                17 => candidate.quick_play_world = value.trim().into(),
+                18 => candidate.patch_natives = parse_bool(value)?,
+                19 => candidate.auto_memory = parse_bool(value)?,
+                20 => candidate.min_memory_mb = value.parse().context("内存必须为整数 MB")?,
+                _ => bail!("无效设置项"),
             }
         }
         if let Some(id) = &self.scope {
@@ -1432,7 +1501,8 @@ impl App {
                 if self.tab == 6 {
                     self.log_scroll = self.log_scroll.saturating_sub(1);
                 } else if self.tab == 2 {
-                    self.setting = (self.setting + 1) % SETTINGS.len();
+                    let indices = self.setting_indices();
+                    self.setting = indices[(self.setting_position() + 1) % indices.len()];
                 } else if self.count() > 0 {
                     self.selection = (self.selection + 1) % self.count();
                 }
@@ -1444,7 +1514,9 @@ impl App {
                         .saturating_add(1)
                         .min(self.logs.len().saturating_sub(self.log_view_height.get()));
                 } else if self.tab == 2 {
-                    self.setting = (self.setting + SETTINGS.len() - 1) % SETTINGS.len();
+                    let indices = self.setting_indices();
+                    self.setting =
+                        indices[(self.setting_position() + indices.len() - 1) % indices.len()];
                 } else if self.count() > 0 {
                     self.selection = (self.selection + self.count() - 1) % self.count();
                 }
@@ -1464,6 +1536,17 @@ impl App {
             KeyCode::End if self.tab == 6 => self.log_scroll = 0,
             KeyCode::Home | KeyCode::End | KeyCode::PageUp | KeyCode::PageDown => {
                 let last = self.count().saturating_sub(1);
+                if self.tab == 2 {
+                    let position = self.setting_position();
+                    let next = match key.code {
+                        KeyCode::Home => 0,
+                        KeyCode::End => last,
+                        KeyCode::PageUp => position.saturating_sub(10),
+                        _ => position.saturating_add(10).min(last),
+                    };
+                    self.setting = self.setting_indices()[next];
+                    return false;
+                }
                 let selected = if self.tab == 2 {
                     &mut self.setting
                 } else {
@@ -1675,6 +1758,7 @@ impl App {
                 if let Some(id) = self.selected() {
                     self.scope = Some(id);
                     self.tab = 2;
+                    self.setting_group = None;
                     self.setting = 1;
                 }
             }
@@ -1777,6 +1861,9 @@ impl App {
         }
         false
     }
+}
+fn global_only_setting(index: usize) -> bool {
+    matches!(index, 0 | 3 | 7 | 10 | 11 | 12 | 16)
 }
 fn parse_bool(value: &str) -> Result<bool> {
     match value.trim() {
@@ -2198,13 +2285,26 @@ fn draw(f: &mut Frame, app: &App) {
             );
         }
         2 => {
-            let items = SETTINGS
-                .iter()
-                .enumerate()
-                .map(|(i, label)| {
+            let items = app
+                .setting_indices()
+                .into_iter()
+                .map(|i| {
+                    let label = SETTINGS[i];
+                    let global_only = app.scope.is_some() && global_only_setting(i);
                     ListItem::new(vec![
-                        Line::from(Span::styled(tr(label), Style::default().fg(MUTED))),
-                        Line::from(format!("  {}", app.setting_value(i))),
+                        Line::from(Span::styled(
+                            if global_only {
+                                format!("{} · {}", tr(label), tr("仅全局"))
+                            } else {
+                                tr(label).to_owned()
+                            },
+                            Style::default().fg(MUTED),
+                        )),
+                        Line::from(if !global_only && matches!(i, 4 | 12 | 13 | 18 | 19) {
+                            format!("  {}  · {}", app.setting_value(i), tr("Enter 切换"))
+                        } else {
+                            format!("  {}", app.setting_value(i))
+                        }),
                     ])
                 })
                 .collect();
@@ -2216,8 +2316,10 @@ fn draw(f: &mut Frame, app: &App) {
             render_list(
                 f,
                 items,
-                tformat!("启动设置 · {scope}", scope = scope),
-                app.setting,
+                app.setting_group
+                    .map(|group| format!("{} · {scope}", tr(SETTINGS_MENU[group])))
+                    .unwrap_or_else(|| tformat!("启动设置 · {scope}", scope = scope)),
+                app.setting_position(),
                 cols[0],
             );
             f.render_widget(Paragraph::new(tformat!("\n Enter 编辑 / 保存\n Ctrl+U 清空输入\n Esc 取消编辑\n\n G 全局设置\n D 清除实例覆盖\n V 检测 Java\n\n 实例可覆盖 Java、内存、\n 隔离与附加参数。\n\n {}",app.logs.back().map(String::as_str).unwrap_or(""))).block(panel(tr("说明"))).wrap(Wrap{trim:false}),cols[1]);
@@ -2704,7 +2806,7 @@ mod tests {
             (0, "Instances"),
             (2, "Launchsettings"),
             (4, "Accounts"),
-            (8, "Globalgame/downloadsettings"),
+            (8, "Globalgamesettings"),
         ] {
             app.tab = tab;
             let rendered = terminal.draw(|f| draw(f, &app)).unwrap();
@@ -2771,6 +2873,45 @@ mod tests {
             terminal.draw(|f| draw(f, &app)).unwrap();
             app.confirm_remove = None;
         }
+    }
+    #[test]
+    fn instance_settings_reject_global_fields_before_editing() {
+        let mut app = app();
+        app.tab = 2;
+        app.scope = Some("test".into());
+        for index in [0, 3, 7, 10, 11, 12, 16] {
+            app.setting = index;
+            app.action();
+            assert!(app.editor.is_none());
+            assert!(app.language_picker.is_none());
+        }
+    }
+    #[test]
+    fn settings_groups_navigate_only_their_own_fields() {
+        let mut covered = Vec::new();
+        for (group, indices) in SETTING_GROUPS.iter().enumerate() {
+            let mut app = app();
+            app.tab = 8;
+            app.selection = group;
+            app.action();
+            assert_eq!(app.tab, 2);
+            assert_eq!(app.setting, indices[0]);
+            assert_eq!(app.count(), indices.len());
+            app.key(event::KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+            assert_eq!(app.setting, *indices.last().unwrap());
+            app.key(event::KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+            assert_eq!(app.setting, indices[0]);
+            app.key(event::KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+            assert_eq!(app.setting, *indices.last().unwrap());
+            app.key(event::KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+            assert_eq!(app.setting, indices[0]);
+            app.key(event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            assert_eq!(app.tab, 8);
+            assert_eq!(app.selection, group);
+            covered.extend_from_slice(indices);
+        }
+        covered.sort_unstable();
+        assert_eq!(covered, (0..SETTINGS.len()).collect::<Vec<_>>());
     }
     #[test]
     fn settings_navigation_and_unicode_tail() {
@@ -2885,11 +3026,11 @@ mod tests {
         assert_eq!((app.tab, app.selection), (7, 4));
         app.key(event::KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE));
         assert_eq!(app.tab, 8);
-        app.selection = 3;
+        app.selection = 6;
         app.key(event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.tab, 6);
         app.key(event::KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert_eq!((app.tab, app.selection), (8, 3));
+        assert_eq!((app.tab, app.selection), (8, 6));
         app.selection = 0;
         app.key(event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.tab, 2);

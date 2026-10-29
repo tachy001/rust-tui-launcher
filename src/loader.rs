@@ -43,6 +43,9 @@ impl Backend {
         requested: Option<&str>,
     ) -> Result<Value> {
         valid_id(game)?;
+        if let Some(version) = requested {
+            valid_id(version).context("加载器版本号无效")?;
+        }
         let client = reqwest::Url::parse(loader.base())?;
         let mut list_url = client.clone();
         list_url
@@ -119,7 +122,11 @@ fn parse_profile(bytes: &[u8], game: &str) -> Result<Value> {
     {
         bail!("加载器 API 返回了不兼容的启动配置");
     }
-    valid_id(profile["id"].as_str().context("加载器配置缺少 ID")?)?;
+    let id = profile["id"].as_str().context("加载器配置缺少 ID")?;
+    valid_id(id)?;
+    if id == game {
+        bail!("加载器实例 ID 不能覆盖原版父版本");
+    }
     for library in profile["libraries"].as_array().unwrap() {
         crate::version::maven_path(
             library["name"]
@@ -127,7 +134,9 @@ fn parse_profile(bytes: &[u8], game: &str) -> Result<Value> {
                 .context("加载器依赖缺少 Maven 坐标")?,
         )?;
     }
-    Ok(profile)
+    crate::version_profile_service::VersionProfileDecoder
+        .decode(profile.clone(), id)
+        .context("加载器 API 返回了无效的版本配置")
 }
 
 #[cfg(test)]
@@ -172,6 +181,22 @@ mod tests {
         let bytes = serde_json::to_vec(&profile).unwrap();
         assert!(parse_profile(&bytes, "1.21.1").is_ok());
         assert!(parse_profile(&bytes, "1.20.1").is_err());
+        for (field, value) in [
+            ("id", serde_json::json!("1.21.1")),
+            ("arguments", serde_json::json!({"jvm": "-Xmx2G"})),
+            ("javaVersion", serde_json::json!({"majorVersion": 0})),
+            (
+                "libraries",
+                serde_json::json!([{"name":"net.fabricmc:fabric-loader:0.17.0","rules":"allow"}]),
+            ),
+        ] {
+            let mut invalid = profile.clone();
+            invalid[field] = value;
+            assert!(
+                parse_profile(&serde_json::to_vec(&invalid).unwrap(), "1.21.1").is_err(),
+                "{field}"
+            );
+        }
         for main in ["", "main class", "main\0class"] {
             let mut invalid = profile.clone();
             invalid["mainClass"] = main.into();
@@ -201,6 +226,45 @@ mod tests {
         assert!(result.warning.is_some());
         assert!(cache
             .load(MANIFEST, |bytes| parse_remote_version(bytes, "missing"))
+            .is_err());
+    }
+    #[test]
+    fn malformed_online_loader_profile_preserves_valid_cached_profile() {
+        use crate::metadata_cache::{MetadataCache, MetadataSource, MetadataStore};
+        struct Source(Vec<u8>);
+        impl MetadataSource for Source {
+            fn fetch(&self, _: &str) -> Result<Vec<u8>> {
+                Ok(self.0.clone())
+            }
+        }
+        struct Store(Vec<u8>);
+        impl MetadataStore for Store {
+            fn read(&self, _: &str) -> Result<Option<Vec<u8>>> {
+                Ok(Some(self.0.clone()))
+            }
+            fn write(&self, _: &str, _: &[u8]) -> Result<()> {
+                panic!("invalid online profile must not overwrite cached data")
+            }
+        }
+        let valid = serde_json::json!({"id":"fabric-test","inheritsFrom":"1.21.1","mainClass":"net.fabricmc.loader.impl.launch.knot.KnotClient","libraries":[{"name":"net.fabricmc:fabric-loader:0.17.0"}]});
+        let mut invalid = valid.clone();
+        invalid["arguments"] = serde_json::json!({"game": false});
+        let source = Source(serde_json::to_vec(&invalid).unwrap());
+        let store = Store(serde_json::to_vec(&valid).unwrap());
+        let control = crate::task::TaskControl::default();
+        let cache = MetadataCache::new(&source, &store, &control);
+        let url = "https://meta.fabricmc.net/v2/versions/loader/1.21.1/0.17.0/profile/json";
+        let result = cache
+            .load(url, |bytes| parse_profile(bytes, "1.21.1"))
+            .unwrap();
+        assert_eq!(result.value, valid);
+        assert!(result.warning.is_some());
+        assert!(cache
+            .load(url, |bytes| parse_profile(bytes, "1.20.1"))
+            .is_err());
+        control.cancel();
+        assert!(cache
+            .load(url, |bytes| parse_profile(bytes, "1.21.1"))
             .is_err());
     }
     #[test]

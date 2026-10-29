@@ -63,6 +63,18 @@ impl InstanceConfigSource for FileInstanceConfigSource<'_> {
 
 impl InstanceSettings {
     pub(crate) fn apply_to(&self, config: &mut Config) {
+        if let Some(memory) = self.min_memory_mb {
+            config.min_memory_mb = memory;
+        }
+        if let Some(auto) = self.auto_memory {
+            config.auto_memory = auto;
+        }
+        if let Some(width) = self.width {
+            config.width = width;
+        }
+        if let Some(height) = self.height {
+            config.height = height;
+        }
         if let Some(java) = &self.java {
             config.java = java.clone();
         }
@@ -83,9 +95,15 @@ impl InstanceSettings {
         }
         if let Some(server) = &self.server {
             config.server = server.clone();
+            if !server.trim().is_empty() && self.quick_play_world.is_none() {
+                config.quick_play_world.clear();
+            }
         }
         if let Some(world) = &self.quick_play_world {
             config.quick_play_world = world.clone();
+            if !world.trim().is_empty() && self.server.is_none() {
+                config.server.clear();
+            }
         }
         if let Some(language) = &self.game_language {
             config.game_language = language.clone();
@@ -125,6 +143,35 @@ impl<'a> InstanceConfigResolver<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn explicit_quick_play_target_replaces_inherited_target_but_rejects_conflicts() {
+        let mut config = Config {
+            server: "global.example".into(),
+            ..Config::default()
+        };
+        InstanceSettings {
+            quick_play_world: Some("My World".into()),
+            ..Default::default()
+        }
+        .apply_to(&mut config);
+        assert!(config.server.is_empty());
+        assert_eq!(config.quick_play_world, "My World");
+        config.validate().unwrap();
+        InstanceSettings {
+            server: Some("instance.example".into()),
+            ..Default::default()
+        }
+        .apply_to(&mut config);
+        assert!(config.quick_play_world.is_empty());
+        config.validate().unwrap();
+        InstanceSettings {
+            server: Some("conflict.example".into()),
+            quick_play_world: Some("My World".into()),
+            ..Default::default()
+        }
+        .apply_to(&mut config);
+        assert!(config.validate().is_err());
+    }
     struct Source(InstanceConfiguration);
     impl InstanceConfigSource for Source {
         fn load(&self, _id: &str) -> Result<InstanceConfiguration> {
@@ -194,6 +241,54 @@ mod tests {
                 .unwrap()
                 .isolated
         );
+    }
+    #[test]
+    fn automatic_memory_round_trip_preserves_explicit_false_and_inheritance() {
+        let mut config = Config {
+            auto_memory: true,
+            ..Default::default()
+        };
+        let source = Source(InstanceConfiguration {
+            settings: Some(
+                serde_json::from_str(r#"{"auto_memory":false,"memory_mb":3072}"#).unwrap(),
+            ),
+            force_isolated: false,
+        });
+        let inherited = InstanceConfigResolver::new(&config, &source)
+            .resolve("test")
+            .unwrap();
+        assert!(!inherited.auto_memory);
+        assert_eq!(inherited.memory_mb, 3072);
+        config.instances.insert(
+            "test".into(),
+            InstanceSettings {
+                auto_memory: Some(true),
+                ..Default::default()
+            },
+        );
+        let restored: Config =
+            serde_json::from_slice(&serde_json::to_vec(&config).unwrap()).unwrap();
+        let overridden = InstanceConfigResolver::new(&restored, &source)
+            .resolve("test")
+            .unwrap();
+        assert!(overridden.auto_memory);
+        assert_eq!(overridden.memory_mb, 3072);
+        config.instances.get_mut("test").unwrap().auto_memory = Some(false);
+        let no_local = Source(InstanceConfiguration::default());
+        assert!(
+            !InstanceConfigResolver::new(&config, &no_local)
+                .resolve("test")
+                .unwrap()
+                .auto_memory
+        );
+        config.instances.clear();
+        assert!(
+            InstanceConfigResolver::new(&config, &no_local)
+                .resolve("test")
+                .unwrap()
+                .auto_memory
+        );
+        assert!(config.auto_memory);
     }
     #[test]
     fn source_failure_is_propagated_and_invalid_id_never_reaches_source() {

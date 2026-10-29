@@ -67,8 +67,12 @@ const HELP: &str = "Rust TUI Launcher — Minecraft Java 终端启动器
 全局选项（本次有效，不覆盖配置）：
   --game-dir <路径>  --java <auto或路径>  --username <用户名>
   --memory <MB>  --threads <1-16>  --shared  --isolated
+  --auto-memory  自动分配内存；--memory 切回手动模式，按最后指定者生效
+  --min-memory <MB>  初始堆内存，0 清除指定值；不改变自动最大内存模式
   --source <official|bmclapi|HTTPS根地址>  --no-optional
   --fullscreen / --windowed  --server <主机[:端口]>  --no-server
+  --width <像素>  --height <像素>  本次启动窗口尺寸
+  --jvm-args <参数文本>  --game-args <参数文本>（替换本次附加参数，空字符串清空）
   --world <存档目录名> / --no-world  快速进入已有本地存档（游戏需支持 Quick Play）
   --native-patches / --no-native-patches（启动时 ARM 原生库兼容替换）
   --language <launcher / zh_cn / zh_tw / en_us / keep>  启动前同步游戏语言
@@ -83,22 +87,45 @@ fn parse(mut config: Config, raw: Vec<String>) -> Result<Options> {
     let mut args = vec![];
     let mut snapshots = false;
     let mut fullscreen_override = None;
+    let mut width_override = None;
+    let mut height_override = None;
     let mut server_override = None;
     let mut world_override = None;
     let mut native_patches_override = None;
     let mut language_override = None;
+    let mut java_override = None;
+    let mut memory_override = None;
+    let mut minimum_override = None;
+    let mut auto_memory_override = None;
+    let mut isolated_override = None;
+    let mut jvm_override = None;
+    let mut game_override = None;
     let mut iter = raw.into_iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--game-dir" => config.game_dir = iter.next().context("--game-dir 缺少路径")?.into(),
-            "--java" => config.java = iter.next().context("--java 缺少值")?,
+            "--java" => {
+                config.java = iter.next().context("--java 缺少值")?;
+                java_override = Some(config.java.clone());
+            }
             "--username" => config.username = iter.next().context("--username 缺少用户名")?,
+            "--jvm-args" => {
+                config.jvm_args = iter.next().context("--jvm-args 缺少参数文本")?;
+                jvm_override = Some(config.jvm_args.clone());
+            }
+            "--game-args" => {
+                config.game_args = iter.next().context("--game-args 缺少参数文本")?;
+                game_override = Some(config.game_args.clone());
+            }
             "--memory" => {
+                config.auto_memory = false;
+                auto_memory_override = Some(false);
                 config.memory_mb = iter
                     .next()
                     .context("--memory 缺少值")?
                     .parse()
-                    .context("内存应为整数")?
+                    .context("内存应为整数")?;
+                memory_override = Some(config.memory_mb);
             }
             "--threads" => {
                 config.download_threads = iter
@@ -107,17 +134,47 @@ fn parse(mut config: Config, raw: Vec<String>) -> Result<Options> {
                     .parse()
                     .context("线程数应为整数")?
             }
+            "--auto-memory" => {
+                config.auto_memory = true;
+                auto_memory_override = Some(true);
+            }
+            "--min-memory" => {
+                config.min_memory_mb = iter
+                    .next()
+                    .context("--min-memory 缺少值")?
+                    .parse()
+                    .context("最小内存必须为整数 MB")?;
+                minimum_override = Some(config.min_memory_mb);
+            }
             "--source" => config.download_source = iter.next().context("--source 缺少值")?,
             "--ui-language" => {
                 config.language = iter.next().context("--ui-language 缺少语言代码")?
             }
             "--no-optional" => config.optional_pack_files = false,
-            "--shared" => config.isolated = false,
-            "--isolated" => config.isolated = true,
+            "--shared" | "--isolated" => {
+                config.isolated = arg == "--isolated";
+                isolated_override = Some(config.isolated);
+            }
             "--snapshots" => snapshots = true,
             "--fullscreen" => {
                 config.fullscreen = true;
                 fullscreen_override = Some(true);
+            }
+            "--width" => {
+                config.width = iter
+                    .next()
+                    .context("--width 缺少值")?
+                    .parse()
+                    .context("宽度必须为整数")?;
+                width_override = Some(config.width);
+            }
+            "--height" => {
+                config.height = iter
+                    .next()
+                    .context("--height 缺少值")?
+                    .parse()
+                    .context("高度必须为整数")?;
+                height_override = Some(config.height);
             }
             "--windowed" => {
                 config.fullscreen = false;
@@ -157,10 +214,36 @@ fn parse(mut config: Config, raw: Vec<String>) -> Result<Options> {
             _ => args.push(arg),
         }
     }
-    config.validate()?;
     if args.first().is_some_and(|command| command == "launch") {
         if let Some(id) = args.get(1) {
             let instance = config.instances.entry(id.clone()).or_default();
+            if let Some(minimum) = minimum_override {
+                instance.min_memory_mb = Some(minimum);
+            }
+            if let Some(auto) = auto_memory_override {
+                instance.auto_memory = Some(auto);
+            }
+            if let Some(args) = jvm_override {
+                instance.jvm_args = Some(args);
+            }
+            if let Some(args) = game_override {
+                instance.game_args = Some(args);
+            }
+            if let Some(java) = java_override {
+                instance.java = Some(java);
+            }
+            if let Some(memory) = memory_override {
+                instance.memory_mb = Some(memory);
+            }
+            if let Some(isolated) = isolated_override {
+                instance.isolated = Some(isolated);
+            }
+            if let Some(width) = width_override {
+                instance.width = Some(width);
+            }
+            if let Some(height) = height_override {
+                instance.height = Some(height);
+            }
             if let Some(fullscreen) = fullscreen_override {
                 instance.fullscreen = Some(fullscreen);
             }
@@ -178,6 +261,7 @@ fn parse(mut config: Config, raw: Vec<String>) -> Result<Options> {
             }
         }
     }
+    config.validate()?;
     Ok(Options {
         config,
         args,
@@ -698,6 +782,186 @@ fn exact(args: &[String], expected: usize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn minimum_memory_can_clear_saved_value_without_disabling_automatic_maximum() {
+        let mut config = Config {
+            auto_memory: true,
+            ..Default::default()
+        };
+        config.instances.insert(
+            "test".into(),
+            crate::config::InstanceSettings {
+                min_memory_mb: Some(1024),
+                ..Default::default()
+            },
+        );
+        for minimum in ["0", "512"] {
+            let options = parse(
+                config.clone(),
+                ["launch", "test", "--min-memory", minimum]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+            )
+            .unwrap();
+            assert!(options.config.auto_memory);
+            assert_eq!(
+                options.config.instances["test"].min_memory_mb,
+                Some(minimum.parse().unwrap())
+            );
+        }
+        assert_eq!(config.instances["test"].min_memory_mb, Some(1024));
+        for values in [
+            vec!["--min-memory"],
+            vec!["--min-memory", "-1"],
+            vec!["--min-memory", "65537"],
+        ] {
+            assert!(parse(
+                Config::default(),
+                values.into_iter().map(str::to_owned).collect()
+            )
+            .is_err());
+        }
+    }
+    #[test]
+    fn automatic_memory_flags_follow_last_option_and_override_instance() {
+        for (flags, expected) in [
+            (vec!["--memory", "2048", "--auto-memory"], true),
+            (vec!["--auto-memory", "--memory", "4096"], false),
+        ] {
+            let mut raw = vec!["launch".to_owned(), "test".to_owned()];
+            raw.extend(flags.into_iter().map(str::to_owned));
+            let options = parse(Config::default(), raw).unwrap();
+            assert_eq!(options.config.auto_memory, expected);
+            assert_eq!(options.config.instances["test"].auto_memory, Some(expected));
+        }
+        assert!(!Config::default().auto_memory);
+    }
+    #[test]
+    fn custom_argument_flags_replace_or_clear_instance_arguments() {
+        let mut config = Config::default();
+        config.instances.insert(
+            "test".into(),
+            crate::config::InstanceSettings {
+                jvm_args: Some("-Dold=true".into()),
+                game_args: Some("--demo".into()),
+                ..Default::default()
+            },
+        );
+        let options = parse(
+            config.clone(),
+            [
+                "launch",
+                "test",
+                "--jvm-args",
+                "-Dlabel=\"hello world\"",
+                "--game-args",
+                "",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        )
+        .unwrap();
+        assert_eq!(
+            options.config.instances["test"].jvm_args.as_deref(),
+            Some("-Dlabel=\"hello world\"")
+        );
+        assert_eq!(
+            options.config.instances["test"].game_args.as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            config.instances["test"].game_args.as_deref(),
+            Some("--demo")
+        );
+        for flag in ["--jvm-args", "--game-args"] {
+            assert!(parse(Config::default(), vec![flag.into()]).is_err());
+            for invalid in ["\"unterminated", "bad\0value"] {
+                assert!(parse(Config::default(), vec![flag.into(), invalid.into()]).is_err());
+            }
+        }
+    }
+    #[test]
+    fn runtime_flags_override_instance_settings_without_mutating_saved_config() {
+        let mut config = Config::default();
+        config.instances.insert(
+            "test".into(),
+            crate::config::InstanceSettings {
+                java: Some("old-java".into()),
+                memory_mb: Some(1024),
+                isolated: Some(true),
+                ..Default::default()
+            },
+        );
+        let options = parse(
+            config.clone(),
+            [
+                "launch", "test", "--java", "new-java", "--memory", "4096", "--shared",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        )
+        .unwrap();
+        let mut effective = config.clone();
+        options.config.instances["test"].apply_to(&mut effective);
+        assert_eq!(effective.java, "new-java");
+        assert_eq!(effective.memory_mb, 4096);
+        assert!(!effective.isolated);
+        assert_eq!(config.instances["test"].memory_mb, Some(1024));
+        let unchanged = parse(config, vec!["launch".into(), "test".into()]).unwrap();
+        assert_eq!(
+            unchanged.config.instances["test"].java.as_deref(),
+            Some("old-java")
+        );
+    }
+    #[test]
+    fn window_flags_override_saved_dimensions_and_validate_after_overrides() {
+        let mut config = Config::default();
+        config.instances.insert(
+            "test".into(),
+            crate::config::InstanceSettings {
+                width: Some(800),
+                height: Some(600),
+                quick_play_world: Some("World".into()),
+                ..Default::default()
+            },
+        );
+        let options = parse(
+            config.clone(),
+            [
+                "launch",
+                "test",
+                "--width",
+                "1280",
+                "--height",
+                "720",
+                "--server",
+                "example.org",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        )
+        .unwrap();
+        let settings = &options.config.instances["test"];
+        assert_eq!((settings.width, settings.height), (Some(1280), Some(720)));
+        assert_eq!(settings.quick_play_world.as_deref(), Some(""));
+        assert_eq!(config.instances["test"].width, Some(800));
+        for args in [
+            vec!["--width"],
+            vec!["--height", "abc"],
+            vec!["--width", "0"],
+            vec!["--height", "20000"],
+        ] {
+            assert!(parse(
+                Config::default(),
+                args.into_iter().map(str::to_owned).collect()
+            )
+            .is_err());
+        }
+    }
     #[test]
     fn launch_flags_override_saved_instance_options_without_saving() {
         let mut config = Config::default();

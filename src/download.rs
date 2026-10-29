@@ -169,7 +169,11 @@ impl Downloader {
                 (0..candidates.len()).min_by_key(|index| self.retry.remaining(&candidates[*index]))
             {
                 let url = candidates.remove(next);
-                let parsed = reqwest::Url::parse(&url)?;
+                let Ok(parsed) = reqwest::Url::parse(&url) else {
+                    // An invalid alternative must not prevent trying the next
+                    // valid source. The primary URL is validated before locking.
+                    continue;
+                };
                 if parsed.scheme() != "https"
                     && !(cfg!(test)
                         && parsed.scheme() == "http"
@@ -191,16 +195,20 @@ impl Downloader {
                     if self.control.cancelled() {
                         return Err(error);
                     }
-                    let _ = self.tx.send(Message::Log(format!(
-                        "重试 {}/3 · {} · {error}",
-                        attempt + 1,
-                        entry.dest.file_name().unwrap_or_default().to_string_lossy()
-                    )));
-                    last = Some(error);
+                    let label = entry.dest.file_name().unwrap_or_default().to_string_lossy();
                     if attempt < 2 {
+                        let _ = self.tx.send(Message::Log(format!(
+                            "准备第 {}/3 次下载 · {label} · {error:#}",
+                            attempt + 2,
+                        )));
                         self.control
                             .wait(std::time::Duration::from_millis(250 * (attempt + 1)))?;
+                    } else {
+                        let _ = self.tx.send(Message::Log(format!(
+                            "下载失败（已尝试 3 次）· {label} · {error:#}"
+                        )));
                     }
+                    last = Some(error);
                 }
             }
         }
@@ -878,7 +886,12 @@ mod tests {
             dest: destination.clone(),
             sha1: Some("a9993e364706816aba3e25717850c26c9cd0d89d".into()),
             size: Some(3),
-            alternatives: vec![format!("{limited}/other"), format!("{available}/file")],
+            alternatives: vec![
+                format!("{limited}/other"),
+                "not an absolute URL".into(),
+                "http://[invalid".into(),
+                format!("{available}/file"),
+            ],
         });
         done.store(true, Ordering::Relaxed);
         timer.join().unwrap();

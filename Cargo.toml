@@ -1,6 +1,6 @@
 [package]
 name = "tui-launcher"
-version = "0.21.7"
+version = "0.21.8"
 edition = "2021"
 description = "A keyboard-first Minecraft Java launcher"
 license = "MIT"
@@ -26,7 +26,7 @@ zeroize = { version = "1", features = ["derive"] }
 
 [target.'cfg(windows)'.dependencies]
 keyring = { version = "3.6", features = ["windows-native"] }
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_System_SystemInformation"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

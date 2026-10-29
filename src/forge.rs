@@ -38,12 +38,12 @@ impl Backend {
         requested: Option<&str>,
     ) -> Result<String> {
         valid_id(game)?;
+        if let Some(version) = requested {
+            valid_id(version).context("加载器版本号无效")?;
+        }
         let (base, artifact, full) = if kind == ForgeKind::Forge {
             let chosen = match requested {
-                Some(version) => version
-                    .strip_prefix(&format!("{game}-"))
-                    .unwrap_or(version)
-                    .to_owned(),
+                Some(version) => forge_requested_version(game, version)?.to_owned(),
                 None => {
                     let promos=self.cached_metadata("https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json",parse_promotions)?;
                     promos["promos"][format!("{game}-recommended")]
@@ -70,22 +70,22 @@ impl Backend {
                 version.to_owned()
             } else {
                 let metadata = self.maven_metadata(&format!("{base}/maven-metadata.xml"))?;
-                let versions = crate::loader_catalog::maven_versions(&metadata, &prefix)?;
+                let versions = crate::loader_catalog::neoforge_versions(&metadata, game)?;
                 crate::loader_catalog::LoaderVersion::select(&versions, None)?
                     .version
                     .clone()
             };
-            if !full.starts_with(&prefix) {
+            if !full.starts_with(&prefix) || !neoforge_game_suffix_matches(&full, game) {
                 bail!("NeoForge {full} 不属于 Minecraft {game}");
             }
             (base, artifact, full)
         };
         valid_id(&full)?;
         self.log(format!("安装 {} {full}", kind.name()));
-        let remote = self.remote_version(game)?;
-        self.install(config, &remote)?;
         let url = format!("{base}/{full}/{artifact}-{full}-installer.jar");
+        // Confirm the requested installer exists before downloading the base game.
         let checksum = self.cached_metadata(&format!("{url}.sha1"), parse_installer_sha1)?;
+        let remote = self.remote_version(game)?;
         let root = config.root()?;
         let cache = root.join("tui-mc-installers");
         fs::create_dir_all(&cache)?;
@@ -122,6 +122,10 @@ impl Backend {
             (kind == ForgeKind::Forge).then_some(full.as_str()),
             &self.control,
         )?;
+        // Like HMCL's installer type detection, validate the package and target
+        // before downloading the vanilla client, libraries, and assets.
+        self.control.check()?;
+        self.install(config, &remote)?;
         let id = plan.id;
         let mut mutation = crate::instance_service::InstanceMutation::begin(&root, &id)?;
         if let Some(legacy) = plan.direct {
@@ -276,6 +280,23 @@ fn parse_installer_sha1(bytes: &[u8]) -> Result<String> {
     }
     Ok(checksum.to_ascii_lowercase())
 }
+fn forge_requested_version<'a>(game: &str, version: &'a str) -> Result<&'a str> {
+    valid_id(version)?;
+    if let Some(short) = version.strip_prefix(&format!("{game}-")) {
+        valid_id(short).context("Forge 完整版本号缺少加载器版本")?;
+        return Ok(short);
+    }
+    if let Some((prefix, _)) = version.split_once('-') {
+        if prefix.starts_with("1.")
+            && prefix
+                .split('.')
+                .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+        {
+            bail!("Forge {version} 属于 Minecraft {prefix}，不属于 {game}");
+        }
+    }
+    Ok(version)
+}
 fn parse_maven_metadata(bytes: &[u8]) -> Result<String> {
     let text = std::str::from_utf8(bytes).context("Maven 元数据不是 UTF-8")?;
     let mut content = text.trim_start_matches('\u{feff}').trim();
@@ -308,11 +329,48 @@ fn parse_maven_metadata(bytes: &[u8]) -> Result<String> {
     }
     Ok(text.into())
 }
+pub(crate) fn neoforge_game_suffix_matches(version: &str, game: &str) -> bool {
+    version.split_once('+').map(|(_, suffix)| suffix)
+        == game.split_once('-').map(|(_, suffix)| suffix)
+}
 pub(crate) fn neoforge_prefix(game: &str) -> Result<String> {
+    // PCL's 0.<Minecraft ID>.<build> branch covers weekly and special snapshots.
+    // Keep the complete game ID and a component boundary to avoid matching a
+    // different snapshot that merely shares its name prefix.
+    if regex::Regex::new(r"^[0-9]{2}w[0-9]{2}[a-z]+$")?.is_match(game) {
+        return Ok(format!("0.{game}."));
+    }
+    let game = if let Some((base, snapshot)) = game.split_once("-snapshot-") {
+        if !base
+            .split('.')
+            .next()
+            .and_then(|year| year.parse::<u64>().ok())
+            .is_some_and(|year| year >= 24)
+            || snapshot.is_empty()
+            || !snapshot.bytes().all(|b| b.is_ascii_digit())
+        {
+            bail!("无法识别 NeoForge 游戏快照：{game}");
+        }
+        base
+    } else {
+        game
+    };
     if game == "1.20.1" {
         return Ok("1.20.1-".into());
     }
     let parts = game.split('.').collect::<Vec<_>>();
+    // Map the numeric base after recognizing supported snapshot suffixes.
+    // Never truncate a custom suffix or
+    // fourth component into the range of a different Minecraft version.
+    if !(2..=3).contains(&parts.len())
+        || parts.iter().any(|part| {
+            part.is_empty()
+                || !part.bytes().all(|byte| byte.is_ascii_digit())
+                || (part.len() > 1 && part.starts_with('0'))
+        })
+    {
+        bail!("无法从 Minecraft {game} 推导 NeoForge 版本范围：需要正式版本号");
+    }
     if parts.first() == Some(&"1") && parts.len() >= 2 {
         Ok(format!(
             "{}.{}.",
@@ -320,13 +378,21 @@ pub(crate) fn neoforge_prefix(game: &str) -> Result<String> {
             parts.get(2).copied().unwrap_or("0")
         ))
     } else if parts.len() >= 2 {
-        Ok(format!("{}.{}.", parts[0], parts[1]))
+        Ok(format!(
+            "{}.{}.{}.",
+            parts[0],
+            parts[1],
+            parts.get(2).copied().unwrap_or("0")
+        ))
     } else {
         bail!("无法从该游戏版本推导 NeoForge 版本范围")
     }
 }
 pub(crate) fn natural_key(version: &str) -> Vec<u64> {
     version
+        .split('+')
+        .next()
+        .unwrap_or(version)
         .split(['.', '-'])
         .map(|part| part.parse().unwrap_or(0))
         .collect()
@@ -352,10 +418,49 @@ mod tests {
         assert!(parse_installer_sha1(b"<html>unavailable</html>").is_err());
     }
     #[test]
+    fn forge_requested_coordinates_preserve_legacy_suffixes_and_reject_wrong_game() {
+        assert_eq!(
+            forge_requested_version("1.21.1", "52.1.20").unwrap(),
+            "52.1.20"
+        );
+        assert_eq!(
+            forge_requested_version("1.21.1", "1.21.1-52.1.20").unwrap(),
+            "52.1.20"
+        );
+        assert_eq!(
+            forge_requested_version("1.7.10", "1.7.10-10.13.4.1614-1.7.10").unwrap(),
+            "10.13.4.1614-1.7.10"
+        );
+        assert_eq!(
+            forge_requested_version("1.7.10", "10.13.4.1614-1.7.10").unwrap(),
+            "10.13.4.1614-1.7.10"
+        );
+        assert!(forge_requested_version("1.21.1", "1.20.1-47.4.8").is_err());
+        assert!(forge_requested_version("1.21.1", "1.21.1-").is_err());
+    }
+    #[test]
     fn neoforge_version_ranges() {
         assert_eq!(neoforge_prefix("1.21.1").unwrap(), "21.1.");
         assert_eq!(neoforge_prefix("1.21").unwrap(), "21.0.");
         assert_eq!(neoforge_prefix("1.20.1").unwrap(), "1.20.1-");
+        assert_eq!(neoforge_prefix("26.1").unwrap(), "26.1.0.");
+        assert_eq!(neoforge_prefix("26.1.1").unwrap(), "26.1.1.");
+        assert_eq!(
+            neoforge_prefix("25w14craftmine").unwrap(),
+            "0.25w14craftmine."
+        );
+        assert_eq!(neoforge_prefix("25w14a").unwrap(), "0.25w14a.");
+        for invalid in [
+            "1.21.1.9",
+            "1.21.1-custom",
+            "1.21-pre1",
+            "1..1",
+            "1.021.1",
+            "26.1-snapshot",
+            "25w14a-custom",
+        ] {
+            assert!(neoforge_prefix(invalid).is_err(), "{invalid}");
+        }
         assert!(natural_key("21.1.100") > natural_key("21.1.9"));
     }
 }

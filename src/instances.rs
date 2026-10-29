@@ -539,6 +539,10 @@ impl CloneSnapshot {
     ) -> Result<Self> {
         use sha1::{Digest, Sha1};
         let settings = crate::config::InstanceSettings {
+            min_memory_mb: Some(effective.min_memory_mb),
+            auto_memory: Some(effective.auto_memory),
+            width: Some(effective.width),
+            height: Some(effective.height),
             java: Some(effective.java.clone()),
             memory_mb: Some(effective.memory_mb),
             isolated: Some(true),
@@ -724,6 +728,10 @@ mod tests {
             .entry("base".into())
             .or_default()
             .quick_play_world = Some("World".into());
+        let overrides = config.instances.get_mut("base").unwrap();
+        overrides.auto_memory = Some(true);
+        overrides.width = Some(1280);
+        overrides.height = Some(720);
         let root = config.root().unwrap();
         let target = root.join("versions/copy");
         let held = InstanceLock::acquire(&target).unwrap();
@@ -754,6 +762,14 @@ mod tests {
             b"fixture"
         );
         assert_eq!(config.effective("copy").unwrap().quick_play_world, "World");
+        // Reload using only the game directory; no in-memory source overrides.
+        let reloaded = Config {
+            game_dir: root.clone(),
+            ..Default::default()
+        };
+        let copied = reloaded.effective("copy").unwrap();
+        assert!(copied.auto_memory);
+        assert_eq!((copied.width, copied.height), (1280, 720));
         assert!(!target.join("tui-mc-clone-pending.json").exists());
         assert!(trash(&config, "base").is_err());
     }

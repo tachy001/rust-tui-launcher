@@ -196,21 +196,29 @@ impl MetadataSource for Backend {
         {
             bail!("元数据超过 16 MiB 限制");
         }
-        let mut bytes = Vec::new();
-        let mut buffer = [0; 64 * 1024];
-        loop {
-            self.control.check()?;
-            let limit = buffer.len().min(MAX_METADATA + 1 - bytes.len());
-            let count = response.read(&mut buffer[..limit])?;
-            self.control.check()?;
-            if count == 0 {
-                break;
-            }
-            bytes.extend_from_slice(&buffer[..count]);
-            check_size(&bytes)?;
-        }
-        Ok(bytes)
+        read_response(&mut response, &self.control)
     }
+}
+
+fn read_response(reader: &mut impl Read, control: &TaskControl) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        control.check()?;
+        let limit = buffer.len().min(MAX_METADATA + 1 - bytes.len());
+        let count = match reader.read(&mut buffer[..limit]) {
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error).context("读取元数据响应失败"),
+        };
+        control.check()?;
+        if count == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+        check_size(&bytes)?;
+    }
+    Ok(bytes)
 }
 impl Backend {
     // Deliberately opt-in: authentication requests and credentials are never routed here.
@@ -233,6 +241,44 @@ mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
     const URL: &str = "https://example.invalid/catalog";
+    #[test]
+    fn response_read_retries_interruption_but_stops_when_cancelled() {
+        struct InterruptedReader<'a> {
+            control: &'a TaskControl,
+            cancel: bool,
+            calls: usize,
+            body: std::io::Cursor<Vec<u8>>,
+        }
+        impl Read for InterruptedReader<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                self.calls += 1;
+                if self.calls == 1 {
+                    if self.cancel {
+                        self.control.cancel();
+                    }
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                self.body.read(buffer)
+            }
+        }
+        for cancel in [false, true] {
+            let control = TaskControl::default();
+            let mut reader = InterruptedReader {
+                control: &control,
+                cancel,
+                calls: 0,
+                body: std::io::Cursor::new(b"metadata".to_vec()),
+            };
+            let result = read_response(&mut reader, &control);
+            if cancel {
+                assert!(result.is_err());
+                assert_eq!(reader.calls, 1);
+            } else {
+                assert_eq!(result.unwrap(), b"metadata");
+                assert_eq!(reader.calls, 3);
+            }
+        }
+    }
     #[derive(Default)]
     struct Store {
         bytes: RefCell<Option<Vec<u8>>>,

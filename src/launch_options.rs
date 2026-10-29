@@ -57,8 +57,7 @@ impl QuickPlayTarget {
             ),
             ("is_quick_play_realms", false),
         ]);
-        let candidate =
-            crate::metadata::arguments_for(&meta["arguments"]["game"], &features, platform);
+        let candidate = metadata_game_arguments(meta, &features, platform)?;
         let option = match self {
             Self::Multiplayer(_) => Some("--quickPlayMultiplayer"),
             Self::Singleplayer(_) => Some("--quickPlaySingleplayer"),
@@ -75,6 +74,25 @@ impl QuickPlayTarget {
         }
         Ok(features)
     }
+}
+// Use the same merged argument formats for capability detection and launching.
+// Loader profiles can retain minecraftArguments alongside modern arguments.
+fn metadata_game_arguments(
+    meta: &Value,
+    features: &HashMap<&str, bool>,
+    platform: &crate::platform_rule_service::PlatformRuleEvaluator<'_>,
+) -> Result<Vec<String>> {
+    let mut args = if let Some(legacy) = meta["minecraftArguments"].as_str() {
+        shlex::split(legacy).context("无法解析旧版启动参数")?
+    } else {
+        Vec::new()
+    };
+    args.extend(crate::metadata::arguments_for(
+        &meta["arguments"]["game"],
+        features,
+        platform,
+    ));
+    Ok(args)
 }
 /// Expand only the original template; substituted paths and tokens are literal data.
 pub fn expand_argument(template: &str, values: &HashMap<&str, String>) -> Result<String> {
@@ -164,16 +182,7 @@ pub(crate) fn game_arguments_for(
 ) -> Result<Vec<String>> {
     let target = QuickPlayTarget::from_config(config)?;
     let features = target.features(meta, platform)?;
-    let mut args = if let Some(legacy) = meta["minecraftArguments"].as_str() {
-        shlex::split(legacy).context("无法解析旧版启动参数")?
-    } else {
-        Vec::new()
-    };
-    args.extend(crate::metadata::arguments_for(
-        &meta["arguments"]["game"],
-        &features,
-        platform,
-    ));
+    let mut args = metadata_game_arguments(meta, &features, platform)?;
     if !has_option(&args, "--width") {
         args.extend(["--width".into(), config.width.to_string()]);
     }
@@ -206,6 +215,38 @@ pub(crate) fn game_arguments_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn quickplay_capability_uses_both_metadata_argument_formats() {
+        for (config, option, placeholder) in [
+            (
+                Config {
+                    server: "example.org".into(),
+                    ..Config::default()
+                },
+                "--quickPlayMultiplayer",
+                "${quickPlayMultiplayer}",
+            ),
+            (
+                Config {
+                    quick_play_world: "My World".into(),
+                    ..Config::default()
+                },
+                "--quickPlaySingleplayer",
+                "${quickPlaySingleplayer}",
+            ),
+        ] {
+            let meta = serde_json::json!({
+                "minecraftArguments": format!("{option} {placeholder}"),
+                "arguments": {"game": ["--tweakClass", "example.Loader"]}
+            });
+            let args = game_arguments(&config, &meta).unwrap();
+            assert_eq!(args.iter().filter(|arg| arg.as_str() == option).count(), 1);
+            assert!(!args.iter().any(|arg| arg == "--server"));
+            assert!(args
+                .windows(2)
+                .any(|pair| pair == ["--tweakClass", "example.Loader"]));
+        }
+    }
     #[test]
     fn expansion_keeps_inserted_values_literal() {
         let values = HashMap::from([

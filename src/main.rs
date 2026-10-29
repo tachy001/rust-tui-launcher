@@ -48,6 +48,7 @@ mod loader_output_service;
 mod loader_profile_service;
 mod logging_service;
 mod logs;
+mod memory_allocation_service;
 mod memory_service;
 mod minecraft_profile_service;
 #[macro_use]

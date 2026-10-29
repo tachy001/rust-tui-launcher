@@ -54,23 +54,24 @@ impl LoaderVersion {
 
 pub(crate) fn json_versions(value: Value) -> Result<Vec<LoaderVersion>> {
     let mut result = vec![];
+    let mut stability = std::collections::HashMap::new();
     for entry in value.as_array().context("加载器版本列表格式错误")? {
         let version = entry["loader"]["version"]
             .as_str()
             .context("加载器缺少版本号")?;
         valid_id(version)?;
-        if result
-            .iter()
-            .any(|entry: &LoaderVersion| entry.version == version)
-        {
-            continue;
-        }
         let stable = match entry["loader"].get("stable") {
             None | Some(Value::Null) => version
                 .split('.')
                 .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())),
             Some(value) => value.as_bool().context("加载器 stable 必须为布尔值")?,
         };
+        if let Some(previous) = stability.insert(version, stable) {
+            if previous != stable {
+                bail!("加载器版本 {version} 的稳定性标记冲突");
+            }
+            continue;
+        }
         result.push(LoaderVersion {
             version: version.into(),
             stable,
@@ -95,12 +96,19 @@ pub(crate) fn maven_versions(xml: &str, prefix: &str) -> Result<Vec<LoaderVersio
         .rev()
         .map(|version| {
             valid_id(&version)?;
-            let stable = !version.contains("beta")
-                && !version.contains("alpha")
-                && !version.contains("snapshot");
+            let lower = version.to_ascii_lowercase();
+            let stable =
+                !lower.contains("beta") && !lower.contains("alpha") && !lower.contains("snapshot");
             Ok(LoaderVersion { version, stable })
         })
         .collect()
+}
+
+pub(crate) fn neoforge_versions(xml: &str, game: &str) -> Result<Vec<LoaderVersion>> {
+    let mut versions = maven_versions(xml, &crate::forge::neoforge_prefix(game)?)?;
+    // PCL maps the suffix after '+' to the Minecraft snapshot suffix.
+    versions.retain(|entry| crate::forge::neoforge_game_suffix_matches(&entry.version, game));
+    Ok(versions)
 }
 
 impl Backend {
@@ -141,8 +149,7 @@ impl Backend {
                 } else {
                     "neoforge"
                 };
-                maven_versions(&self.maven_metadata(&format!("https://maven.neoforged.net/releases/net/neoforged/{artifact}/maven-metadata.xml"))?,
-                    &crate::forge::neoforge_prefix(game)?)?
+                neoforge_versions(&self.maven_metadata(&format!("https://maven.neoforged.net/releases/net/neoforged/{artifact}/maven-metadata.xml"))?, game)?
             }
         };
         if versions.is_empty() {
@@ -172,6 +179,19 @@ impl Backend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn conflicting_or_malformed_duplicate_records_are_not_silently_discarded() {
+        for duplicate in [serde_json::json!(false), serde_json::json!("false")] {
+            let records = serde_json::json!([
+                {"loader":{"version":"0.27.0","stable":true}},
+                {"loader":{"version":"0.27.0","stable":duplicate}}
+            ]);
+            assert!(json_versions(records.clone()).is_err());
+            let mut reversed = records.as_array().unwrap().clone();
+            reversed.reverse();
+            assert!(json_versions(Value::Array(reversed)).is_err());
+        }
+    }
     #[test]
     #[ignore = "requires TUI_TEST_METADATA_CACHE; reads cached official loader catalogs"]
     fn official_cached_catalogs_select_listed_versions() {
@@ -252,6 +272,71 @@ mod tests {
         let first = names(first);
         assert_eq!(first.len(), 2);
         assert_eq!(first, names(reordered));
+    }
+    #[test]
+    fn yearly_snapshot_catalog_matches_only_the_requested_snapshot() {
+        let xml = "<version>26.1.0.9-alpha+snapshot-1</version><version>26.1.0.10-alpha+snapshot-2</version><version>26.1.0.11</version>";
+        let versions = neoforge_versions(xml, "26.1-snapshot-1").unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].version, "26.1.0.9-alpha+snapshot-1");
+        assert!(neoforge_versions(xml, "26.1-snapshot-3")
+            .unwrap()
+            .is_empty());
+        assert!(neoforge_versions(xml, "1.21-snapshot-1").is_err());
+        assert!(!crate::forge::neoforge_game_suffix_matches(
+            "26.1.0.11",
+            "26.1-snapshot-1"
+        ));
+    }
+    #[test]
+    fn snapshot_suffix_does_not_replace_the_numeric_build_order() {
+        let xml = "<version>26.1.0.9+snapshot-1</version><version>26.1.0.10+snapshot-1</version>";
+        let versions = neoforge_versions(xml, "26.1-snapshot-1").unwrap();
+        assert_eq!(versions[0].version, "26.1.0.10+snapshot-1");
+        assert_eq!(
+            LoaderVersion::select(&versions, None).unwrap().version,
+            versions[0].version
+        );
+    }
+    #[test]
+    fn weekly_neoforge_catalog_keeps_exact_game_and_numeric_build() {
+        let xml = "<version>0.25w14craftmine.9-beta</version><version>0.25w14craftmine.10-beta</version><version>0.25w14craftmineextra.99-beta</version><version>0.25w14a.99-beta</version><version>26.1.0.99</version>";
+        let versions = neoforge_versions(xml, "25w14craftmine").unwrap();
+        assert_eq!(versions.len(), 2);
+        let selected = LoaderVersion::select(&versions, None).unwrap();
+        assert_eq!(selected.version, "0.25w14craftmine.10-beta");
+        assert!(!selected.stable);
+        assert!(LoaderVersion::select(&versions, Some("0.25w14a.99-beta")).is_err());
+        assert!(neoforge_versions(xml, "25w15a").unwrap().is_empty());
+    }
+    #[test]
+    fn release_neoforge_catalog_excludes_other_game_snapshot_builds() {
+        let xml = "<version>26.1.0.99-alpha.1+snapshot-1</version><version>26.1.0.8-beta</version>";
+        let versions = neoforge_versions(xml, "26.1").unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(
+            LoaderVersion::select(&versions, None).unwrap().version,
+            "26.1.0.8-beta"
+        );
+        assert!(
+            neoforge_versions("<version>26.1.0.99-alpha.1+snapshot-1</version>", "26.1")
+                .unwrap()
+                .is_empty()
+        );
+    }
+    #[test]
+    fn yearly_neoforge_catalog_does_not_mix_game_patches() {
+        let xml = "<version>26.1.0.9-ALPHA</version><version>26.1.0.8</version><version>26.1.1.99</version>";
+        let versions =
+            maven_versions(xml, &crate::forge::neoforge_prefix("26.1").unwrap()).unwrap();
+        assert_eq!(versions.len(), 2);
+        assert_eq!(
+            LoaderVersion::select(&versions, None).unwrap().version,
+            "26.1.0.8"
+        );
+        let patch = maven_versions(xml, &crate::forge::neoforge_prefix("26.1.1").unwrap()).unwrap();
+        assert_eq!(patch.len(), 1);
+        assert_eq!(patch[0].version, "26.1.1.99");
     }
     #[test]
     fn neoforge_selection_uses_normalized_catalog_and_avoids_snapshots() {
