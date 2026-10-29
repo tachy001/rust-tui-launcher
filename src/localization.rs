@@ -85,7 +85,7 @@ impl UiLanguage {
     fn catalog(self) -> &'static HashMap<String, String> {
         static CATALOGS: OnceLock<Vec<HashMap<String, String>>> = OnceLock::new();
         let catalogs = CATALOGS.get_or_init(|| {
-            [
+            let mut catalogs: Vec<HashMap<String, String>> = [
                 include_str!("../assets/lang/zh_cn.json"),
                 include_str!("../assets/lang/en_us.json"),
                 include_str!("../assets/lang/zh_tw.json"),
@@ -101,7 +101,16 @@ impl UiLanguage {
             .map(|source| {
                 serde_json::from_str(source).expect("validated built-in language catalog")
             })
-            .collect()
+            .collect();
+            let english = catalogs[1].clone();
+            for (index, catalog) in catalogs.iter_mut().enumerate() {
+                if index != 1 {
+                    for (key, value) in &english {
+                        catalog.entry(key.clone()).or_insert_with(|| value.clone());
+                    }
+                }
+            }
+            catalogs
         });
         &catalogs[Self::ALL
             .iter()

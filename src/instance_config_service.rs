@@ -95,15 +95,9 @@ impl InstanceSettings {
         }
         if let Some(server) = &self.server {
             config.server = server.clone();
-            if !server.trim().is_empty() && self.quick_play_world.is_none() {
-                config.quick_play_world.clear();
-            }
         }
         if let Some(world) = &self.quick_play_world {
             config.quick_play_world = world.clone();
-            if !world.trim().is_empty() && self.server.is_none() {
-                config.server.clear();
-            }
         }
         if let Some(language) = &self.game_language {
             config.game_language = language.clone();
@@ -144,7 +138,7 @@ impl<'a> InstanceConfigResolver<'a> {
 mod tests {
     use super::*;
     #[test]
-    fn explicit_quick_play_target_replaces_inherited_target_but_rejects_conflicts() {
+    fn explicit_quick_play_target_preserves_inheritance_and_rejects_conflicts() {
         let mut config = Config {
             server: "global.example".into(),
             ..Config::default()
@@ -154,15 +148,16 @@ mod tests {
             ..Default::default()
         }
         .apply_to(&mut config);
-        assert!(config.server.is_empty());
+        assert_eq!(config.server, "global.example");
         assert_eq!(config.quick_play_world, "My World");
-        config.validate().unwrap();
+        assert!(config.validate().is_err());
         InstanceSettings {
             server: Some("instance.example".into()),
+            quick_play_world: Some(String::new()),
             ..Default::default()
         }
         .apply_to(&mut config);
-        assert!(config.quick_play_world.is_empty());
+        assert_eq!(config.quick_play_world, "My World");
         config.validate().unwrap();
         InstanceSettings {
             server: Some("conflict.example".into()),

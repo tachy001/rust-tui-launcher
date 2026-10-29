@@ -479,6 +479,9 @@ mod tests {
                     }
                     Err(error) => panic!("{error}"),
                 };
+                // On Windows an accepted stream can inherit the listener's
+                // nonblocking mode; switch it back before the HTTP fixture read.
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(1)))
                     .unwrap();
