@@ -824,7 +824,7 @@ mod tests {
                 .set_read_timeout(Some(Duration::from_secs(3)))
                 .unwrap();
             let mut buffer = [0; 4096];
-            socket.read(&mut buffer).unwrap();
+            let _ = socket.read(&mut buffer).unwrap();
             socket.write_all(b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 120\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
         });
         let (tx, _rx) = std::sync::mpsc::channel();
