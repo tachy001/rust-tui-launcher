@@ -303,7 +303,12 @@ impl OptiFineArchive {
 }
 /// Store entries in a fixed order with fixed timestamps and without compression,
 /// so re-running the patcher can reproduce the exact published file checksum.
-pub(crate) fn normalize(input: &Path, output: &Path, control: &TaskControl) -> Result<()> {
+pub(crate) fn normalize(
+    input: &Path,
+    output: &Path,
+    preserve_mod_registration: bool,
+    control: &TaskControl,
+) -> Result<()> {
     let mut archive = crate::installer_archive::open(input, control)?;
     let mut names: Vec<_> = archive.file_names().map(str::to_owned).collect();
     names.sort();
@@ -314,7 +319,7 @@ pub(crate) fn normalize(input: &Path, output: &Path, control: &TaskControl) -> R
         control.check()?;
         let upper = name.to_ascii_uppercase();
         if name.ends_with('/')
-            || upper == "META-INF/MODS.TOML"
+            || (!preserve_mod_registration && upper == "META-INF/MODS.TOML")
             || upper.starts_with("META-INF/")
                 && [".SF", ".RSA", ".DSA", ".EC"]
                     .iter()
@@ -549,12 +554,15 @@ mod tests {
         )
         .unwrap();
         let control = TaskControl::default();
-        normalize(&input, &first, &control).unwrap();
-        normalize(&first, &second, &control).unwrap();
+        normalize(&input, &first, false, &control).unwrap();
+        normalize(&first, &second, false, &control).unwrap();
         assert_eq!(fs::read(&first).unwrap(), fs::read(&second).unwrap());
         let archive = crate::installer_archive::open(&second, &control).unwrap();
         assert_eq!(archive.file_names().collect::<Vec<_>>(), ["a", "z"]);
+        normalize(&input, &first, true, &control).unwrap();
+        let kept = crate::installer_archive::open(&first, &control).unwrap();
+        assert!(kept.file_names().any(|name| name == "META-INF/mods.toml"));
         fs::write(&input, fixtures::jar(&[("../outside", b"bad")])).unwrap();
-        assert!(normalize(&input, &first, &control).is_err());
+        assert!(normalize(&input, &first, false, &control).is_err());
     }
 }

@@ -102,20 +102,12 @@ impl Backend {
     }
     pub fn get_json(&self, url: &str) -> Result<Value> {
         self.control.check()?;
-        if !url.starts_with("https://") {
-            bail!("API 必须使用 HTTPS");
-        }
+        crate::metadata_cache::validate_url(url)?;
         let mut last = None;
-        for candidate in crate::sources::urls(url, &self.source) {
+        for candidate in self.metadata_candidates(url) {
             self.control.check()?;
-            let response = (|| -> Result<Value> {
-                Ok(self
-                    .client
-                    .get(candidate)
-                    .send()?
-                    .error_for_status()?
-                    .json()?)
-            })();
+            let response = crate::metadata_cache::MetadataSource::fetch(self, &candidate)
+                .and_then(|bytes| serde_json::from_slice(&bytes).context("远程 JSON 格式错误"));
             match response {
                 Ok(value) => {
                     self.control.check()?;
@@ -125,6 +117,42 @@ impl Backend {
             }
         }
         Err(last.unwrap_or_else(|| anyhow::anyhow!("无法读取远程元数据")))
+    }
+    pub(crate) fn metadata_candidates(&self, url: &str) -> Vec<String> {
+        let mut candidates = crate::sources::urls(url, &self.source);
+        // Stable ordering preserves the user's source preference when neither
+        // source is cooling down, while ready alternatives avoid needless waits.
+        candidates.sort_by_cached_key(|candidate| self.retry.remaining(candidate));
+        candidates
+    }
+    pub(crate) fn request_metadata_response(
+        &self,
+        url: &str,
+    ) -> Result<reqwest::blocking::Response> {
+        self.retry.wait(url, &self.control, |origin, seconds| {
+            self.log(format!(
+                "元数据源暂时限流或不可用，等待约 {seconds} 秒：{origin}；可取消任务"
+            ));
+        })?;
+        let response = self.client.get(url).send()?;
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok());
+        let server_date = response
+            .headers()
+            .get(reqwest::header::DATE)
+            .and_then(|value| value.to_str().ok());
+        for origin_url in [url, response.url().as_str()] {
+            self.retry.response(
+                origin_url,
+                response.status().as_u16(),
+                retry_after,
+                server_date,
+            )?;
+        }
+        self.control.check()?;
+        Ok(response.error_for_status()?)
     }
     pub(crate) fn downloader(&self) -> Downloader {
         Downloader {
@@ -759,6 +787,66 @@ pub fn offline_uuid(name: &str) -> String {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn metadata_prefers_ready_sources_without_discarding_cooling_alternatives() {
+        use crate::metadata_cache::MetadataSource;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut backend = Backend::new(tx).unwrap();
+        backend.source = "bmclapi".into();
+        let official = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
+        let original = crate::sources::urls(official, &backend.source);
+        assert_eq!(backend.candidates(official), original);
+        backend
+            .retry
+            .response(&original[0], 429, Some("120"), None)
+            .unwrap();
+        assert_eq!(
+            backend.candidates(official),
+            [original[1].clone(), original[0].clone()]
+        );
+        backend
+            .retry
+            .response(official, 503, Some("240"), None)
+            .unwrap();
+        assert_eq!(backend.candidates(official), original);
+        backend.source = "official".into();
+        assert_eq!(backend.candidates(official), [official]);
+    }
+
+    #[test]
+    fn metadata_rate_limit_is_shared_with_downloads_and_blocks_early_requests() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/metadata", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut buffer = [0; 4096];
+            socket.read(&mut buffer).unwrap();
+            socket.write_all(b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 120\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+        });
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut backend = Backend::new(tx).unwrap();
+        backend.client = Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+        assert!(backend.request_metadata_response(&url).is_err());
+        server.join().unwrap();
+        assert!(backend.downloader().retry.remaining(&url) > Duration::from_secs(60));
+        let error = backend.request_metadata_response(&url).unwrap_err();
+        assert!(error.to_string().contains("60秒"), "{error:#}");
+        backend.control.cancel();
+        assert!(backend
+            .request_metadata_response(&url)
+            .unwrap_err()
+            .to_string()
+            .contains("取消"));
+    }
+
     use super::*;
     use std::io::Write;
     #[test]

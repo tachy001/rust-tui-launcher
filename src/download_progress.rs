@@ -16,21 +16,30 @@ impl Snapshot {
     pub fn display(&self, paused: bool) -> String {
         let amount = match self.total {
             Some(total) => format!("{} / {}", bytes(self.done), bytes(total)),
-            None => format!("{} / 大小未知", bytes(self.done)),
+            None => format!(
+                "{} / {}",
+                bytes(self.done),
+                crate::localization::tr("大小未知")
+            ),
         };
         if paused {
-            return format!("{} · {amount} · 已暂停", self.label);
+            return format!(
+                "{} · {amount} · {}",
+                self.label,
+                crate::localization::tr("已暂停")
+            );
         }
         let eta = self
             .eta
             .map(|seconds| {
-                if seconds >= 3600 {
-                    format!(" · 约 {}h {}m", seconds / 3600, seconds % 3600 / 60)
+                let duration = if seconds >= 3600 {
+                    format!("{}h {}m", seconds / 3600, seconds % 3600 / 60)
                 } else if seconds >= 60 {
-                    format!(" · 约 {}m {}s", seconds / 60, seconds % 60)
+                    format!("{}m {}s", seconds / 60, seconds % 60)
                 } else {
-                    format!(" · 约 {seconds}s")
-                }
+                    format!("{seconds}s")
+                };
+                format!(" · {}", tformat!("约 {}", duration))
             })
             .unwrap_or_default();
         format!(
@@ -82,10 +91,7 @@ impl<'a> Meter<'a> {
     }
     pub fn update(&self, job: usize, position: u64, total: Option<u64>, received: u64) {
         let mut state = self.state.lock().unwrap();
-        state.jobs[job].0 = position;
-        if total.is_some() {
-            state.jobs[job].1 = total;
-        }
+        state.jobs[job] = (position, total);
         state.received = state.received.saturating_add(received);
         if state.last_report.elapsed() >= Duration::from_millis(300) {
             self.send(&mut state);
@@ -145,6 +151,15 @@ mod tests {
         };
         assert_eq!(snapshot.done, 220);
         assert!(snapshot.speed > 0.0);
+        // The next source may omit Content-Length even if its predecessor supplied it.
+        meter.update(0, 10, None, 10);
+        meter.finish();
+        let Message::Transfer(snapshot) = rx.recv().unwrap() else {
+            panic!()
+        };
+        assert_eq!(snapshot.done, 210);
+        assert_eq!(snapshot.total, None);
+        assert_eq!(snapshot.eta, None);
     }
     #[test]
     fn unknown_sizes_and_pause_do_not_invent_an_eta() {

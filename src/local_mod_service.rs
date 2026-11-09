@@ -61,6 +61,7 @@ impl ModMutationSession {
         } else {
             bail!("请选择 JAR Mod 文件");
         };
+        self.ensure_names_free(filename, &target, Some(filename), &TaskControl::default())?;
         let target = safe_path(&self.directory, &target)?;
         // A hard link publishes atomically and fails if the destination exists.
         // Unlike rename, it cannot replace a concurrently created target on Unix.
@@ -91,14 +92,16 @@ impl ModMutationSession {
     ) -> Result<()> {
         control.check()?;
         crate::metadata::valid_id(filename)?;
-        if !filename.to_ascii_lowercase().ends_with(".jar") {
-            bail!("只能导入 .jar 文件");
-        }
+        let lower = filename.to_ascii_lowercase();
+        let counterpart = if lower.ends_with(".jar.disabled") {
+            filename[..filename.len() - ".disabled".len()].to_owned()
+        } else if lower.ends_with(".jar") {
+            format!("{filename}.disabled")
+        } else {
+            bail!("只能导入 .jar 或 .jar.disabled 文件");
+        };
         let target = safe_path(&self.directory, filename)?;
-        let disabled = safe_path(&self.directory, &format!("{filename}.disabled"))?;
-        if fs::symlink_metadata(&target).is_ok() || fs::symlink_metadata(&disabled).is_ok() {
-            bail!("已有同名启用或禁用 Mod，不会覆盖或创建双副本");
-        }
+        self.ensure_names_free(filename, &counterpart, None, control)?;
         let staged_path = self.directory.join(format!(
             ".tui-mc-import-{}-{}.part",
             std::process::id(),
@@ -126,12 +129,62 @@ impl ModMutationSession {
         drop(output);
         copied?;
         control.check()?;
-        zip::ZipArchive::new(fs::File::open(&staged.0)?)
-            .context("文件不是有效的 JAR 归档，未发布到 Mod 目录")?;
+        Self::validate_archive(&staged.0, control)
+            .context("Mod 归档校验失败，未发布到 Mod 目录")?;
         control.check()?;
+        self.ensure_names_free(filename, &counterpart, None, control)?;
         fs::hard_link(&staged.0, &target)
             .context("无法发布 Mod；目标可能已存在，或文件系统不支持硬链接")?;
         Ok(())
+    }
+
+    fn ensure_names_free(
+        &self,
+        filename: &str,
+        counterpart: &str,
+        source: Option<&str>,
+        control: &TaskControl,
+    ) -> Result<()> {
+        // Management records compare ASCII names without case, even on Linux.
+        // Include directories and broken links: neither is a free destination.
+        for entry in fs::read_dir(&self.directory).context("无法检查 Mod 目录中的同名文件")?
+        {
+            control.check()?;
+            let name = entry?.file_name();
+            if name.to_str().is_some_and(|name| {
+                Some(name) != source
+                    && (name.eq_ignore_ascii_case(filename)
+                        || name.eq_ignore_ascii_case(counterpart))
+            }) {
+                bail!("已有同名启用或禁用 Mod，不会覆盖或创建双副本");
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_archive(path: &Path, control: &TaskControl) -> Result<()> {
+        let mut archive = crate::installer_archive::open(path, control)?;
+        let mut buffer = [0; 65536];
+        for index in 0..archive.len() {
+            control.check()?;
+            let mut entry = archive.by_index(index)?;
+            if entry.is_dir() {
+                continue;
+            }
+            // Opening a ZIP checks its directory only. Reading through EOF also
+            // validates compression and CRC, without extracting or retaining data.
+            loop {
+                control.check()?;
+                if entry
+                    .read(&mut buffer)
+                    .with_context(|| format!("Mod 条目损坏：{}", entry.name()))?
+                    == 0
+                {
+                    break;
+                }
+            }
+        }
+        control.check()
     }
 }
 
@@ -208,6 +261,93 @@ mod tests {
         }
     }
     #[test]
+    fn toggling_rejects_case_variant_counterparts_without_changing_either_file() {
+        for (source, conflict) in [
+            ("Example.jar", "EXAMPLE.JAR.DISABLED"),
+            ("Example.jar.disabled", "EXAMPLE.JAR"),
+        ] {
+            let temp = crate::test_support::Workspace::new();
+            let session = ModMutationSession::begin(&config(&temp.path), "test").unwrap();
+            fs::write(session.directory.join(source), b"selected").unwrap();
+            fs::write(session.directory.join(conflict), b"existing counterpart").unwrap();
+            assert!(session.toggle(source).is_err());
+            assert_eq!(
+                fs::read(session.directory.join(source)).unwrap(),
+                b"selected"
+            );
+            assert_eq!(
+                fs::read(session.directory.join(conflict)).unwrap(),
+                b"existing counterpart"
+            );
+            assert_eq!(fs::read_dir(&session.directory).unwrap().count(), 2);
+        }
+    }
+
+    #[test]
+    fn corrupt_entry_payload_is_rejected_before_publication() {
+        let temp = crate::test_support::Workspace::new();
+        let session = ModMutationSession::begin(&config(&temp.path), "test").unwrap();
+        let mut archive = zip::ZipWriter::new(Cursor::new(vec![]));
+        archive
+            .start_file(
+                "example.class",
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored),
+            )
+            .unwrap();
+        archive.write_all(b"payload-to-corrupt").unwrap();
+        let mut bytes = archive.finish().unwrap().into_inner();
+        let offset = bytes
+            .windows(b"payload-to-corrupt".len())
+            .position(|part| part == b"payload-to-corrupt")
+            .unwrap();
+        bytes[offset] ^= 1;
+        // Directory parsing still succeeds; only reading the payload finds CRC damage.
+        assert!(zip::ZipArchive::new(Cursor::new(&bytes)).is_ok());
+        for name in ["damaged.jar", "damaged.jar.disabled"] {
+            let error = session
+                .import_reader(name, &mut Cursor::new(&bytes), &TaskControl::default())
+                .unwrap_err();
+            assert!(format!("{error:#}").contains("example.class"));
+            assert!(!session.directory.join(name).exists());
+            no_partial(&session.directory);
+        }
+    }
+
+    #[test]
+    fn importing_disabled_mod_keeps_state_and_rejects_enabled_counterpart() {
+        let temp = crate::test_support::Workspace::new();
+        let session = ModMutationSession::begin(&config(&temp.path), "test").unwrap();
+        let bytes = jar();
+        session
+            .import_reader(
+                "Example.JAR.DISABLED",
+                &mut Cursor::new(&bytes),
+                &TaskControl::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            fs::read(session.directory.join("Example.JAR.DISABLED")).unwrap(),
+            bytes
+        );
+        assert!(!session.directory.join("Example.JAR").exists());
+        session.toggle("Example.JAR.DISABLED").unwrap();
+        assert!(session
+            .import_reader(
+                "Example.JAR.disabled",
+                &mut Cursor::new(&bytes),
+                &TaskControl::default()
+            )
+            .is_err());
+        assert_eq!(
+            fs::read(session.directory.join("Example.JAR")).unwrap(),
+            bytes
+        );
+        assert!(!session.directory.join("Example.JAR.disabled").exists());
+        no_partial(&session.directory);
+    }
+
+    #[test]
     fn copy_failure_invalid_archive_and_cancellation_never_publish_partial_mods() {
         let temp = crate::test_support::Workspace::new();
         let session = ModMutationSession::begin(&config(&temp.path), "test").unwrap();
@@ -251,19 +391,22 @@ mod tests {
                 self.bytes.read(buffer)
             }
         }
-        let temp = crate::test_support::Workspace::new();
-        let session = ModMutationSession::begin(&config(&temp.path), "test").unwrap();
-        let target = session.directory.join("race.jar");
-        let mut source = RaceReader {
-            bytes: Cursor::new(jar()),
-            target: target.clone(),
-            created: false,
-        };
-        assert!(session
-            .import_reader("race.jar", &mut source, &TaskControl::default())
-            .is_err());
-        assert_eq!(fs::read(target).unwrap(), b"concurrent file");
-        no_partial(&session.directory);
+        for concurrent in ["race.jar", "RACE.JAR.DISABLED"] {
+            let temp = crate::test_support::Workspace::new();
+            let session = ModMutationSession::begin(&config(&temp.path), "test").unwrap();
+            let target = session.directory.join(concurrent);
+            let mut source = RaceReader {
+                bytes: Cursor::new(jar()),
+                target: target.clone(),
+                created: false,
+            };
+            assert!(session
+                .import_reader("race.jar", &mut source, &TaskControl::default())
+                .is_err());
+            assert_eq!(fs::read(target).unwrap(), b"concurrent file");
+            assert_eq!(fs::read_dir(&session.directory).unwrap().count(), 1);
+            no_partial(&session.directory);
+        }
     }
 
     #[test]

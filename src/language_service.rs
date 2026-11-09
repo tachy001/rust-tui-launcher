@@ -38,11 +38,25 @@ impl GameLanguage {
             .chain(meta["assetIndex"]["id"].as_str())
             .find_map(|version| {
                 let mut parts = version.split('-').next()?.split('.');
-                (parts.next()? == "1")
-                    .then(|| parts.next()?.parse::<u32>().ok())
-                    .flatten()
+                let major = parts.next()?.parse::<u32>().ok()?;
+                match major {
+                    1 => Some(parts.next()?.parse::<u32>().ok()? < 16),
+                    26.. => Some(false),
+                    _ => None,
+                }
             })
-            .is_some_and(|minor| minor < 16);
+            .or_else(|| {
+                // HMCL gates Classical Chinese at 1.16. A renamed instance may
+                // have only a release timestamp; years before 2020 unambiguously
+                // precede that version. Do not guess within the transition year.
+                let year: u32 = meta["releaseTime"].as_str()?.get(..4)?.parse().ok()?;
+                match year {
+                    2012..=2019 => Some(true),
+                    2021.. => Some(false),
+                    _ => None,
+                }
+            })
+            .unwrap_or(false);
         let language = if preferred == "lzh" && (!modern || before_classical_chinese) {
             "zh_cn"
         } else {
@@ -270,6 +284,50 @@ mod tests {
                 .as_deref(),
             Some("zh_cn")
         );
+    }
+
+    #[test]
+    fn classical_language_uses_release_time_only_when_version_is_unknown() {
+        let language = GameLanguage::parse("lzh").unwrap();
+        for (version, metadata, expected) in [
+            (
+                "renamed",
+                json!({"releaseTime":"2019-12-10T00:00:00Z"}),
+                "zh_cn",
+            ),
+            (
+                "renamed",
+                json!({"releaseTime":"2015-12-10T00:00:00Z"}),
+                "zh_CN",
+            ),
+            (
+                "renamed",
+                json!({"releaseTime":"2022-01-01T00:00:00Z"}),
+                "lzh",
+            ),
+            ("1.16", json!({"releaseTime":"2019-01-01T00:00:00Z"}), "lzh"),
+            (
+                "26.1",
+                json!({"assets":"1.15", "releaseTime":"2019-01-01T00:00:00Z"}),
+                "lzh",
+            ),
+            (
+                "renamed",
+                json!({"assets":"1.15", "releaseTime":"2022-01-01T00:00:00Z"}),
+                "zh_cn",
+            ),
+            (
+                "renamed",
+                json!({"assetIndex":{"id":"1.16"}, "releaseTime":"2019-01-01T00:00:00Z"}),
+                "lzh",
+            ),
+        ] {
+            assert_eq!(
+                language.for_version(version, &metadata).as_deref(),
+                Some(expected),
+                "{version}: {metadata}"
+            );
+        }
     }
 
     #[test]

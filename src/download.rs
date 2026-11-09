@@ -360,9 +360,7 @@ impl Downloader {
         let mut position = if resume { offset } else { 0 };
         meter.update(job, position, entry.size.or(expected_len), 0);
         loop {
-            self.control.check()?;
-            let n = response.read(&mut buffer)?;
-            self.control.check()?;
+            let n = read_block(&mut response, &mut buffer, &self.control)?;
             if n == 0 {
                 break;
             }
@@ -508,13 +506,24 @@ pub(crate) fn valid_file_with_control(
     let mut file = fs::File::open(path)?;
     hash_matches(&mut file, expected, control)
 }
+fn read_block(reader: &mut impl Read, buffer: &mut [u8], control: &TaskControl) -> Result<usize> {
+    loop {
+        control.check()?;
+        let n = match reader.read(buffer) {
+            Ok(n) => n,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        };
+        control.check()?;
+        return Ok(n);
+    }
+}
+
 fn hash_matches(reader: &mut impl Read, expected: &str, control: &TaskControl) -> Result<bool> {
     let mut hash = Sha1::new();
     let mut buf = [0u8; 65536];
     loop {
-        control.check()?;
-        let n = reader.read(&mut buf)?;
-        control.check()?;
+        let n = read_block(reader, &mut buf, control)?;
         if n == 0 {
             break;
         }
@@ -526,6 +535,30 @@ fn hash_matches(reader: &mut impl Read, expected: &str, control: &TaskControl) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn interrupted_hash_read_preserves_previous_blocks() {
+        struct Blocks(u8);
+        impl Read for Blocks {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                self.0 += 1;
+                let bytes: &[u8] = match self.0 {
+                    1 => b"a",
+                    2 => return Err(std::io::ErrorKind::Interrupted.into()),
+                    3 => b"bc",
+                    _ => b"",
+                };
+                buffer[..bytes.len()].copy_from_slice(bytes);
+                Ok(bytes.len())
+            }
+        }
+        assert!(hash_matches(
+            &mut Blocks(0),
+            "a9993e364706816aba3e25717850c26c9cd0d89d",
+            &TaskControl::default()
+        )
+        .unwrap());
+    }
+
     #[test]
     fn cancellation_during_hash_read_is_not_a_checksum_mismatch() {
         struct CancellingReader {

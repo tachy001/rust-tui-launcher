@@ -38,14 +38,15 @@ impl Diagnosis {
 fn classify(text: &str) -> Vec<(&'static str, &'static str)> {
     let text = text.to_lowercase();
     let rules = [
-        (&["unsupportedclassversionerror", "unsupported class file major version"][..], "Java 版本不兼容", "将实例 Java 设为自动，或选择游戏与加载器要求的 Java；若错误来自 Mod，也检查它支持的游戏和 Java 版本。"),
+        (&["unsupportedclassversionerror", "unsupported class file major version", "unsupported major.minor version", "level is not supported by the active jre or asm version"][..], "Java 版本不兼容", "将实例 Java 设为自动，或选择游戏与加载器要求的 Java；若错误来自 Mod，也检查它支持的游戏和 Java 版本。"),
         (&["could not reserve enough space", "invalid maximum heap size", "native memory allocation (malloc) failed", "there is insufficient memory for the java runtime environment"][..], "Java 无法分配内存", "降低实例内存，关闭其他占用内存的程序；检查 Java 位数和自定义 -Xmx / -Xms 参数。"),
         (&["outofmemoryerror: java heap space", "outofmemoryerror: gc overhead limit exceeded"][..], "Java 堆内存不足", "在机器可用内存允许的范围内提高实例内存；大型整合包也应检查异常占用内存的 Mod。"),
         (&["outofmemoryerror: unable to create native thread"][..], "系统无法创建更多线程", "检查系统可用内存与线程限制，减少后台程序和创建大量线程的 Mod。"),
-        (&["incompatible mods found", "modresolutionexception", "missing mandatory dependencies", "modloadingexception", "loadingfailedexception"][..], "加载器报告 Mod 或依赖问题", "打开日志中的依赖说明，检查游戏版本、加载器、前置 Mod 和冲突版本；可逐批禁用最近添加的 Mod。"),
-        (&["duplicate mods", "duplicate mod id", "found duplicate mods"][..], "重复 Mod", "检查 mods 目录是否同时放入了同一 Mod 的多个版本，保留需要的版本，其余禁用或移出。"),
+        (&["incompatible mods found", "modresolutionexception", "missing mandatory dependencies", "missing or unsupported mandatory dependencies:", "modloadingexception", "loadingfailedexception"][..], "加载器报告 Mod 或依赖问题", "打开日志中的依赖说明，检查游戏版本、加载器、前置 Mod 和冲突版本；可逐批禁用最近添加的 Mod。"),
+        (&["duplicate mods", "duplicate mod id", "found duplicate mods", "duplicatemodsfoundexception", "found a duplicate mod", "modresolutionexception: duplicate"][..], "重复 Mod", "检查 mods 目录是否同时放入了同一 Mod 的多个版本，保留需要的版本，其余禁用或移出。"),
         (&["could not find or load main class", "classnotfoundexception", "noclassdeffounderror"][..], "缺少类或启动依赖", "先使用实例修复；若错误类属于 Mod，检查前置依赖与版本兼容性。也检查自定义 classpath 参数。"),
         (&["glfw error 65542", "glfw error 65543", "pixel format not accelerated", "failed to create window", "opengl is not supported"][..], "图形环境初始化失败", "检查显卡驱动、硬件对该游戏版本的支持，以及远程桌面或虚拟机的图形环境。"),
+        (&["cannot find launch target fmlclient, unable to launch"][..], "Forge 客户端安装不完整", "重新安装当前实例对应的 Forge，保留存档与配置；检查安装任务是否成功完成及所需加载器文件是否齐全。"),
         (&["zipexception", "invalid or corrupt jarfile", "zip end header not found"][..], "JAR / ZIP 文件读取失败", "根据日志中的文件位置修复或重新下载对应库 / Mod；移除最近添加的损坏文件后再试。"),
         (&["unrecognized vm option", "improperly specified vm option", "unrecognized option:"][..], "Java 启动参数不兼容", "检查并暂时清空实例自定义 JVM 参数，确认它们适用于当前 Java 版本。"),
         (&["exception_access_violation", "sigsegv", "a fatal error has been detected by the java runtime environment"][..], "Java 或原生组件崩溃", "查看 hs_err_pid 报告中的 Problematic frame；检查 Java、显卡驱动和原生 Mod。仅凭退出码无法确定原因。"),
@@ -317,6 +318,23 @@ mod tests {
             "Java 堆内存不足"
         );
     }
+    #[test]
+    fn recognizes_legacy_java_and_loader_failures_from_pcl_signatures() {
+        for (log, expected) in [
+            ("java.lang.UnsupportedClassVersionError: example/Mod : Unsupported major.minor version 52.0", "Java 版本不兼容"),
+            ("The requested compatibility level JAVA_11 could not be set. Level is not supported by the active JRE or ASM version", "Java 版本不兼容"),
+            ("net.minecraftforge.fml.common.DuplicateModsFoundException", "重复 Mod"),
+            ("Found a duplicate mod example at mods/example.jar", "重复 Mod"),
+            ("ModResolutionException: Duplicate versions for mod ID example", "重复 Mod"),
+            ("Missing or unsupported mandatory dependencies:\nMod ID: example", "加载器报告 Mod 或依赖问题"),
+            ("Cannot find launch target fmlclient, unable to launch", "Forge 客户端安装不完整"),
+        ] {
+            let findings = classify(log);
+            assert_eq!(findings.iter().filter(|(title, _)| *title == expected).count(), 1, "{log}: {findings:?}");
+        }
+        assert!(classify("Launch target fmlclient selected; Mod dependencies resolved").is_empty());
+    }
+
     #[test]
     fn reads_head_tail_and_ignores_stale_crashes() {
         let temp = crate::test_support::Workspace::new();

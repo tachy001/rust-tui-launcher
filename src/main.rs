@@ -15,7 +15,6 @@ mod curseforge;
 mod diagnostics;
 mod download;
 mod download_lock;
-mod download_progress;
 mod download_resume_service;
 mod download_retry_service;
 mod fabric_check;
@@ -53,6 +52,8 @@ mod memory_service;
 mod minecraft_profile_service;
 #[macro_use]
 mod localization;
+// Uses the localization macros declared above.
+mod download_progress;
 mod installed_mod_service;
 mod local_mod_service;
 mod metadata;

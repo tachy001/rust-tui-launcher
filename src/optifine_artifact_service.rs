@@ -34,6 +34,8 @@ pub(crate) struct Origin {
     pub game: String,
     pub edition: String,
     pub release: String,
+    #[serde(default)]
+    pub preserve_mod_registration: bool,
     pub action: Action,
 }
 fn hash_valid(hash: &str) -> bool {
@@ -71,12 +73,17 @@ impl Origin {
     }
     fn key(&self) -> Result<String> {
         Ok(format!(
-            "{:x}",
+            "{:x}{}",
             Sha1::digest(serde_json::to_vec(&json!([
                 self.raw_sha1,
                 self.client_sha1,
                 self.action
-            ]))?)
+            ]))?),
+            if self.preserve_mod_registration {
+                ".keepmod"
+            } else {
+                ""
+            }
         ))
     }
 }
@@ -173,7 +180,7 @@ impl<'a> OptiFineArtifactService<'a> {
             if !hash_valid(sha1) || size == 0 {
                 bail!("OptiFine 工件缺少校验信息");
             }
-            if valid(destination, sha1, size)? {
+            if valid(destination, sha1, size, self.control)? {
                 return Ok(Stamp {
                     schema: 1,
                     key,
@@ -187,7 +194,7 @@ impl<'a> OptiFineArtifactService<'a> {
                     if stamp.schema == 1
                         && stamp.key == key
                         && hash_valid(&stamp.sha1)
-                        && valid(destination, &stamp.sha1, stamp.size)?
+                        && valid(destination, &stamp.sha1, stamp.size, self.control)?
                     {
                         return Ok(stamp);
                     }
@@ -241,7 +248,12 @@ impl<'a> OptiFineArtifactService<'a> {
         }
         self.control.check()?;
         let normalized = workspace.path.join("normalized.jar");
-        optifine_archive::normalize(&output, &normalized, self.control)?;
+        optifine_archive::normalize(
+            &output,
+            &normalized,
+            origin.preserve_mod_registration,
+            self.control,
+        )?;
         let stamp = Stamp {
             schema: 1,
             key,
@@ -300,9 +312,11 @@ impl<'a> OptiFineArtifactService<'a> {
         Ok(())
     }
 }
-fn valid(path: &Path, hash: &str, size: u64) -> Result<bool> {
-    Ok(crate::download::valid_file(path, Some(hash), Some(size))?
-        && zip::ZipArchive::new(fs::File::open(path)?).is_ok())
+fn valid(path: &Path, hash: &str, size: u64, control: &TaskControl) -> Result<bool> {
+    Ok(
+        crate::download::valid_file_with_control(path, Some(hash), Some(size), control)?
+            && zip::ZipArchive::new(fs::File::open(path)?).is_ok(),
+    )
 }
 impl OptiFineIo for crate::backend::Backend {
     fn raw(&self, root: &Path, origin: &Origin) -> Result<PathBuf> {
@@ -315,7 +329,12 @@ impl OptiFineIo for crate::backend::Backend {
                 size: None,
                 alternatives: vec![],
             })?;
-        } else if !crate::download::valid_file(&path, Some(&origin.raw_sha1), None)? {
+        } else if !crate::download::valid_file_with_control(
+            &path,
+            Some(&origin.raw_sha1),
+            None,
+            &self.control,
+        )? {
             bail!("本地 OptiFine 安装包缓存缺失，请重新导入原安装包");
         }
         Ok(path)
@@ -425,6 +444,7 @@ mod tests {
         fs::create_dir_all(client.parent().unwrap()).unwrap();
         fs::write(&client, b"client fixture").unwrap();
         let origin = Origin {
+            preserve_mod_registration: false,
             schema: 1,
             raw_sha1: optifine_archive::digest(&raw, control).unwrap(),
             raw_url: None,
@@ -453,9 +473,13 @@ mod tests {
         let config = Config::default();
         let (io, origin) = setup(&workspace.path, &control);
         let service = OptiFineArtifactService::new(&io, &config, &control);
-        let library = service
+        let mut library = service
             .library(&workspace.path, "optifine:OptiFine:test", origin.clone())
             .unwrap();
+        library["tuiMcOptiFine"]
+            .as_object_mut()
+            .unwrap()
+            .remove("preserve_mod_registration");
         let path = workspace
             .path
             .join("libraries/optifine/OptiFine/test/OptiFine-test.jar");

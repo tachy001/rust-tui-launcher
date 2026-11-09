@@ -72,6 +72,7 @@ tui-launcher java-install 21
 tui-launcher import MyPack.mrpack my-pack
 tui-launcher pack-info MyPack.mrpack
 tui-launcher mods my-pack add Example.jar
+tui-launcher mods my-pack add Example.jar.disabled
 tui-launcher account offline Player
 tui-launcher instance name 1.21.1 "我的原版"
 tui-launcher instance clone 1.21.1 my-survival

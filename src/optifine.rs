@@ -30,6 +30,40 @@ pub(crate) struct OptiFineVersion {
     pub url: String,
     pub stable: bool,
 }
+impl OptiFineVersion {
+    fn discard_mismatched_download(
+        &self,
+        path: &Path,
+        control: &crate::task::TaskControl,
+        on_wait: impl FnMut(),
+    ) -> Result<()> {
+        let _lease = crate::download_lock::DownloadLease::acquire(path, control, on_wait)?;
+        match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+            Ok(metadata) if !metadata.is_file() => bail!("OptiFine 下载缓存不是普通文件"),
+            Ok(_) => {}
+        }
+        match OptiFineArchive::inspect(path, control) {
+            Ok(info) if self.matches_installer(&info.identity) => return Ok(()),
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() != std::io::ErrorKind::UnexpectedEof) =>
+            {
+                return Err(error)
+            }
+            _ => {}
+        }
+        control.check()?;
+        fs::remove_file(path).context("清理无效 OptiFine 下载缓存失败")?;
+        Ok(())
+    }
+    fn matches_installer(&self, identity: &Identity) -> bool {
+        normal_game(&self.identity.game) == normal_game(&identity.game)
+            && self.identity.version() == identity.version()
+    }
+}
 pub(crate) fn catalog(bytes: &[u8], game: &str) -> Result<Vec<OptiFineVersion>> {
     let value: Value = serde_json::from_slice(bytes)?;
     let mut seen = HashSet::new();
@@ -114,12 +148,14 @@ enum LaunchMode {
     ForgeLegacy,
     ForgeModLauncher,
     ForgeBootstrap,
+    ForgeNativeBootstrap,
 }
 fn launch_mode(meta: &Value) -> Result<LaunchMode> {
     let main = meta["mainClass"].as_str().context("父实例没有启动入口")?;
     let libraries = meta["libraries"].as_array().context("父实例没有依赖列表")?;
     let forge = libraries
         .iter()
+        .filter(|library| crate::metadata::allowed(library))
         .filter_map(|lib| lib["name"].as_str())
         .any(|name| {
             name.starts_with("net.minecraftforge:forge:")
@@ -131,9 +167,46 @@ fn launch_mode(meta: &Value) -> Result<LaunchMode> {
         "net.minecraft.launchwrapper.Launch" if forge => Ok(LaunchMode::ForgeLegacy),
         "cpw.mods.modlauncher.Launcher" if forge => Ok(LaunchMode::ForgeModLauncher),
         "cpw.mods.bootstraplauncher.BootstrapLauncher" if forge => Ok(LaunchMode::ForgeBootstrap),
+        "net.minecraftforge.bootstrap.ForgeBootstrap" if forge => {
+            Ok(LaunchMode::ForgeNativeBootstrap)
+        }
         _ => bail!("当前父实例的启动入口不支持此 OptiFine 安装模式"),
     }
 }
+fn needs_registration_fix(game: &str, meta: &Value) -> bool {
+    game == "1.20.4"
+        && meta["libraries"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|lib| crate::metadata::allowed(lib))
+            .filter_map(|lib| lib["name"].as_str())
+            .any(|name| {
+                let mut parts = name.split(':');
+                if parts.next() != Some("net.minecraftforge")
+                    || !matches!(parts.next(), Some("forge" | "fmlloader"))
+                {
+                    return false;
+                }
+                let Some(version) = parts.next() else {
+                    return false;
+                };
+                let version = version.strip_prefix("1.20.4-").unwrap_or(version);
+                let mut numbers = version.split('.').map(str::parse::<u32>);
+                match (
+                    numbers.next(),
+                    numbers.next(),
+                    numbers.next(),
+                    numbers.next(),
+                ) {
+                    (Some(Ok(a)), Some(Ok(b)), Some(Ok(c)), None) => {
+                        ((48, 0, 0)..=(49, 0, 50)).contains(&(a, b, c))
+                    }
+                    _ => false,
+                }
+            })
+}
+
 fn compatibility(meta: &Value, info: &OptiFineArchive) -> Result<LaunchMode> {
     let mode = launch_mode(meta)?;
     match mode {
@@ -214,6 +287,7 @@ pub(crate) fn profile(
             }
             "cpw.mods.bootstraplauncher.BootstrapLauncher"
         }
+        LaunchMode::ForgeNativeBootstrap => "net.minecraftforge.bootstrap.ForgeBootstrap",
     };
     let mut result = json!({"id":id,"inheritsFrom":parent,"mainClass":main,"libraries":libraries,
         "tuiMcOptiFineVersion":format!("{}_{}",info.identity.game,info.identity.version())});
@@ -253,6 +327,9 @@ impl Backend {
             game,
             chosen.identity.version()
         ));
+        chosen.discard_mismatched_download(&path, &self.control, || {
+            self.log("正在等待其他任务释放 OptiFine 安装器，可取消任务")
+        })?;
         self.downloader().fetch(&crate::download::Download {
             url: chosen.url.clone(),
             dest: path.clone(),
@@ -260,13 +337,7 @@ impl Backend {
             size: None,
             alternatives: vec![],
         })?;
-        let info = OptiFineArchive::inspect(&path, &self.control)?;
-        if info.identity.game != chosen.identity.game
-            || info.identity.version() != chosen.identity.version()
-        {
-            bail!("下载的 OptiFine 身份与所选版本不符，未运行补丁器");
-        }
-        self.install_optifine_local_source(config, game, &path, None, Some(chosen.url.clone()))
+        self.install_optifine_local_source(config, game, &path, None, Some(chosen))
     }
     pub(crate) fn install_optifine_local(
         &self,
@@ -283,12 +354,22 @@ impl Backend {
         parent: &str,
         path: &Path,
         id: Option<&str>,
-        url: Option<String>,
+        chosen: Option<&OptiFineVersion>,
     ) -> Result<String> {
         use crate::game_java_service::ClientVersionSource;
         self.control.check()?;
         valid_id(parent)?;
+        let download_lease = chosen
+            .map(|_| {
+                crate::download_lock::DownloadLease::acquire(path, &self.control, || {
+                    self.log("正在等待其他任务释放 OptiFine 安装器，可取消任务")
+                })
+            })
+            .transpose()?;
         let info = OptiFineArchive::inspect(path, &self.control)?;
+        if chosen.is_some_and(|version| !version.matches_installer(&info.identity)) {
+            bail!("下载的 OptiFine 身份与所选版本不符，未运行补丁器");
+        }
         let default = format!("{parent}-OptiFine-{}", info.identity.version());
         let id = id.unwrap_or(&default);
         valid_id(id)?;
@@ -314,7 +395,8 @@ impl Backend {
             );
         }
         if let Some(hash) = resolved.meta["downloads"]["client"]["sha1"].as_str() {
-            if !crate::download::valid_file(&client, Some(hash), None)? {
+            if !crate::download::valid_file_with_control(&client, Some(hash), None, &self.control)?
+            {
                 bail!("原版客户端校验失败，请先修复父实例");
             }
         }
@@ -325,9 +407,10 @@ impl Backend {
         let raw_sha1 = optifine_archive::digest(path, &self.control)?;
         let client_sha1 = optifine_archive::digest(&client, &self.control)?;
         let mut origin = Origin {
+            preserve_mod_registration: !needs_registration_fix(&info.identity.game, &resolved.meta),
             schema: 1,
             raw_sha1,
-            raw_url: url,
+            raw_url: chosen.map(|version| version.url.clone()),
             jar_id: resolved.jar_id.clone(),
             client_sha1,
             game_minimum: game.requirement.recommended(),
@@ -344,13 +427,24 @@ impl Backend {
         let raw = origin.raw_path(&root);
         {
             let _lease = crate::download_lock::DownloadLease::acquire(&raw, &self.control, || {})?;
-            if !crate::download::valid_file(&raw, Some(&origin.raw_sha1), None)? {
+            if !crate::download::valid_file_with_control(
+                &raw,
+                Some(&origin.raw_sha1),
+                None,
+                &self.control,
+            )? {
                 crate::storage::atomic_copy(&raw, &mut fs::File::open(path)?)?;
             }
         }
+        drop(download_lease);
         let effective = config.effective(parent)?;
         let artifacts = OptiFineArtifactService::new(self, &effective, &self.control);
-        let suffix = format!("-tui.{}.{}", origin.raw_sha1, origin.client_sha1);
+        let variant = if origin.preserve_mod_registration {
+            ".keepmod"
+        } else {
+            ""
+        };
+        let suffix = format!("-tui.{}.{}{variant}", origin.raw_sha1, origin.client_sha1);
         let coordinate = format!(
             "optifine:OptiFine:{}_{}{suffix}",
             info.identity.game,
@@ -386,6 +480,37 @@ mod tests {
     use crate::{optifine_archive::fixtures, task::TaskControl};
     use sha1::{Digest, Sha1};
     #[test]
+    fn stale_online_installer_cache_is_cleared_before_retry() {
+        let workspace = crate::test_support::Workspace::new();
+        let path = workspace.path.join("download.jar");
+        let control = TaskControl::default();
+        fixtures::installer(&path, "1.12.2", false, false);
+        let mut chosen = OptiFineVersion {
+            identity: OptiFineArchive::inspect(&path, &control).unwrap().identity,
+            url: String::new(),
+            stable: true,
+        };
+        chosen
+            .discard_mismatched_download(&path, &control, || {})
+            .unwrap();
+        assert!(path.exists());
+        chosen.identity.game = "1.20.1".into();
+        let held = crate::download_lock::DownloadLease::try_acquire(&path).unwrap();
+        let cancelled = TaskControl::default();
+        let before = fs::read(&path).unwrap();
+        let error = chosen
+            .discard_mismatched_download(&path, &cancelled, || cancelled.cancel())
+            .unwrap_err();
+        assert!(error.to_string().contains("取消"));
+        assert_eq!(fs::read(&path).unwrap(), before);
+        drop(held);
+        chosen
+            .discard_mismatched_download(&path, &control, || {})
+            .unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
     fn catalog_normalizes_lookup_versions_and_keeps_release_channels_distinct() {
         let bytes = serde_json::to_vec(&json!([
             {"mcversion":"1.8.0","type":"HD_U","patch":"I6_pre2"},
@@ -394,6 +519,11 @@ mod tests {
         ]))
         .unwrap();
         let versions = catalog(&bytes, "1.8").unwrap();
+        let mut archive = versions[0].identity.clone();
+        archive.game = "1.8.0".into();
+        assert!(versions[0].matches_installer(&archive));
+        archive.release.push_str("_pre");
+        assert!(!versions[0].matches_installer(&archive));
         assert_eq!(versions.len(), 2);
         assert_eq!(versions[0].identity.version(), "HD_U_I5");
         assert!(versions[0].stable);
@@ -433,7 +563,8 @@ mod tests {
             edition: "HD_U".into(),
             release: "J1_pre10".into(),
         };
-        assert_eq!(versions[2].identity.version(), raw.version());
+        assert!(versions[2].matches_installer(&raw));
+        assert!(!versions[3].matches_installer(&raw));
     }
     fn info() -> OptiFineArchive {
         OptiFineArchive {
@@ -517,6 +648,47 @@ mod tests {
         }
     }
     #[test]
+    fn registration_fix_matches_only_affected_forge_versions() {
+        for (game, version, expected) in [
+            ("1.20.4", "48.0.0", true),
+            ("1.20.4", "49.0.50", true),
+            ("1.20.4", "49.0.51", false),
+            ("1.20.2", "48.0.0", false),
+        ] {
+            let meta = json!({"libraries":[{"name":format!("net.minecraftforge:forge:{game}-{version}")}]});
+            assert_eq!(needs_registration_fix(game, &meta), expected);
+        }
+    }
+
+    #[test]
+    fn modern_forge_bootstrap_is_preserved_without_legacy_tweakers() {
+        let main = "net.minecraftforge.bootstrap.ForgeBootstrap";
+        let parent = json!({
+            "mainClass":main,
+            "libraries":[{"name":"net.minecraftforge:forge:1.21.1-52.1.20"}],
+            "arguments":{"game":["--launchTarget","forgeclient"], "jvm":["-DlegacyClassPath=${classpath}"]}
+        });
+        let child = profile("of", "forge", &parent, &info(), core(), None).unwrap();
+        assert_eq!(child["mainClass"], main);
+        assert_eq!(child["inheritsFrom"], "forge");
+        assert_eq!(child["libraries"].as_array().unwrap().len(), 1);
+        assert!(child.get("arguments").is_none());
+        assert!(child.get("minecraftArguments").is_none());
+        let mut excluded = parent.clone();
+        excluded["libraries"][0]["rules"] = json!([{"action":"disallow"}]);
+        assert!(profile("of", "forge", &excluded, &info(), core(), None).is_err());
+        assert!(profile(
+            "of",
+            "forge",
+            &json!({"mainClass":main,"libraries":[]}),
+            &info(),
+            core(),
+            None
+        )
+        .is_err());
+    }
+
+    #[test]
     fn incompatible_loaders_old_bootstrap_builds_and_parent_overwrite_are_rejected() {
         let fabric =
             json!({"mainClass":"net.fabricmc.loader.impl.launch.knot.KnotClient","libraries":[]});
@@ -581,6 +753,10 @@ mod tests {
             .join("libraries")
             .join(artifact["downloads"]["artifact"]["path"].as_str().unwrap());
         let original = fs::read(&path).unwrap();
+        assert!(zip::ZipArchive::new(std::io::Cursor::new(&original))
+            .unwrap()
+            .by_name("META-INF/mods.toml")
+            .is_ok());
         fs::write(&path, b"corrupt").unwrap();
         backend.repair(&config, "of").unwrap();
         assert_eq!(fs::read(&path).unwrap(), original);

@@ -64,24 +64,35 @@ impl ClientVersionSource for JarClientVersionSource {
             Err(error) => return Err(error).context("读取客户端 version.json 失败"),
         }
         control.check()?;
-        // The vanilla entry point is independent of a loader's own entry point.
-        match archive.by_name("net/minecraft/client/main/Main.class") {
-            Ok(mut entry) => {
-                let mut header = [0; 8];
-                entry
-                    .read_exact(&mut header)
-                    .context("客户端主类文件不完整，请修复实例")?;
-                if header[..4] != [0xca, 0xfe, 0xba, 0xbe] {
-                    bail!("客户端主类不是有效的 Java class 文件");
+        // HMCL also inspects Minecraft.class for older clients without Main.
+        // Both classes must run on the selected VM; retain the higher minimum.
+        for class_path in [
+            "net/minecraft/client/main/Main.class",
+            "net/minecraft/client/Minecraft.class",
+        ] {
+            control.check()?;
+            match archive.by_name(class_path) {
+                Ok(mut entry) => {
+                    let mut header = [0; 8];
+                    entry
+                        .read_exact(&mut header)
+                        .context("客户端主类文件不完整，请修复实例")?;
+                    if header[..4] != [0xca, 0xfe, 0xba, 0xbe] {
+                        bail!("客户端主类不是有效的 Java class 文件");
+                    }
+                    let class_version = u16::from_be_bytes([header[6], header[7]]);
+                    if class_version < 45 {
+                        bail!("客户端主类字节码版本无效");
+                    }
+                    info.class_java = Some(
+                        info.class_java
+                            .unwrap_or(0)
+                            .max(u64::from(class_version - 44)),
+                    );
                 }
-                let class_version = u16::from_be_bytes([header[6], header[7]]);
-                if class_version < 45 {
-                    bail!("客户端主类字节码版本无效");
-                }
-                info.class_java = Some(u64::from(class_version - 44));
+                Err(zip::result::ZipError::FileNotFound) => {}
+                Err(error) => return Err(error).context("读取客户端主类版本失败"),
             }
-            Err(zip::result::ZipError::FileNotFound) => {}
-            Err(error) => return Err(error).context("读取客户端主类版本失败"),
         }
         control.check()?;
         Ok(info)
@@ -743,6 +754,46 @@ mod tests {
             assert!(message.contains("ambiguous-client.jar"), "{message}");
         }
     }
+    #[test]
+    fn legacy_client_class_is_checked_and_highest_bytecode_requirement_wins() {
+        let workspace = crate::test_support::Workspace::new();
+        let jar = workspace.path.join("legacy-client.jar");
+        for (main, legacy, expected) in [
+            (None, 61_u16, 17),
+            (Some(65_u16), 61, 21),
+            (Some(52), 61, 17),
+        ] {
+            let mut archive = zip::ZipWriter::new(fs::File::create(&jar).unwrap());
+            for (name, major) in [
+                ("net/minecraft/client/main/Main.class", main),
+                ("net/minecraft/client/Minecraft.class", Some(legacy)),
+            ] {
+                if let Some(major) = major {
+                    archive
+                        .start_file(name, zip::write::SimpleFileOptions::default())
+                        .unwrap();
+                    archive
+                        .write_all(&[
+                            0xca,
+                            0xfe,
+                            0xba,
+                            0xbe,
+                            0,
+                            0,
+                            (major >> 8) as u8,
+                            major as u8,
+                        ])
+                        .unwrap();
+                }
+            }
+            archive.finish().unwrap();
+            let info = JarClientVersionSource
+                .read(&jar, &TaskControl::default())
+                .unwrap();
+            assert_eq!(info.class_java, Some(expected));
+        }
+    }
+
     #[test]
     fn real_zip_provider_reads_embedded_metadata_and_bytecode_header() {
         let workspace = crate::test_support::Workspace::new();

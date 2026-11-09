@@ -85,7 +85,7 @@ impl UiLanguage {
     fn catalog(self) -> &'static HashMap<String, String> {
         static CATALOGS: OnceLock<Vec<HashMap<String, String>>> = OnceLock::new();
         let catalogs = CATALOGS.get_or_init(|| {
-            let mut catalogs: Vec<HashMap<String, String>> = [
+            [
                 include_str!("../assets/lang/zh_cn.json"),
                 include_str!("../assets/lang/en_us.json"),
                 include_str!("../assets/lang/zh_tw.json"),
@@ -101,16 +101,7 @@ impl UiLanguage {
             .map(|source| {
                 serde_json::from_str(source).expect("validated built-in language catalog")
             })
-            .collect();
-            let english = catalogs[1].clone();
-            for (index, catalog) in catalogs.iter_mut().enumerate() {
-                if index != 1 {
-                    for (key, value) in &english {
-                        catalog.entry(key.clone()).or_insert_with(|| value.clone());
-                    }
-                }
-            }
-            catalogs
+            .collect()
         });
         &catalogs[Self::ALL
             .iter()
@@ -273,11 +264,16 @@ mod tests {
     fn every_catalog_preserves_template_arguments() {
         let english = UiLanguage::English.catalog();
         for language in UiLanguage::ALL {
+            set(language.game_code());
+            // Missing translations are allowed only when lookup supplies the
+            // English fallback; coverage must still count the original catalog.
             assert_eq!(
-                language.catalog().len(),
-                english.len(),
-                "incomplete built-in catalog: {language:?}"
+                language.coverage(),
+                (language.catalog().len(), english.len())
             );
+            for (key, fallback) in english {
+                assert_eq!(tr(key), language.catalog().get(key).unwrap_or(fallback));
+            }
             for (key, value) in language.catalog() {
                 assert!(english.contains_key(key), "unknown key: {language:?} {key}");
                 assert!(!value.trim().is_empty(), "empty value: {language:?} {key}");

@@ -1,4 +1,6 @@
 {
+  "大小未知": "Size unknown",
+  "约 {}": "About {}",
   "最小内存 / MB（0 由 Java 决定）": "Initial memory / MB (0 lets Java decide)",
   "自动分配内存（false 使用最大内存设置）": "Automatic memory (false uses the configured maximum)",
   "仅全局": "Global only",

@@ -126,6 +126,7 @@ impl<'a> MetadataCache<'a> {
         validate_url(url)?;
         self.control.check()?;
         let mut online = Err(anyhow::anyhow!("没有可用元数据来源"));
+        let mut failures = Vec::new();
         for candidate in self.source.candidates(url) {
             self.control.check()?;
             online = validate_url(&candidate)
@@ -140,6 +141,9 @@ impl<'a> MetadataCache<'a> {
             if online.is_ok() {
                 break;
             }
+            if let Err(error) = &online {
+                failures.push(format!("候选源 {}：{error:#}", failures.len() + 1));
+            }
         }
         self.control.check()?;
         match online {
@@ -153,6 +157,11 @@ impl<'a> MetadataCache<'a> {
                 Ok(MetadataResult { value, warning })
             }
             Err(network_error) => {
+                let network_error = if failures.len() > 1 {
+                    network_error.context(failures.join("；"))
+                } else {
+                    network_error
+                };
                 let cached = self.store.read(url);
                 self.control.check()?;
                 let cached = cached
@@ -180,12 +189,12 @@ impl<'a> MetadataCache<'a> {
 
 impl MetadataSource for Backend {
     fn candidates(&self, url: &str) -> Vec<String> {
-        crate::sources::urls(url, &self.source)
+        self.metadata_candidates(url)
     }
     fn fetch(&self, url: &str) -> Result<Vec<u8>> {
         validate_url(url)?;
         self.control.check()?;
-        let mut response = self.client.get(url).send()?.error_for_status()?;
+        let mut response = self.request_metadata_response(url)?;
         self.control.check()?;
         if response.url().scheme() != "https" {
             bail!("元数据被重定向到非 HTTPS 地址");
@@ -372,6 +381,41 @@ mod tests {
             assert!(message.contains("缓存"));
         }
     }
+    #[test]
+    fn exhausted_sources_keep_each_failure_with_or_without_usable_cache() {
+        struct FailedSources;
+        impl MetadataSource for FailedSources {
+            fn candidates(&self, url: &str) -> Vec<String> {
+                vec!["https://mirror.invalid/catalog".into(), url.into()]
+            }
+            fn fetch(&self, url: &str) -> Result<Vec<u8>> {
+                if url == URL {
+                    anyhow::bail!("official connection failed");
+                }
+                Ok(b"<html>mirror unavailable</html>".to_vec())
+            }
+        }
+        for cached in [b"3".as_slice(), b"bad".as_slice()] {
+            let store = Store {
+                bytes: RefCell::new(Some(cached.to_vec())),
+                ..Default::default()
+            };
+            let result = MetadataCache::new(&FailedSources, &store, &TaskControl::default())
+                .load(URL, parse);
+            let message = match result {
+                Ok(result) => {
+                    assert_eq!(result.value, 3);
+                    result.warning.unwrap()
+                }
+                Err(error) => format!("{error:#}"),
+            };
+            assert!(message.contains("候选源 1") && message.contains("invalid catalog"));
+            assert!(message.contains("候选源 2") && message.contains("official connection failed"));
+            assert_eq!(store.writes.get(), 0);
+            assert_eq!(store.bytes.borrow().as_deref(), Some(cached));
+        }
+    }
+
     #[test]
     fn mirror_schema_failure_continues_to_official_before_using_cache() {
         struct Mirrored(Cell<usize>);
