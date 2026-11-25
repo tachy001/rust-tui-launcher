@@ -127,6 +127,11 @@ impl Accounts {
         *self = AccountService::new(&FileAccountIndex, &SystemCredentials).add_offline(name)?;
         Ok(())
     }
+    pub fn add_offline_profile(&mut self, name: &str, uuid: &str) -> Result<()> {
+        *self = AccountService::new(&FileAccountIndex, &SystemCredentials)
+            .add_offline_profile(name, uuid)?;
+        Ok(())
+    }
     pub fn upsert(&mut self, account: Account) {
         self.entries.retain(|entry| entry.id != account.id);
         self.active = Some(account.id.clone());
@@ -140,4 +145,15 @@ impl Accounts {
         *self = AccountService::new(&FileAccountIndex, &SystemCredentials).remove(id)?;
         Ok(())
     }
+}
+pub(crate) fn profile_uuid(input: &str) -> Option<String> {
+    let compact = match input.len() {
+        32 => input.to_owned(),
+        36 if [8, 13, 18, 23].iter().all(|&i| input.as_bytes()[i] == b'-') => {
+            input.replace('-', "")
+        }
+        _ => return None,
+    };
+    (compact.len() == 32 && compact.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| compact.to_ascii_lowercase())
 }

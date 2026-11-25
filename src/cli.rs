@@ -55,7 +55,7 @@ const HELP: &str = "Rust TUI Launcher — Minecraft Java 终端启动器
   mods <实例> updates          检查在线管理项目的更新
   mods <实例> check            检查 Fabric 包内依赖范围，不启动游戏
   account list                 列出账户
-  account offline <用户名>     添加并选择离线账户
+  account offline <用户名> [UUID]  添加离线账户，可沿用原存档身份
   account select <账户ID>      切换账户
   account remove <账户ID>      移除账户及安全凭证
   account login                打开浏览器登录微软账户
@@ -521,8 +521,12 @@ pub fn run(config: Config, raw: Vec<String>) -> Result<()> {
                     }
                 }
                 "offline" => {
-                    exact(&args, 3)?;
-                    accounts.add_offline(&args[2])?;
+                    if args.len() == 4 {
+                        accounts.add_offline_profile(&args[2], &args[3])?;
+                    } else {
+                        exact(&args, 3)?;
+                        accounts.add_offline(&args[2])?;
+                    }
                 }
                 "select" => {
                     exact(&args, 3)?;

@@ -158,7 +158,7 @@ impl<'a> MetadataCache<'a> {
             }
             Err(network_error) => {
                 let network_error = if failures.len() > 1 {
-                    network_error.context(failures.join("；"))
+                    anyhow::Error::msg(failures.join("；"))
                 } else {
                     network_error
                 };
@@ -411,6 +411,7 @@ mod tests {
             };
             assert!(message.contains("候选源 1") && message.contains("invalid catalog"));
             assert!(message.contains("候选源 2") && message.contains("official connection failed"));
+            assert_eq!(message.matches("official connection failed").count(), 1);
             assert_eq!(store.writes.get(), 0);
             assert_eq!(store.bytes.borrow().as_deref(), Some(cached));
         }

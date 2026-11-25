@@ -38,6 +38,8 @@ impl Diagnosis {
 fn classify(text: &str) -> Vec<(&'static str, &'static str)> {
     let text = text.to_lowercase();
     let rules = [
+        (&["maybe try a lowerresolution texturepack?", "maybe try a lower resolution texturepack?", "maybe try a lowerresolution resourcepack?", "maybe try a lower resolution resourcepack?"][..], "资源包纹理超出图集容量", "切换到默认资源包后重试；若能启动，逐个启用资源包或选用较低分辨率的版本。"),
+        (&["java.lang.securityexception: sha1 digest error for", "signer information does not match signer information of other classes in the same package"][..], "JAR 签名校验失败", "检查日志指出的文件或包名；修复游戏及依赖库，若来自 Mod，请从原发布渠道重新获取对应版本。"),
         (&["unsupportedclassversionerror", "unsupported class file major version", "unsupported major.minor version", "level is not supported by the active jre or asm version"][..], "Java 版本不兼容", "将实例 Java 设为自动，或选择游戏与加载器要求的 Java；若错误来自 Mod，也检查它支持的游戏和 Java 版本。"),
         (&["could not reserve enough space", "invalid maximum heap size", "native memory allocation (malloc) failed", "there is insufficient memory for the java runtime environment"][..], "Java 无法分配内存", "降低实例内存，关闭其他占用内存的程序；检查 Java 位数和自定义 -Xmx / -Xms 参数。"),
         (&["outofmemoryerror: java heap space", "outofmemoryerror: gc overhead limit exceeded"][..], "Java 堆内存不足", "在机器可用内存允许的范围内提高实例内存；大型整合包也应检查异常占用内存的 Mod。"),
@@ -45,7 +47,7 @@ fn classify(text: &str) -> Vec<(&'static str, &'static str)> {
         (&["incompatible mods found", "modresolutionexception", "missing mandatory dependencies", "missing or unsupported mandatory dependencies:", "modloadingexception", "loadingfailedexception"][..], "加载器报告 Mod 或依赖问题", "打开日志中的依赖说明，检查游戏版本、加载器、前置 Mod 和冲突版本；可逐批禁用最近添加的 Mod。"),
         (&["duplicate mods", "duplicate mod id", "found duplicate mods", "duplicatemodsfoundexception", "found a duplicate mod", "modresolutionexception: duplicate"][..], "重复 Mod", "检查 mods 目录是否同时放入了同一 Mod 的多个版本，保留需要的版本，其余禁用或移出。"),
         (&["could not find or load main class", "classnotfoundexception", "noclassdeffounderror"][..], "缺少类或启动依赖", "先使用实例修复；若错误类属于 Mod，检查前置依赖与版本兼容性。也检查自定义 classpath 参数。"),
-        (&["glfw error 65542", "glfw error 65543", "pixel format not accelerated", "failed to create window", "opengl is not supported"][..], "图形环境初始化失败", "检查显卡驱动、硬件对该游戏版本的支持，以及远程桌面或虚拟机的图形环境。"),
+        (&["glfw error 65542", "glfw error 65543", "pixel format not accelerated", "couldn't set pixel format", "glx: failed to create context: glxbadfbconfig", "failed to create window", "opengl is not supported"][..], "图形环境初始化失败", "检查显卡驱动、硬件对该游戏版本的支持，以及远程桌面或虚拟机的图形环境。"),
         (&["cannot find launch target fmlclient, unable to launch"][..], "Forge 客户端安装不完整", "重新安装当前实例对应的 Forge，保留存档与配置；检查安装任务是否成功完成及所需加载器文件是否齐全。"),
         (&["zipexception", "invalid or corrupt jarfile", "zip end header not found"][..], "JAR / ZIP 文件读取失败", "根据日志中的文件位置修复或重新下载对应库 / Mod；移除最近添加的损坏文件后再试。"),
         (&["unrecognized vm option", "improperly specified vm option", "unrecognized option:"][..], "Java 启动参数不兼容", "检查并暂时清空实例自定义 JVM 参数，确认它们适用于当前 Java 版本。"),
@@ -318,6 +320,19 @@ mod tests {
             "Java 堆内存不足"
         );
     }
+    #[test]
+    fn recognizes_graphics_context_failures() {
+        assert_eq!(classify("bkr: Unable to fit: waterlily - size: 128x128 - Maybe try a lowerresolution texturepack?")[0].0, "资源包纹理超出图集容量");
+        assert_eq!(classify("java.lang.SecurityException: SHA1 digest error for assets/minecraft/texts/splashes.txt")[0].0, "JAR 签名校验失败");
+        for message in [
+            "Couldn't set pixel format",
+            "GLX: Failed to create context: GLXBadFBConfig",
+        ] {
+            assert_eq!(classify(message)[0].0, "图形环境初始化失败");
+        }
+        assert!(classify("GLX context created").is_empty());
+    }
+
     #[test]
     fn recognizes_legacy_java_and_loader_failures_from_pcl_signatures() {
         for (log, expected) in [

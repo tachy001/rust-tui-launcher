@@ -94,6 +94,27 @@ fn metadata_game_arguments(
     ));
     Ok(args)
 }
+/// Normalize PCL spellings before the single value-expansion pass.
+pub(crate) fn custom_template(mut arg: String) -> String {
+    for (alias, key) in [
+        ("{name}", "version_name"),
+        ("{user}", "auth_player_name"),
+        ("{uuid}", "auth_uuid"),
+    ] {
+        let mut offset = 0;
+        while let Some(relative) = arg[offset..].find(alias) {
+            let start = offset + relative;
+            if arg[..start].ends_with('$') {
+                offset = start + alias.len();
+            } else {
+                let replacement = format!("${{{key}}}");
+                arg.replace_range(start..start + alias.len(), &replacement);
+                offset = start + replacement.len();
+            }
+        }
+    }
+    arg
+}
 /// Expand only the original template; substituted paths and tokens are literal data.
 pub fn expand_argument(template: &str, values: &HashMap<&str, String>) -> Result<String> {
     let mut output = String::new();
@@ -260,6 +281,16 @@ mod tests {
         assert!(expand_argument("${unknown}", &values).is_err());
         assert!(expand_argument("${unfinished", &values).is_err());
         assert_eq!(expand_argument("plain", &values).unwrap(), "plain");
+        let identities = HashMap::from([
+            ("version_name", "My {user} Pack".into()),
+            ("auth_player_name", "Alex".into()),
+            ("auth_uuid", "abc".into()),
+        ]);
+        let custom = custom_template("{name}/{user}/{uuid}".into());
+        assert_eq!(
+            expand_argument(&custom, &identities).unwrap(),
+            "My {user} Pack/Alex/abc"
+        );
     }
     #[test]
     fn accepts_domains_and_ipv6_but_rejects_paths_and_bad_ports() {

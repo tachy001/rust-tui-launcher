@@ -68,6 +68,12 @@ impl UiLanguage {
             Self::ClassicalChinese => "lzh",
         }
     }
+    pub(crate) fn language_tag(self) -> String {
+        match self.game_code().split_once('_') {
+            Some((language, region)) => format!("{language}-{}", region.to_ascii_uppercase()),
+            None => self.game_code().into(),
+        }
+    }
     pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Chinese => "简体中文",

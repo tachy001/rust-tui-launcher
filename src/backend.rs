@@ -513,18 +513,17 @@ impl Backend {
         let session =
             crate::account_session_service::AccountSessionService::new(accounts, &self.control)
                 .resolve(&config.username)?;
-        let uuid = session.uuid.clone();
+        let library_directory = root.join("libraries").display().to_string();
         let mut values: HashMap<&str, String> = [
             ("auth_player_name", session.name.clone()),
-            ("auth_uuid", uuid),
+            ("auth_uuid", session.uuid.clone()),
             ("auth_access_token", session.access_token.to_string()),
+            ("access_token", session.access_token.to_string()),
+            ("auth_session", session.access_token.to_string()),
+            ("profile_name", id.into()),
             (
-                "auth_session",
-                if session.user_type == "msa" {
-                    format!("token:{}:{}", session.access_token.as_str(), session.uuid)
-                } else {
-                    "0".into()
-                },
+                "language",
+                crate::localization::UiLanguage::parse(&config.language)?.language_tag(),
             ),
             ("user_type", session.user_type.into()),
             ("user_properties", "{}".into()),
@@ -549,10 +548,8 @@ impl Backend {
                     .into_owned(),
             ),
             ("file_separator", std::path::MAIN_SEPARATOR.to_string()),
-            (
-                "library_directory",
-                root.join("libraries").display().to_string(),
-            ),
+            ("library_directory", library_directory.clone()),
+            ("libraries_directory", library_directory),
             ("launcher_name", env!("CARGO_PKG_NAME").into()),
             ("launcher_version", env!("CARGO_PKG_VERSION").into()),
             ("auth_xuid", session.xuid.clone()),
@@ -611,7 +608,13 @@ impl Backend {
             args.push(logging.argument().into());
         }
         let parser = crate::argument_service::ArgumentParser::current();
-        args.extend(parser.parse(&config.jvm_args).context("JVM 参数格式错误")?);
+        args.extend(
+            parser
+                .parse(&config.jvm_args)
+                .context("JVM 参数格式错误")?
+                .into_iter()
+                .map(crate::launch_options::custom_template),
+        );
         crate::jvm_argument_service::JvmArgumentDefaults::new(
             runtime.major(),
             std::env::consts::OS,
@@ -627,7 +630,9 @@ impl Backend {
         args.extend(
             parser
                 .parse(&config.game_args)
-                .context("游戏参数格式错误")?,
+                .context("游戏参数格式错误")?
+                .into_iter()
+                .map(crate::launch_options::custom_template),
         );
         for arg in &mut args {
             *arg = crate::launch_options::expand_argument(arg, &values)?;
@@ -1125,7 +1130,7 @@ mod tests {
         let metadata = serde_json::json!({
             "mainClass":"LaunchFixture", "libraries":[], "type":"release",
             "javaVersion":{"majorVersion":8}, "assetIndex":{"id":"fixture"},
-            "arguments":{"jvm":["-cp","${classpath}"], "game":["${auth_player_name}","${auth_uuid}","${game_directory}"]}
+            "arguments":{"jvm":["-cp","${classpath}"], "game":["${auth_player_name}","${auth_uuid}","${game_directory}","profile=${profile_name}","session=${auth_session}","aliases=${auth_access_token}/${access_token}","libs=${libraries_directory}","locale=${language}"]}
         });
         fs::write(
             dir.join("fixture.json"),
@@ -1135,6 +1140,8 @@ mod tests {
         let config = Config {
             game_dir: root.clone(),
             username: "Notch".into(),
+            language: "zh_tw".into(),
+            game_language: "keep".into(),
             memory_mb: 512,
             java: "java".into(),
             ..Config::default()
@@ -1153,6 +1160,12 @@ mod tests {
         let log = fs::read_to_string(dir.join("tui-mc-game.log")).unwrap();
         assert!(log.contains("Notch"));
         assert!(log.contains(&offline_uuid("Notch")));
+        assert!(log.contains("profile=fixture"));
+        assert!(log.contains("locale=zh-TW"));
+        assert!(log.contains("session=0"));
+        assert!(log.contains("aliases=0/0"));
+        let libraries = config.root().unwrap().join("libraries");
+        assert!(log.contains(&format!("libs={}", libraries.display())));
         assert!(log.contains("tui mc launch"));
     }
     #[test]

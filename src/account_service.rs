@@ -117,6 +117,11 @@ impl<'a> AccountService<'a> {
         Ok(accounts)
     }
     pub(crate) fn add_offline(&self, name: &str) -> Result<Accounts> {
+        self.add_offline_profile(name, &crate::backend::offline_uuid(name))
+    }
+    pub(crate) fn add_offline_profile(&self, name: &str, uuid: &str) -> Result<Accounts> {
+        let uuid = crate::accounts::profile_uuid(uuid)
+            .ok_or_else(|| anyhow::anyhow!("离线账户 UUID 格式无效"))?;
         let config = crate::config::Config {
             username: name.into(),
             ..crate::config::Config::default()
@@ -125,7 +130,7 @@ impl<'a> AccountService<'a> {
         let _lease = self.index.lock()?;
         let mut accounts = self.index.load()?;
         accounts.upsert(Account {
-            id: format!("offline:{}", crate::backend::offline_uuid(name)),
+            id: format!("offline:{uuid}"),
             name: name.into(),
             kind: AccountKind::Offline,
             client_id: String::new(),

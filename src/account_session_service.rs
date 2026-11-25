@@ -30,7 +30,15 @@ impl<'a> AccountSessionService<'a> {
             return Self::offline(username);
         };
         if account.kind == AccountKind::Offline {
-            return Self::offline(&account.name);
+            let mut session = Self::offline(&account.name)?;
+            if let Some(uuid) = account
+                .id
+                .strip_prefix("offline:")
+                .and_then(crate::accounts::profile_uuid)
+            {
+                session.uuid = uuid;
+            }
+            return Ok(session);
         }
         Self::validate(account)?;
         if self.usable(account) {
@@ -296,10 +304,14 @@ mod tests {
     fn offline_selection_does_not_read_credentials_and_invalid_identity_is_rejected() {
         let mut source = source();
         source.initial.entries[0].kind = AccountKind::Offline;
+        let id = "offline:12345678-1234-5678-ABCD-123456789ABC".to_owned();
+        source.initial.active = Some(id.clone());
+        source.initial.entries[0].id = id;
         let session = AccountSessionService::new(&source, &TaskControl::default())
             .resolve("Fallback")
             .unwrap();
         assert_eq!(session.user_type, "legacy");
+        assert_eq!(session.uuid, "1234567812345678abcd123456789abc");
         assert_eq!(*source.calls.borrow(), ["load"]);
         source.initial.entries[0].kind = AccountKind::Microsoft;
         source.initial.entries[0].name = "bad/name".into();

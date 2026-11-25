@@ -1,5 +1,37 @@
 # 基本功能还原与验收
 
+## PCL 自定义参数中的实例与玩家
+
+自定义 JVM 和游戏参数分词后支持 PCL 的 {name}、{user}、{uuid}。它们沿用实例名、玩家名和当前会话 UUID 的标准替换逻辑。
+
+## 2026-11-10 启动参数中的语言标签
+
+对照 HMCL SettingsManager 与 DefaultLauncher，将启动器语言展开为带连字符的语言标签，独立于游戏 options.txt 的语言同步策略。Java 参数探针覆盖繁体中文和保留游戏设置的组合。
+
+## 2026-11-10 PCL 认证参数别名
+
+版本参数可使用 PCL ModLaunch 的 access_token 别名，与 auth_access_token 同取当前启动会话的令牌。离线 Java 参数探针覆盖两者，真实正版登录仍待验收。
+
+## 2026-11-10 旧版启动占位符
+
+按 HMCL DefaultLauncher 与 PCL ModLaunch 使用会话访问令牌展开 auth_session。支持 HMCL 的历史 libraries_directory 别名，profile_name 使用当前实例名。微软账户旧版游戏联网仍待验收。
+
+## 2026-11-10 离线玩家身份迁移
+
+对照 HMCL OfflineAccountFactory 支持命令行指定离线 UUID。启动时沿用账户记录中的 UUID，旧式非 UUID 记录按原用户名生成。实际存档迁移待验收。
+
+## 2026-11-10 资源包与 JAR 签名诊断
+
+依据 HMCL 的 resourcepack_resolution.txt 与 security.txt 报告样例，识别纹理图集容量不足和 JAR 摘要校验错误，并提示对应的实例恢复操作。验证覆盖日志特征匹配。
+
+## 2026-11-10 图形初始化诊断
+
+参照 HMCL CrashReportAnalyzer 和 PCL ModCrash，识别像素格式设置失败及 Linux GLXBadFBConfig 上下文创建失败。回归覆盖日志分类，真实显卡环境待验收。
+
+## 2026-11-10 元数据来源失败提示
+
+多个来源均失败时，缓存回退警告与最终错误按请求顺序各显示一次失败原因。验证范围为模拟来源与缓存。
+
 ## 2026-11-09 v0.21.12 发布准备
 
 集中合并下载进度、元数据回退、OptiFine 安装一致性、本地模组校验、Java 版本探测及多语言资源改进，准备由 GitHub Actions 生成 Windows、Linux 与 macOS 三端包。CI 构建和真实登录、安装、启动验收仍需分别确认。
